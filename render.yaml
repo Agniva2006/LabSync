@@ -13,6 +13,6 @@ services:
       - key: NODE_ENV
         value: production
       - key: SPREADSHEET_ID
-        value: 1swF1x8y7xNFAF7Ovr9R86usq7baM3gGkXqNl8rgWmI
+        value: 1swE1x8y7xNFaPFZovR9BJ6usq7baM3gGkXqNI8cgWmI
       - key: JWT_SECRET
         value: labsync_jwt_secret_key_2026
