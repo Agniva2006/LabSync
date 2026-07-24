@@ -31,6 +31,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <NetworkClient.h>
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
@@ -325,15 +326,23 @@ bool displayJpegOnTFT(uint8_t* buf, size_t len) {
 String httpGet(const String& path) {
   if (WiFi.status() != WL_CONNECTED) { connectWiFi(); return ""; }
 
-  NetworkClient client;
-  HTTPClient http;
-  http.setConnectTimeout(5000);
-  http.setTimeout(10000);
-
   String url = String(SERVER_URL) + path;
-  if (!http.begin(client, url)) return "";
+  HTTPClient http;
+  http.setConnectTimeout(8000);
+  http.setTimeout(15000);
 
-  int code = http.GET();
+  int code = 0;
+  if (url.startsWith("https://")) {
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+    if (!http.begin(secureClient, url)) return "";
+    code = http.GET();
+  } else {
+    NetworkClient client;
+    if (!http.begin(client, url)) return "";
+    code = http.GET();
+  }
+
   String body = (code == HTTP_CODE_OK) ? http.getString() : "";
   http.end();
   return body;
@@ -343,16 +352,25 @@ String httpGet(const String& path) {
 String httpPostJson(const String& path, const String& jsonBody) {
   if (WiFi.status() != WL_CONNECTED) { connectWiFi(); return ""; }
 
-  NetworkClient client;
+  String url = String(SERVER_URL) + path;
   HTTPClient http;
-  http.setConnectTimeout(5000);
+  http.setConnectTimeout(8000);
   http.setTimeout(15000);
 
-  String url = String(SERVER_URL) + path;
-  if (!http.begin(client, url)) return "";
+  int code = 0;
+  if (url.startsWith("https://")) {
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+    if (!http.begin(secureClient, url)) return "";
+    http.addHeader("Content-Type", "application/json");
+    code = http.POST(jsonBody);
+  } else {
+    NetworkClient client;
+    if (!http.begin(client, url)) return "";
+    http.addHeader("Content-Type", "application/json");
+    code = http.POST(jsonBody);
+  }
 
-  http.addHeader("Content-Type", "application/json");
-  int code = http.POST(jsonBody);
   String body = (code > 0) ? http.getString() : "";
   http.end();
   return body;
@@ -363,62 +381,98 @@ String httpPostJson(const String& path, const String& jsonBody) {
 bool postMultipartStreaming(const String& path, const String& part1, uint8_t* jpegBuf, size_t jpegLen, const String& part3, String& outResp) {
   if (WiFi.status() != WL_CONNECTED) { connectWiFi(); return false; }
 
-  // Extract host and port from SERVER_URL (e.g. http://192.168.154.100:5000)
   String serverStr = String(SERVER_URL);
+  bool isHttps = serverStr.startsWith("https://");
   int protoEnd = serverStr.indexOf("://");
   String hostPort = (protoEnd != -1) ? serverStr.substring(protoEnd + 3) : serverStr;
 
   String host = hostPort;
-  int port = 80;
+  int port = isHttps ? 443 : 80;
   int colonIndex = hostPort.indexOf(':');
   if (colonIndex != -1) {
     host = hostPort.substring(0, colonIndex);
     port = hostPort.substring(colonIndex + 1).toInt();
   }
 
-  NetworkClient client;
-  client.setTimeout(45); // 45s timeout for face recognition API
-
-  if (!client.connect(host.c_str(), port)) {
-    Serial.println("❌ Direct TCP connection to backend failed");
-    return false;
-  }
-
   const String boundary = "----LabSyncBoundary7344";
   size_t totalLen = part1.length() + jpegLen + part3.length();
 
-  client.printf("POST %s HTTP/1.1\r\n", path.c_str());
-  client.printf("Host: %s:%d\r\n", host.c_str(), port);
-  client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
-  client.printf("Content-Length: %u\r\n", totalLen);
-  client.print("Connection: close\r\n\r\n");
-
-  // Write text fields header
-  client.print(part1);
-
-  // Stream JPEG bytes in 1024-byte chunks (Zero Heap Allocation!)
-  size_t bytesSent = 0;
-  while (bytesSent < jpegLen && client.connected()) {
-    size_t chunkSize = (jpegLen - bytesSent > 1024) ? 1024 : (jpegLen - bytesSent);
-    client.write(jpegBuf + bytesSent, chunkSize);
-    bytesSent += chunkSize;
-  }
-
-  // Write boundary footer
-  client.print(part3);
-  client.flush();
-
-  // Read response body
-  unsigned long startWait = millis();
-  while (!client.available() && millis() - startWait < 45000) {
-    delay(10);
-  }
-
   String response = "";
-  while (client.available()) {
-    response += (char)client.read();
+
+  if (isHttps) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(45);
+
+    if (!client.connect(host.c_str(), port)) {
+      Serial.println("❌ Direct HTTPS connection to backend failed");
+      return false;
+    }
+
+    client.printf("POST %s HTTP/1.1\r\n", path.c_str());
+    client.printf("Host: %s\r\n", host.c_str());
+    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
+    client.printf("Content-Length: %u\r\n", totalLen);
+    client.print("Connection: close\r\n\r\n");
+
+    client.print(part1);
+
+    size_t bytesSent = 0;
+    while (bytesSent < jpegLen && client.connected()) {
+      size_t chunkSize = (jpegLen - bytesSent > 1024) ? 1024 : (jpegLen - bytesSent);
+      client.write(jpegBuf + bytesSent, chunkSize);
+      bytesSent += chunkSize;
+    }
+
+    client.print(part3);
+    client.flush();
+
+    unsigned long startWait = millis();
+    while (!client.available() && millis() - startWait < 45000) {
+      delay(10);
+    }
+
+    while (client.available()) {
+      response += (char)client.read();
+    }
+    client.stop();
+  } else {
+    NetworkClient client;
+    client.setTimeout(45);
+
+    if (!client.connect(host.c_str(), port)) {
+      Serial.println("❌ Direct TCP connection to backend failed");
+      return false;
+    }
+
+    client.printf("POST %s HTTP/1.1\r\n", path.c_str());
+    client.printf("Host: %s:%d\r\n", host.c_str(), port);
+    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
+    client.printf("Content-Length: %u\r\n", totalLen);
+    client.print("Connection: close\r\n\r\n");
+
+    client.print(part1);
+
+    size_t bytesSent = 0;
+    while (bytesSent < jpegLen && client.connected()) {
+      size_t chunkSize = (jpegLen - bytesSent > 1024) ? 1024 : (jpegLen - bytesSent);
+      client.write(jpegBuf + bytesSent, chunkSize);
+      bytesSent += chunkSize;
+    }
+
+    client.print(part3);
+    client.flush();
+
+    unsigned long startWait = millis();
+    while (!client.available() && millis() - startWait < 45000) {
+      delay(10);
+    }
+
+    while (client.available()) {
+      response += (char)client.read();
+    }
+    client.stop();
   }
-  client.stop();
 
   outResp = response;
   int bodyStart = response.indexOf("\r\n\r\n");
