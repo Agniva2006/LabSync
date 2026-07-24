@@ -453,7 +453,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
                       crossAxisCount: 2,
                       shrinkWrap: true,
                       physics: const NeverScrollableScrollPhysics(),
-                      childAspectRatio: 1.5,
+                      childAspectRatio: 1.25,
                       crossAxisSpacing: 12,
                       mainAxisSpacing: 12,
                       children: [
@@ -858,30 +858,36 @@ class _AdminStatCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return GlassCard(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(12),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(icon, color: color, size: 32),
-          const SizedBox(height: 8),
-          Text(
-            value,
-            style: TextStyle(
-              color: color,
-              fontSize: 28,
-              fontWeight: FontWeight.bold,
+          Icon(icon, color: color, size: 26),
+          const SizedBox(height: 6),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(
+              value,
+              style: TextStyle(
+                color: color,
+                fontSize: 24,
+                fontWeight: FontWeight.bold,
+              ),
             ),
           ),
-          const SizedBox(height: 4),
-          Text(
-            label,
-            style: TextStyle(
-              color: AppColors.textSecondary,
-              fontSize: 10,
-              letterSpacing: 1,
-              fontWeight: FontWeight.bold,
+          const SizedBox(height: 2),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(
+              label,
+              style: TextStyle(
+                color: AppColors.textSecondary,
+                fontSize: 9,
+                letterSpacing: 0.5,
+                fontWeight: FontWeight.bold,
+              ),
+              textAlign: TextAlign.center,
             ),
-            textAlign: TextAlign.center,
           ),
         ],
       ),

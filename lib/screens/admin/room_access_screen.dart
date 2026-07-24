@@ -83,7 +83,13 @@ class _RoomAccessScreenState extends State<RoomAccessScreen>
     return Scaffold(
       backgroundColor: AppColors.bgDark,
       appBar: AppBar(
-        title: const Text('BIOMETRIC ROOM ACCESS'),
+        title: const FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Text(
+            'BIOMETRIC ROOM ACCESS',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+          ),
+        ),
         backgroundColor: AppColors.neonPurple.withOpacity(0.2),
         elevation: 0,
         actions: [
@@ -338,24 +344,30 @@ class _RoomAccessScreenState extends State<RoomAccessScreen>
                 ],
               ),
             ),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: (isEntry ? AppColors.success : AppColors.warning)
-                    .withOpacity(0.15),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
+            const SizedBox(width: 8),
+            Flexible(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
                   color: (isEntry ? AppColors.success : AppColors.warning)
-                      .withOpacity(0.5),
+                      .withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: (isEntry ? AppColors.success : AppColors.warning)
+                        .withOpacity(0.5),
+                  ),
                 ),
-              ),
-              child: Text(
-                action,
-                style: TextStyle(
-                  color: isEntry ? AppColors.success : AppColors.warning,
-                  fontSize: 10,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 1,
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    action,
+                    style: TextStyle(
+                      color: isEntry ? AppColors.success : AppColors.warning,
+                      fontSize: 10,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
                 ),
               ),
             ),
