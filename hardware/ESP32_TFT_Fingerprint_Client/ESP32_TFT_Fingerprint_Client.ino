@@ -44,7 +44,8 @@
 // ==================== CONFIGURATION — CHANGE THESE ====================
 const char* WIFI_SSID           = "Galaxy";
 const char* WIFI_PASSWORD       = "password2006";
-const char* SERVER_URL          = "https://labsync-pnr8.onrender.com";  // ← Production Render URL
+// Production Render Cloud Backend
+const char* SERVER_URL          = "https://labsync-pnr8.onrender.com";
 const char* CAMERA_IP_FALLBACK  = "192.168.154.133";              // ← Hardcoded CAM IP
 const char* ROOM_ID             = "ROOM-001";
 const char* CAMERA_MDNS_NAME    = "esp32cam";

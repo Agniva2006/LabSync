@@ -358,7 +358,8 @@ bool isValidPhone(String phone) {
 
 // ==================== APP CONSTANTS ====================
 class AppConstants {
-  // Backend URL (Production Render Deployment)
+  // ==================== BACKEND URL CONFIGURATION ====================
+  // Production Render Cloud Backend
   static const String baseUrl = 'https://labsync-pnr8.onrender.com/api';
 
   // App Info
