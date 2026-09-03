@@ -502,8 +502,7 @@ esp_err_t startHandler(
       "Received /start"
   );
 
-  if (
-      !cameraInitialized)
+  if (!cameraInitialized)
   {
     if (!initializeCamera())
     {
@@ -523,24 +522,21 @@ esp_err_t startHandler(
       true;
 
   /*
-     Throw away first frame.
-
-     The first frame immediately after power-up may
-     have incorrect exposure/white balance.
+     Flush 2 stale DMA frames to let OV2640 Auto-Exposure (AEC)
+     and Auto-White-Balance (AWB) settle for clear face images.
   */
-
-  camera_fb_t *oldFrame =
-      esp_camera_fb_get();
-
-  if (oldFrame != nullptr)
+  for (int f = 0; f < 2; f++)
   {
-    esp_camera_fb_return(
-        oldFrame
-    );
+    camera_fb_t *oldFrame = esp_camera_fb_get();
+    if (oldFrame != nullptr)
+    {
+      esp_camera_fb_return(oldFrame);
+    }
+    delay(20);
   }
 
   Serial.println(
-      "Camera ACTIVE"
+      "Camera ACTIVE & Exposure Stabilized"
   );
 
   return sendText(
@@ -615,30 +611,39 @@ esp_err_t captureHandler(
     httpd_req_t *req)
 {
   /*
-     IMPORTANT:
-
-     /capture will NOT wake the camera automatically.
-
-     Main ESP32 must first send /start.
+     Auto-wake camera if sleeping so /capture NEVER fails on race condition.
   */
-
-  if (
-      !cameraEnabled ||
-      !cameraInitialized)
+  if (!cameraInitialized || !cameraEnabled)
   {
     Serial.println(
-        "Capture rejected: camera sleeping"
+        "Auto-waking OV2640 for capture..."
     );
 
-    httpd_resp_set_status(
-        req,
-        "503 Service Unavailable"
-    );
+    if (!initializeCamera())
+    {
+      httpd_resp_set_status(
+          req,
+          "500 Internal Server Error"
+      );
 
-    return sendText(
-        req,
-        "CAMERA_SLEEPING"
-    );
+      return sendText(
+          req,
+          "CAMERA_INIT_FAILED"
+      );
+    }
+
+    cameraEnabled = true;
+
+    // Flush stale frames
+    for (int f = 0; f < 2; f++)
+    {
+      camera_fb_t *oldFb = esp_camera_fb_get();
+      if (oldFb != nullptr)
+      {
+        esp_camera_fb_return(oldFb);
+      }
+      delay(20);
+    }
   }
 
   camera_fb_t *frame =
@@ -647,7 +652,17 @@ esp_err_t captureHandler(
   if (frame == nullptr)
   {
     Serial.println(
-        "Camera capture failed"
+        "Camera capture failed — retrying once..."
+    );
+
+    delay(30);
+    frame = esp_camera_fb_get();
+  }
+
+  if (frame == nullptr)
+  {
+    Serial.println(
+        "Camera frame acquisition failed"
     );
 
     httpd_resp_send_500(

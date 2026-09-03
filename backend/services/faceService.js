@@ -66,6 +66,13 @@ class FaceRecognitionService {
   // ==================== SHEETS PERSISTENCE ====================
 
   /**
+   * Helper: Normalize user ID for resilient map key lookup
+   */
+  _normalizeKey(id) {
+    return String(id || '').trim().toLowerCase();
+  }
+
+  /**
    * Load all enrolled face descriptors from USERS Google Sheet
    * Called once on server start — populates in-memory faceDatabase Map
    */
@@ -76,19 +83,25 @@ class FaceRecognitionService {
       let loaded = 0;
 
       for (const user of users) {
-        const userId = user.userid || user.userId;
+        // Support all casing permutations for userId
+        const userId = user.userid || user.userId || user.USERID || user.id || '';
         // Column I: faceDescriptor (JSON string of 128 floats)
-        const descriptorStr = user.facedescriptor || user.faceDescriptor || '';
+        const descriptorStr = user.facedescriptor || user.faceDescriptor || user.FACEDESCRIPTOR || '';
 
         if (userId && descriptorStr && descriptorStr.trim() !== '') {
           try {
             const parsed = JSON.parse(descriptorStr);
             if (Array.isArray(parsed) && parsed.length === 128) {
-              this.faceDatabase.set(userId, {
+              const faceEntry = {
+                rawUserId: userId,
                 descriptor: parsed,
                 enrolledAt: user.faceenrolledat || user.faceEnrolledAt || new Date().toISOString(),
                 score: parseFloat(user.facescore || user.faceScore || '0.9'),
-              });
+              };
+
+              // Store both exact ID and normalized lowercase ID
+              this.faceDatabase.set(userId, faceEntry);
+              this.faceDatabase.set(this._normalizeKey(userId), faceEntry);
               loaded++;
             } else {
               console.warn(`⚠️ Invalid descriptor format for ${userId} (length: ${parsed?.length})`);
@@ -102,7 +115,6 @@ class FaceRecognitionService {
       console.log(`✅ Loaded ${loaded} face descriptor(s) from Google Sheets`);
     } catch (error) {
       console.error('❌ Error loading faces from Sheets:', error.message);
-      // Don't throw — server can still run without pre-loaded faces
     }
   }
 
@@ -115,11 +127,8 @@ class FaceRecognitionService {
       console.log(`💾 Saving face descriptor to Sheets for user: ${userId}`);
       const users = await getSheetData('USERS');
 
-      // Find user row — try lowercase then camelCase column name
-      let rowIndex = await findRowIndex('USERS', 'userid', userId);
-      if (rowIndex === -1) {
-        rowIndex = await findRowIndex('USERS', 'userId', userId);
-      }
+      // Case-insensitive row search
+      const rowIndex = await findRowIndex('USERS', 'userId', userId);
 
       if (rowIndex === -1) {
         console.error(`❌ User ${userId} not found in USERS sheet`);
@@ -127,7 +136,8 @@ class FaceRecognitionService {
       }
 
       // Find user data
-      const user = users.find(u => (u.userid || u.userId) === userId);
+      const normTarget = this._normalizeKey(userId);
+      const user = users.find(u => this._normalizeKey(u.userid || u.userId) === normTarget);
       if (!user) return false;
 
       // Write full row with updated faceDescriptor + faceStatus
@@ -158,12 +168,12 @@ class FaceRecognitionService {
   async clearFaceFromSheet(userId) {
     try {
       const users = await getSheetData('USERS');
-      let rowIndex = await findRowIndex('USERS', 'userid', userId);
-      if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', userId);
+      const rowIndex = await findRowIndex('USERS', 'userId', userId);
 
       if (rowIndex === -1) return false;
 
-      const user = users.find(u => (u.userid || u.userId) === userId);
+      const normTarget = this._normalizeKey(userId);
+      const user = users.find(u => this._normalizeKey(u.userid || u.userId) === normTarget);
       if (!user) return false;
 
       await updateRow('USERS', rowIndex, [
@@ -227,26 +237,33 @@ class FaceRecognitionService {
 
       // Try 4 cardinal orientations: 0°, 180° (upside down), 90°, 270° (sideways)
       const angles = [0, 180, 90, 270];
-      const options = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.25 });
 
-      for (const angle of angles) {
-        const cvs = this.rotateImageCanvas(rawImg, angle);
+      // Pass 1: Standard confidence (0.25)
+      // Pass 2: Low-light / tilt fallback confidence (0.15)
+      const confidenceLevels = [0.25, 0.15];
 
-        const detection = await faceapi
-          .detectSingleFace(cvs, options)
-          .withFaceLandmarks()
-          .withFaceDescriptor();
+      for (const minConf of confidenceLevels) {
+        const options = new faceapi.SsdMobilenetv1Options({ minConfidence: minConf });
 
-        if (detection) {
-          console.log(`   ✅ Face detected at angle ${angle}° — confidence: ${detection.detection.score.toFixed(4)}`);
-          return {
-            success: true,
-            descriptor: Array.from(detection.descriptor), // 128 floats
-            landmarks: detection.landmarks,
-            box: detection.detection.box,
-            score: detection.detection.score,
-            rotationAngle: angle,
-          };
+        for (const angle of angles) {
+          const cvs = this.rotateImageCanvas(rawImg, angle);
+
+          const detection = await faceapi
+            .detectSingleFace(cvs, options)
+            .withFaceLandmarks()
+            .withFaceDescriptor();
+
+          if (detection) {
+            console.log(`   ✅ Face detected at angle ${angle}° (conf: ${minConf}) — score: ${detection.detection.score.toFixed(4)}`);
+            return {
+              success: true,
+              descriptor: Array.from(detection.descriptor), // 128 floats
+              landmarks: detection.landmarks,
+              box: detection.detection.box,
+              score: detection.detection.score,
+              rotationAngle: angle,
+            };
+          }
         }
       }
 
@@ -334,16 +351,18 @@ class FaceRecognitionService {
       const masterDescriptor = this.computeAverageDescriptor(validDescriptors);
       const avgScore = scores.reduce((a, b) => a + b, 0) / scores.length;
 
-      // Store in memory Map
+      // Store in memory Map with both exact and normalized keys
       const faceData = {
+        rawUserId: userId,
         descriptor: masterDescriptor,
         enrolledAt: new Date().toISOString(),
         score: avgScore,
         samplesUsed: validDescriptors.length,
       };
       this.faceDatabase.set(userId, faceData);
+      this.faceDatabase.set(this._normalizeKey(userId), faceData);
 
-      // Persist to Google Sheets (Column I: faceDescriptor, Column J: faceStatus)
+      // Persist to Google Sheets
       const saved = await this.saveFaceToSheet(userId, masterDescriptor, avgScore);
       if (!saved) {
         console.warn('⚠️ Face saved in memory but Sheets save failed');
@@ -371,7 +390,25 @@ class FaceRecognitionService {
 
   // ==================== FACE VERIFICATION ====================
 
-  async verifyFace(userId, imageBuffer, threshold = 0.6) {
+  /**
+   * Look up face entry with case-insensitivity and automatic Sheets fallback
+   */
+  async getFaceEntry(userId) {
+    if (!userId) return null;
+    const normKey = this._normalizeKey(userId);
+
+    let entry = this.faceDatabase.get(userId) || this.faceDatabase.get(normKey);
+
+    if (!entry) {
+      console.log(`⚠️ User "${userId}" not in memory cache — reloading from Sheets...`);
+      await this.loadFacesFromSheet();
+      entry = this.faceDatabase.get(userId) || this.faceDatabase.get(normKey);
+    }
+
+    return entry;
+  }
+
+  async verifyFace(userId, imageBuffer, threshold = 0.65) {
     console.log(`\n🔍 VERIFYING FACE: ${userId} (threshold: ${threshold})`);
 
     try {
@@ -379,12 +416,7 @@ class FaceRecognitionService {
         return { success: false, message: 'Invalid user ID' };
       }
 
-      if (!this.faceDatabase.has(userId)) {
-        console.log(`⚠️ User ${userId} not in memory cache — reloading from Sheets...`);
-        await this.loadFacesFromSheet();
-      }
-
-      const storedFace = this.faceDatabase.get(userId);
+      const storedFace = await this.getFaceEntry(userId);
       if (!storedFace) {
         return {
           success: false,
@@ -398,8 +430,8 @@ class FaceRecognitionService {
       // Distance between stored master descriptor and current frame
       const distance = this.euclideanDistance(storedFace.descriptor, result.descriptor);
       const isMatch = distance < threshold;
-      const confidence = Math.max(0, Math.min(1, 1 - distance));
-      const similarityPercent = (confidence * 100).toFixed(1);
+      const confidence = Math.max(0, Math.min(1, 1 - (distance / threshold) * 0.5));
+      const similarityPercent = Math.max(0, Math.min(100, (1 - (distance / (threshold * 1.5))) * 100)).toFixed(1);
 
       console.log(`   Distance: ${distance.toFixed(4)} | Match: ${isMatch} | Confidence: ${confidence.toFixed(4)} (${similarityPercent}%) | Angle: ${result.rotationAngle}°`);
 
@@ -441,18 +473,26 @@ class FaceRecognitionService {
 
   async deleteFace(userId) {
     console.log(`🗑️ Deleting face for user: ${userId}`);
-    if (!this.faceDatabase.has(userId)) {
-      return { success: false, message: 'No face enrolled for this user' };
-    }
+    const normKey = this._normalizeKey(userId);
     this.faceDatabase.delete(userId);
+    this.faceDatabase.delete(normKey);
     await this.clearFaceFromSheet(userId);
     console.log(`✅ Face deleted for ${userId}`);
     return { success: true, message: 'Face deleted successfully' };
   }
 
-  getEnrolledCount() { return this.faceDatabase.size; }
-  isUserEnrolled(userId) { return this.faceDatabase.has(userId); }
-  getEnrolledUsers() { return Array.from(this.faceDatabase.keys()); }
+  getEnrolledCount() { return Math.floor(this.faceDatabase.size / 2); }
+  isUserEnrolled(userId) {
+    const normKey = this._normalizeKey(userId);
+    return this.faceDatabase.has(userId) || this.faceDatabase.has(normKey);
+  }
+  getEnrolledUsers() {
+    const set = new Set();
+    for (const [key, val] of this.faceDatabase.entries()) {
+      if (val && val.rawUserId) set.add(val.rawUserId);
+    }
+    return Array.from(set);
+  }
 }
 
 module.exports = new FaceRecognitionService();

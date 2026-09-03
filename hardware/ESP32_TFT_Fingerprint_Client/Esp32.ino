@@ -2038,19 +2038,29 @@ bool postFaceVerify(
           response
       );
 
-  if (!ok)
+  if (!ok && response.indexOf("\"success\":true") < 0)
     return false;
 
-  DynamicJsonDocument doc(768);
+  DynamicJsonDocument doc(1024);
+
+  // Clean JSON boundary extraction
+  int jsonStart = response.indexOf('{');
+  int jsonEnd = response.lastIndexOf('}');
+  String jsonBody = (jsonStart >= 0 && jsonEnd > jsonStart)
+      ? response.substring(jsonStart, jsonEnd + 1)
+      : response;
 
   if (
       deserializeJson(
           doc,
-          response
+          jsonBody
       ) !=
       DeserializationError::Ok)
   {
-    return false;
+    Serial.println(
+        "JSON parse note: falling back to string match"
+    );
+    return response.indexOf("\"success\":true") >= 0;
   }
 
   bool success =
@@ -2128,29 +2138,32 @@ bool postFaceEnroll(
           response
       );
 
-  if (!ok)
+  if (!ok && response.indexOf("\"success\":true") < 0)
     return false;
 
-  DynamicJsonDocument doc(512);
+  int jsonStart = response.indexOf('{');
+  int jsonEnd = response.lastIndexOf('}');
+  String jsonBody = (jsonStart >= 0 && jsonEnd > jsonStart)
+      ? response.substring(jsonStart, jsonEnd + 1)
+      : response;
+
+  DynamicJsonDocument doc(1024);
 
   if (
       deserializeJson(
           doc,
-          response
+          jsonBody
       ) !=
       DeserializationError::Ok)
   {
-    return false;
+    return response.indexOf("\"success\":true") >= 0;
   }
 
-  return
-      doc["success"] |
-      false;
+  return doc["success"] | false;
 }
 
 // ============================================================
 // USER LOOKUP
-// ============================================================
 
 bool getUserByFingerId(
     int fingerId,

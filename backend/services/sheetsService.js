@@ -250,22 +250,24 @@ async function findRowIndex(sheetName, columnName, value) {
     }
     
     // Normalize search value
-    const searchValue = String(value).trim();
+    const searchValue = String(value || '').trim().toLowerCase();
+    const targetCol = String(columnName || '').trim().toLowerCase();
     
-    // Find matching row
+    // Find matching row (case-insensitive column name and value)
     const rowIndex = data.findIndex(row => {
-      const cellValue = String(row[columnName] || '').trim();
+      // Find matching key in row object
+      const matchingKey = Object.keys(row).find(k => k.trim().toLowerCase() === targetCol);
+      if (!matchingKey) return false;
+      const cellValue = String(row[matchingKey] || '').trim().toLowerCase();
       return cellValue === searchValue;
     });
     
     if (rowIndex === -1) {
       console.log(`❌ Value "${value}" not found in column "${columnName}"`);
-      console.log(`   Available values:`, data.slice(0, 5).map(r => r[columnName]));
       return -1;
     }
     
-    // Convert array index to Google Sheets row number
-    // Array index 0 = Row 2 in Google Sheets (Row 1 is header)
+    // Convert array index to Google Sheets row number (Array index 0 = Row 2 in Google Sheets)
     const googleSheetsRowNumber = rowIndex + 2;
     
     console.log(`✅ Found "${value}" at row ${googleSheetsRowNumber}`);
