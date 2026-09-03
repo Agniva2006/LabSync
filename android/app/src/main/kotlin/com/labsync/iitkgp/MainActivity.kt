@@ -1,4 +1,4 @@
-﻿package com.example.qr_flutter
+package com.labsync.iitkgp
 
 import io.flutter.embedding.android.FlutterActivity
 

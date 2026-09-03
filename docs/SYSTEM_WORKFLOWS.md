@@ -169,8 +169,38 @@ To eliminate Google Sheets API rate-limit quota exhaustion during frequent 3-sec
 
 ### 2. Network Resilience & Auto-Discovery
 - **mDNS Auto-Discovery**: ESP32 client resolves `esp32cam.local` dynamically over mDNS.
-- **Hardcoded IP Fallback**: If mDNS fails due to router isolation, the firmware automatically falls back to static IP (`http://192.168.154.133`).
+- **Configurable IP Fallback**: If mDNS fails due to router isolation, set `CAMERA_IP_FALLBACK` in `Esp32.ino` to the camera's static IP.
 - **HTTP Timeout Margin**: Client HTTP request timeouts are set to **45 seconds** to accommodate network jitter.
+
+### 3. Camera Power Management (v3.0)
+The ESP32-CAM operates in a low-power lifecycle to reduce heat and power consumption:
+
+```
+┌─────────────────────────┐
+│  IDLE STATE             │
+│  Camera: OFF (deinit)   │
+│  WiFi: Modem Sleep      │ ← Default state between captures
+│  Endpoint: /status only │
+└────────────┬────────────┘
+             │ GET /start
+             ▼
+┌─────────────────────────┐
+│  ACTIVE STATE           │
+│  Camera: ON (esp_init)  │
+│  WiFi: Full Power       │
+│  Endpoints: /capture    │ ← Serves JPEG frames (640x480 VGA)
+└────────────┬────────────┘
+             │ GET /stop
+             ▼
+┌─────────────────────────┐
+│  SHUTDOWN               │
+│  esp_camera_deinit()    │
+│  Camera: Powered Down   │ ← Returns to IDLE state
+│  WiFi: Modem Sleep      │
+└─────────────────────────┘
+```
+
+**Power savings**: ~60% reduction in active current draw when camera is idle vs always-on.
 
 ---
 

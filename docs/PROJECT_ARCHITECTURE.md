@@ -85,10 +85,11 @@ LabSync-main/
 │   └── package.json
 │
 ├── hardware/                       # Microcontroller Firmware (Arduino C++)
+│   ├── FLASHING_GUIDE.md           # Step-by-step flashing instructions for lab personnel
 │   ├── ESP32_TFT_Fingerprint_Client/
-│   │   └── ESP32_TFT_Fingerprint_Client.ino  # Main room access board firmware
+│   │   └── Esp32.ino              # v3.2 — Main room access board firmware (idle animation, mDNS + IP fallback)
 │   └── ESP32_CAM_Server/
-│       └── ESP32_CAM_Server.ino              # Camera module firmware
+│       └── Camera.ino             # v3.0 — Low-power camera server (OV2640 power-down, modem sleep)
 │
 ├── lib/                            # Flutter Cross-Platform Application
 │   ├── core/                       # App colors, constants, global state
@@ -104,6 +105,7 @@ LabSync-main/
 └── docs/                           # Documentation & Guides
     ├── PROJECT_ARCHITECTURE.md     # This document
     └── SYSTEM_WORKFLOWS.md         # Detailed sequence flows & error handling
+
 ```
 
 ---
@@ -150,14 +152,17 @@ LabSync uses a Google Spreadsheet (`LabSync DB`) as its primary database. Each t
   - Multi-sample descriptor averaging combines multiple captures into a master 128-float face embedding.
 
 ### Hardware Modules (ESP32 & ESP32-CAM)
-1. **ESP32 TFT & Fingerprint Client**:
+1. **ESP32 TFT & Fingerprint Client** (`Esp32.ino` v3.2):
    - Interfaced with Adafruit Optical Fingerprint Sensor over UART (57600 baud).
-   - ST7789 / ILI9341 TFT display for real-time status and bounding box visualization.
+   - ILI9341 TFT display for real-time status, bounding box visualization, and idle animation.
    - Non-blocking HTTP polling loop fetches door unlock/enrollment commands every 3s.
    - Step 2 fingerprint enrollment retry loop (up to 4 attempts) prevents touch-release mismatch errors.
-2. **ESP32-CAM Server**:
+   - mDNS camera discovery with configurable hardcoded IP fallback for hotspot networks.
+2. **ESP32-CAM Server** (`Camera.ino` v3.0):
    - Operates OV2640 camera sensor at **VGA (640x480)** resolution with hardware contrast (+1), brightness (+1), and auto-exposure control.
    - Exposes `/capture`, `/start`, `/stop`, and `/status` endpoints.
+   - **Low-power mode**: Camera sensor powered down between captures using `esp_camera_deinit()`. WiFi modem sleep enabled when idle.
+   - mDNS hostname: `esp32cam.local` for automatic LAN discovery.
 
 ### Frontend Flutter Application
 - Responsive web and mobile client featuring a dark glassmorphism aesthetic.

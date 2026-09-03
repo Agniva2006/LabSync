@@ -310,22 +310,29 @@ router.delete('/:userId', verifyToken, async (req, res) => {
       // Update user's face status in database
       try {
         const users = await getSheetData('USERS');
-        const userIndex = await findRowIndex('USERS', 'userid', userId);
+        let userIndex = await findRowIndex('USERS', 'userid', userId);
+        if (userIndex === -1) {
+          userIndex = await findRowIndex('USERS', 'userId', userId);
+        }
         
         if (userIndex !== -1) {
-          const user = users[userIndex];
-          await updateRow('USERS', userIndex, [
-            user.userid,
-            user.username,
-            user.email,
-            user.password,
-            user.role,
-            user.department,
-            user.authorized_rooms || '',
-            user.fingerprint || '',
-            'NOT_ENROLLED', // face_status
-          ]);
-          console.log('✅ User record updated in database');
+          // Find user from data array (findRowIndex returns Sheets row, not array index)
+          const user = users.find(u => (u.userid || u.userId) === userId);
+          if (user) {
+            await updateRow('USERS', userIndex, [
+              user.userid || user.userId,
+              user.username || user.name || '',
+              user.email || '',
+              user.password || '',
+              user.role || 'user',
+              user.department || '',
+              user.authorized_rooms || '',
+              user.fingerprintid || user.fingerprintId || '',
+              '',             // Clear faceDescriptor
+              'NOT_ENROLLED', // Reset faceStatus
+            ]);
+            console.log('✅ User record updated in database');
+          }
         }
       } catch (dbError) {
         console.error('⚠️ Database update failed:', dbError.message);
