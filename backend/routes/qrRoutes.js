@@ -137,10 +137,21 @@ router.post('/scan', async (req, res) => {
 
       // Update ACTIVE_BORROWS record
       const borrows = await getSheetData('ACTIVE_BORROWS');
-      const borrowIndex = borrows.findIndex(b => 
-        (b.objectId === objId || b.equipmentId === objId) && 
-        (b.status || '').toLowerCase() === 'active'
-      );
+      let borrowIndex = -1;
+      if (userId) {
+        const normUserId = String(userId).trim().toLowerCase();
+        borrowIndex = borrows.findIndex(b => 
+          (b.objectId === objId || b.equipmentId === objId) && 
+          (b.status || '').toLowerCase() === 'active' &&
+          String(b.userId || '').trim().toLowerCase() === normUserId
+        );
+      }
+      if (borrowIndex === -1) {
+        borrowIndex = borrows.findIndex(b => 
+          (b.objectId === objId || b.equipmentId === objId) && 
+          (b.status || '').toLowerCase() === 'active'
+        );
+      }
 
       if (borrowIndex !== -1) {
         const b = borrows[borrowIndex];

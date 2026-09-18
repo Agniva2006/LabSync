@@ -153,6 +153,9 @@ router.post('/enroll-hardware', upload.single('faceImage'), handleMulterError, a
     res.json({
       success: true,
       message: result.message || 'Face enrolled successfully via hardware',
+      box: result.box || null,
+      confidence: result.confidence || 0,
+      samplesUsed: result.samplesUsed || 1,
     });
 
   } catch (error) {

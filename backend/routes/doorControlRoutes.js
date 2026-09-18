@@ -44,7 +44,7 @@ router.post('/remote-unlock', verifyToken, verifyAdmin, validateRequest(schemas.
 // Admin triggers fingerprint enrollment for a user via ESP32
 router.post('/start-enrollment', verifyToken, verifyAdmin, async (req, res) => {
   try {
-    const { roomId, userId, userName } = req.body;
+    const { roomId, userId, userName, role } = req.body;
     const adminId = req.user.userId;
 
     if (!roomId || !userId || !userName) {
@@ -58,18 +58,20 @@ router.post('/start-enrollment', verifyToken, verifyAdmin, async (req, res) => {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
+    const assignedRole = role || user.role || 'user';
+
     // Clear any previous enrollment status for this user
     enrollmentStatus.delete(userId);
 
     // Queue ENROLL command for ESP32 to pick up (uses shared pendingCommands)
     pendingCommands.set(roomId, {
-      command: `ENROLL:${userId}:${userName}`,
+      command: `ENROLL:${userId}:${userName}:${assignedRole}`,
       userName,
       adminId,
       timestamp: new Date().toISOString(),
     });
 
-    console.log(`📝 Enrollment command queued for ${userName} (${userId}) → Room ${roomId}`);
+    console.log(`📝 Enrollment command queued for ${userName} (${userId}) [Role: ${assignedRole}] → Room ${roomId}`);
 
     // Notify the user
     await createNotification(

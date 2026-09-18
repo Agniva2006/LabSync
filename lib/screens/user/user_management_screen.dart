@@ -3,6 +3,7 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'dart:io';
 import 'package:image_picker/image_picker.dart';
+import '../../core/constants.dart';
 
 class UserManagementScreen extends StatefulWidget {
   @override
@@ -13,7 +14,7 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
   List<dynamic> users = [];
   bool isLoading = true;
 
-  final String backendUrl = "https://labsync-backend-e2o8.onrender.com/api";
+  final String backendUrl = AppConstants.baseUrl;
 
   @override
   void initState() {
@@ -271,7 +272,7 @@ class _FaceEnrollScreenState extends State<FaceEnrollScreen> {
   final ImagePicker _picker = ImagePicker();
 
   final String faceApiUrl = "https://labsync-face-api.onrender.com";
-  final String mainBackendUrl = "https://labsync-backend-e2o8.onrender.com/api";
+  final String mainBackendUrl = AppConstants.baseUrl;
 
   Future<void> _captureAndEnroll() async {
     final XFile? photo = await _picker.pickImage(source: ImageSource.camera);

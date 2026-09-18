@@ -255,11 +255,37 @@ class FaceRecognitionService {
 
           if (detection) {
             console.log(`   ✅ Face detected at angle ${angle}° (conf: ${minConf}) — score: ${detection.detection.score.toFixed(4)}`);
+            const dBox = detection.detection.box;
+            let origBox = { x: dBox.x, y: dBox.y, width: dBox.width, height: dBox.height };
+
+            if (angle === 180) {
+              origBox = {
+                x: rawImg.width - dBox.x - dBox.width,
+                y: rawImg.height - dBox.y - dBox.height,
+                width: dBox.width,
+                height: dBox.height,
+              };
+            } else if (angle === 90) {
+              origBox = {
+                x: dBox.y,
+                y: rawImg.height - dBox.x - dBox.width,
+                width: dBox.height,
+                height: dBox.width,
+              };
+            } else if (angle === 270) {
+              origBox = {
+                x: rawImg.width - dBox.y - dBox.height,
+                y: dBox.x,
+                width: dBox.height,
+                height: dBox.width,
+              };
+            }
+
             return {
               success: true,
               descriptor: Array.from(detection.descriptor), // 128 floats
               landmarks: detection.landmarks,
-              box: detection.detection.box,
+              box: origBox,
               score: detection.detection.score,
               rotationAngle: angle,
             };
@@ -327,6 +353,7 @@ class FaceRecognitionService {
       const validDescriptors = [];
       const scores = [];
       let lastAngle = 0;
+      let lastBox = null;
 
       for (let i = 0; i < imageBuffers.length; i++) {
         console.log(`   Processing sample ${i + 1}/${imageBuffers.length}...`);
@@ -335,6 +362,7 @@ class FaceRecognitionService {
           validDescriptors.push(result.descriptor);
           scores.push(result.score);
           lastAngle = result.rotationAngle || 0;
+          if (result.box) lastBox = result.box;
         } else {
           console.warn(`   ⚠️ Sample ${i + 1} face detection failed: ${result.message}`);
         }
@@ -376,6 +404,12 @@ class FaceRecognitionService {
         confidence: avgScore,
         samplesUsed: validDescriptors.length,
         rotationAngle: lastAngle,
+        box: lastBox ? {
+          x: Math.round(lastBox.x),
+          y: Math.round(lastBox.y),
+          w: Math.round(lastBox.width),
+          h: Math.round(lastBox.height),
+        } : null,
       };
     } catch (error) {
       console.error('❌ Multi-sample enrollment error:', error.message);

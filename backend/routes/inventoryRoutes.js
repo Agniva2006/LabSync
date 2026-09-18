@@ -6,7 +6,8 @@ const { getSheetData, appendRow, updateRow, findRowIndex } = require('../service
 router.get('/', async (req, res) => {
   try {
     const data = await getSheetData('OBJECTS');
-    res.json({ success: true, data });
+    const activeData = data.filter(item => (item.status || '').toLowerCase() !== 'deleted');
+    res.json({ success: true, data: activeData });
   } catch (error) {
     console.error('Error fetching inventory:', error);
     res.status(500).json({ success: false, message: error.message });
@@ -54,8 +55,9 @@ router.get('/borrow-history/:userId', async (req, res) => {
     const allBorrows = await getSheetData('ACTIVE_BORROWS');
     const allEquipment = await getSheetData('OBJECTS');
     
-    // Filter borrows for this specific user
-    let userBorrows = allBorrows.filter(item => item.userId === userId);
+    // Filter borrows for this specific user (case-insensitive)
+    const targetUserId = String(userId || '').trim().toLowerCase();
+    let userBorrows = allBorrows.filter(item => String(item.userId || '').trim().toLowerCase() === targetUserId);
     
     // ✅ Enrich borrow records with equipment details
     userBorrows = userBorrows.map(borrow => {
@@ -151,7 +153,7 @@ router.put('/update/:objectId', async (req, res) => {
   }
 });
 
-// DELETE /api/inventory/delete/:objectId - Delete equipment (Optional)
+// DELETE /api/inventory/delete/:objectId - Soft delete equipment
 router.delete('/delete/:objectId', async (req, res) => {
   try {
     const { objectId } = req.params;
@@ -160,15 +162,36 @@ router.delete('/delete/:objectId', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Object ID is required' });
     }
     
+    const allEquipment = await getSheetData('OBJECTS');
     const rowIndex = await findRowIndex('OBJECTS', 'objectId', objectId);
     
     if (rowIndex === -1) {
       return res.status(404).json({ success: false, message: 'Equipment not found' });
     }
+
+    const equipment = allEquipment.find(item => item.objectId === objectId);
+    if (!equipment) {
+      return res.status(404).json({ success: false, message: 'Equipment not found' });
+    }
     
-    res.status(501).json({ 
-      success: false, 
-      message: 'Delete functionality not implemented. Use update to change status to "Deleted"' 
+    const updatedRow = [
+      equipment.objectId,
+      equipment.objectName,
+      equipment.room,
+      'Deleted',
+      equipment.qrCode || '',
+      equipment.category || '',
+      equipment.imageUrl || '',
+      equipment.description || ''
+    ];
+
+    await updateRow('OBJECTS', rowIndex, updatedRow);
+
+    console.log(`🗑️ Equipment soft-deleted: ${equipment.objectName} (${objectId})`);
+    res.json({ 
+      success: true, 
+      message: 'Equipment marked as deleted successfully',
+      objectId 
     });
   } catch (error) {
     console.error('Error deleting equipment:', error);
@@ -283,7 +306,11 @@ router.post('/return', async (req, res) => {
     
     const borrowRecord = allBorrows[borrowIndex];
     
-    if (borrowRecord.userId !== userId) {
+    const requesterId = String(userId || '').trim().toLowerCase();
+    const borrowerId = String(borrowRecord.userId || '').trim().toLowerCase();
+    const isAdmin = req.body.isAdmin === true || req.body.role === 'admin';
+
+    if (!isAdmin && borrowerId !== requesterId) {
       return res.json({ success: false, message: 'This equipment is borrowed by another user' });
     }
     

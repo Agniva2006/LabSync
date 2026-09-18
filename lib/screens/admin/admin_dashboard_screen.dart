@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import '../../core/constants.dart';
 
 class AdminDashboardScreen extends StatefulWidget {
   @override
@@ -12,7 +13,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
   List<dynamic> recentLogs = [];
   bool isLoading = true;
 
-  final String backendUrl = "https://labsync-backend-e2o8.onrender.com/api";
+  final String backendUrl = AppConstants.baseUrl;
 
   @override
   void initState() {

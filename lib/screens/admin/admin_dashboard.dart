@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
-import 'package:go_router/go_router.dart';
 import 'package:fl_chart/fl_chart.dart';
 import '../../core/constants.dart';
 import '../../widgets/glass_card.dart';
@@ -44,6 +43,10 @@ class _AdminDashboardState extends State<AdminDashboard> {
         _buildUsersList(),
         const AdminRequestsScreen(),
         const RoomAccessScreen(),
+        AdminDoorControlScreen(
+          userId: CurrentUser.userId,
+          roomId: 'ROOM-001',
+        ),
         const LiveOccupancyScreen(),
         const AdminProfileScreen(),
       ];
@@ -182,9 +185,12 @@ class _AdminDashboardState extends State<AdminDashboard> {
                   4, Icons.door_sliding_outlined, Icons.door_sliding, 'ROOMS'),
               const SizedBox(width: 2),
               _buildNavItem(
-                  5, Icons.analytics_outlined, Icons.analytics, 'LIVE'),
+                  5, Icons.door_front_door_outlined, Icons.door_front_door, 'DOOR CTRL'),
               const SizedBox(width: 2),
-              _buildNavItem(6, Icons.person_outline, Icons.person, 'PROFILE'),
+              _buildNavItem(
+                  6, Icons.analytics_outlined, Icons.analytics, 'LIVE'),
+              const SizedBox(width: 2),
+              _buildNavItem(7, Icons.person_outline, Icons.person, 'PROFILE'),
             ],
           ),
         ),
@@ -348,7 +354,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
           IconButton(
             icon: const Icon(Icons.account_circle_outlined, color: AppColors.neonPurple),
             tooltip: 'Admin Profile',
-            onPressed: () => setState(() => _selectedIndex = 6),
+            onPressed: () => setState(() => _selectedIndex = 7),
           ),
         ],
       ),
@@ -417,18 +423,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
                                   icon: Icons.door_front_door,
                                   label: 'DOOR CONTROL',
                                   color: AppColors.neonCyan,
-                                  onTap: () {
-                                    Navigator.push(
-                                      context,
-                                      MaterialPageRoute(
-                                        builder: (context) =>
-                                            AdminDoorControlScreen(
-                                          userId: CurrentUser.userId,
-                                          roomId: 'ROOM-001',
-                                        ),
-                                      ),
-                                    );
-                                  },
+                                  onTap: () =>
+                                      setState(() => _selectedIndex = 5),
                                 ),
                               ),
                               const SizedBox(width: 12),
@@ -438,7 +434,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
                                   label: 'LIVE OCCUPANCY',
                                   color: AppColors.success,
                                   onTap: () =>
-                                      setState(() => _selectedIndex = 5),
+                                      setState(() => _selectedIndex = 6),
                                 ),
                               ),
                             ],

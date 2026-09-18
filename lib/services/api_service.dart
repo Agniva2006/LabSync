@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -755,7 +754,7 @@ class ApiService {
             headers: await _getAuthHeaders(),
             body: jsonEncode({
               'roomId': roomId,
-              'command': 'ENROLL:$userId:$userName',
+              'command': 'ENROLL:$userId:$userName:${role ?? 'user'}',
               'userId': userId,
               'userName': userName,
               'adminId': adminId,

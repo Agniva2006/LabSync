@@ -120,6 +120,7 @@ router.post('/send-command', async (req, res) => {
       const parts = command.split(':');
       const targetUserId = parts[1] || userId;
       const targetUserName = parts[2] || userName || 'New User';
+      const targetRole = (parts[3] || role || 'user').trim().toLowerCase();
 
       try {
         const bcrypt = require('bcryptjs');
@@ -134,14 +135,14 @@ router.post('/send-command', async (req, res) => {
             targetUserName,
             email || '',
             defaultHash,
-            role || 'user',
+            targetRole,
             department || '',
             authorizedRooms || roomId,
             '',   // fingerprintId
             '',   // faceDescriptor
             'NOT_ENROLLED'
           ]);
-          console.log(`✅ Created user ${targetUserName} (${targetUserId}) in USERS sheet [Role: ${role || 'user'}]`);
+          console.log(`✅ Created user ${targetUserName} (${targetUserId}) in USERS sheet [Role: ${targetRole}]`);
         } else {
           // Update existing user details if role/email/department/authorizedRooms changed
           const existingUser = users[userIndex];
@@ -151,14 +152,14 @@ router.post('/send-command', async (req, res) => {
             targetUserName,
             email || existingUser.email || '',
             existingUser.password,
-            role || existingUser.role || 'user',
+            targetRole || existingUser.role || 'user',
             department || existingUser.department || '',
             authorizedRooms || existingUser.authorized_rooms || roomId,
             existingUser.fingerprintid || existingUser.fingerprintId || '',
             existingUser.facedescriptor || existingUser.faceDescriptor || '',
             existingUser.facestatus || existingUser.faceStatus || 'NOT_ENROLLED'
           ]);
-          console.log(`🔄 Updated user details for ${targetUserName} (${targetUserId}) in USERS sheet [Role: ${role || existingUser.role}]`);
+          console.log(`🔄 Updated user details for ${targetUserName} (${targetUserId}) in USERS sheet [Role: ${targetRole || existingUser.role}]`);
         }
       } catch (dbErr) {
         console.error('❌ Error syncing user to USERS sheet during enroll:', dbErr.message);
@@ -199,24 +200,20 @@ router.post('/send-command', async (req, res) => {
   }
 });
 
-// ==================== POST /api/esp32/door-closed ====================
-// ESP32 reports that the door relay has closed
+// ==================== DOOR CLOSED EVENT ====================
 router.post('/door-closed', async (req, res) => {
   try {
-    const { roomId } = req.body;
-    if (!roomId) {
-      return res.status(400).json({ success: false, message: 'roomId required' });
-    }
+    const { roomId, timestamp } = req.body;
 
-    console.log(`🚪 Door closed mechanically at room ${roomId}`);
+    console.log(`🚪 Door closed in room: ${roomId} at ${timestamp}`);
     
     await logAccessEvent({
       action: 'DOOR_CLOSED',
       authMethod: 'SYSTEM',
-      status: 'SUCCESS',
+      status: 'LOGGED',
       userId: 'SYSTEM',
-      roomId: roomId,
-      details: 'Relay closed by hardware timer'
+      roomId: roomId || 'UNKNOWN',
+      details: 'Physical door magnetic switch closed'
     });
 
     res.json({ success: true, message: 'Door close logged' });
@@ -247,6 +244,87 @@ router.get('/get-commands/:roomId', (req, res) => {
   res.json({ success: true, hasCommand: false });
 });
 
+// ==================== GET NEXT AVAILABLE USER FOR HARDWARE ENROLLMENT ====================
+// ESP32 calls this when an admin initiates enrollment on the hardware terminal
+router.get('/next-available-user', async (req, res) => {
+  try {
+    const bcrypt = require('bcryptjs');
+    const users = await getSheetData('USERS');
+    const requestedRole = (req.query.role || req.body?.role || 'user').trim().toLowerCase();
+    const isAdmin = requestedRole === 'admin';
+
+    // 1. Check for any user marked PENDING or NOT_ENROLLED in Google Sheets matching the role
+    const pendingUser = users.find(u => {
+      const status = (u.facestatus || u.faceStatus || '').toUpperCase();
+      const fp = (u.fingerprintid || u.fingerprintId || '').trim();
+      const userRole = (u.role || 'user').toLowerCase();
+      const roleMatches = !req.query.role || userRole === requestedRole;
+      return roleMatches && (status === 'PENDING' || status === 'NOT_ENROLLED' || fp === '');
+    });
+
+    if (pendingUser) {
+      const userId = pendingUser.userid || pendingUser.userId;
+      const userName = pendingUser.username || pendingUser.name || (isAdmin ? 'Pending Admin' : 'Pending User');
+      const role = pendingUser.role || requestedRole;
+      console.log(`📋 Found pending user in Sheets: ${userName} (${userId}) [Role: ${role}]`);
+      return res.json({
+        found: true,
+        isNew: false,
+        userId,
+        userName,
+        role,
+        message: 'Pending user found in Sheets'
+      });
+    }
+
+    // 2. If no pending user, auto-generate next sequential User/Admin ID
+    const prefix = isAdmin ? 'ADMIN' : 'USER';
+    const regex = new RegExp(`^${prefix}-(\\d+)`, 'i');
+    let maxNum = 100;
+    users.forEach(u => {
+      const id = (u.userid || u.userId || '');
+      const match = id.match(regex);
+      if (match) {
+        const num = parseInt(match[1], 10);
+        if (num > maxNum) maxNum = num;
+      }
+    });
+
+    const nextNum = maxNum + 1;
+    const newUserId = `${prefix}-${nextNum}`;
+    const newUserName = isAdmin ? `Admin ${nextNum}` : `User ${nextNum}`;
+    const defaultHash = await bcrypt.hash('user123', 10);
+
+    // Create entry in Google Sheets
+    await appendRow('USERS', [
+      newUserId,
+      newUserName,
+      `${prefix.toLowerCase()}${nextNum}@iitkgp.ac.in`,
+      defaultHash,
+      requestedRole,
+      'Laboratory',
+      'ROOM-001',
+      '',   // fingerprintId (will be updated after hardware scan)
+      '',   // faceDescriptor (will be updated after camera scan)
+      'NOT_ENROLLED'
+    ]);
+
+    console.log(`✨ Auto-generated new ${requestedRole} for hardware enrollment: ${newUserName} (${newUserId})`);
+
+    res.json({
+      found: true,
+      isNew: true,
+      userId: newUserId,
+      userName: newUserName,
+      role: requestedRole,
+      message: `New sequential ${requestedRole} created`
+    });
+  } catch (error) {
+    console.error('❌ next-available-user error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ==================== GET USER BY FINGERPRINT ID ====================
 // ESP32 calls this after fingerSearch() to get the matching userId
 router.get('/user-by-finger/:fingerId', async (req, res) => {
@@ -267,7 +345,7 @@ router.get('/user-by-finger/:fingerId', async (req, res) => {
     const userId = user.userid || user.userId;
     const userName = user.username || user.name;
 
-    console.log(`✅ Fingerprint ${fingerId} → User: ${userName} (${userId})`);
+    console.log(`✅ Fingerprint ${fingerId} → User: ${userName} (${userId}) [Role: ${user.role}]`);
     res.json({ found: true, userId, userName, role: user.role });
   } catch (error) {
     console.error('❌ user-by-finger error:', error);
@@ -278,10 +356,10 @@ router.get('/user-by-finger/:fingerId', async (req, res) => {
 // ==================== ENROLLMENT COMPLETE (ESP32 calls after enroll) ====================
 router.post('/enrollment-complete', async (req, res) => {
   try {
-    const { fingerId, userId, userName, roomId } = req.body;
+    const { fingerId, userId, userName, roomId, role } = req.body;
 
     console.log(`\n📝 ENROLLMENT COMPLETE`);
-    console.log(`   Finger ID: ${fingerId} | User: ${userName} (${userId})`);
+    console.log(`   Finger ID: ${fingerId} | User: ${userName} (${userId}) | Role: ${role || 'N/A'}`);
 
     // Track in-memory for polling
     enrollmentStatus.set(userId, {
@@ -289,6 +367,7 @@ router.post('/enrollment-complete', async (req, res) => {
       fingerprintId: fingerId,
       enrolledAt: new Date().toISOString(),
       userName,
+      role: role || 'user',
     });
 
     // Update USERS sheet fingerprintId column
@@ -303,14 +382,14 @@ router.post('/enrollment-complete', async (req, res) => {
         user.username || user.name,
         user.email,
         user.password,
-        user.role,
+        role || user.role || 'user',
         user.department,
         user.authorized_rooms || '',
         fingerId.toString(),                            // fingerprintId
         user.facedescriptor || user.faceDescriptor || '', // preserve faceDescriptor
         user.facestatus || user.faceStatus || 'NOT_ENROLLED',
       ]);
-      console.log(`✅ Updated fingerprintId to ${fingerId} for user ${userId}`);
+      console.log(`✅ Updated fingerprintId to ${fingerId} for user ${userId} [Role: ${role || user.role}]`);
     }
 
     // Send notification to user

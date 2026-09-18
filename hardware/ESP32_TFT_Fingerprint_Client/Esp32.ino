@@ -1329,6 +1329,57 @@ void prepareCameraScreen(
 }
 
 // ============================================================
+// FACE BOUNDING BOX & TFT PROJECTION
+// ============================================================
+
+struct FaceBox {
+  int x;
+  int y;
+  int w;
+  int h;
+  bool valid;
+};
+
+static int16_t lastJpegDrawX = 0;
+static int16_t lastJpegDrawY = 0;
+static uint8_t lastJpegScale = 1;
+
+void drawDynamicFaceBox(int x, int y, int w, int h, uint16_t color)
+{
+  int16_t minY = HEADER_HEIGHT + 20;
+  int16_t maxY = tft.height() - STATUS_HEIGHT - 4;
+  int16_t minX = 0;
+  int16_t maxX = tft.width();
+
+  if (x < minX) { w -= (minX - x); x = minX; }
+  if (y < minY) { h -= (minY - y); y = minY; }
+  if (x + w > maxX) w = maxX - x;
+  if (y + h > maxY) h = maxY - y;
+  if (w <= 10 || h <= 10) return;
+
+  // Outer high-tech bounding rectangle
+  tft.drawRect(x, y, w, h, color);
+  tft.drawRect(x + 1, y + 1, w - 2, h - 2, color);
+
+  // Corner HUD brackets for visual punch
+  int k = min(16, min(w / 3, h / 3));
+  if (k > 3) {
+    // Top-Left corner
+    tft.drawFastHLine(x, y - 1, k, color);
+    tft.drawFastVLine(x - 1, y, k, color);
+    // Top-Right corner
+    tft.drawFastHLine(x + w - k, y - 1, k, color);
+    tft.drawFastVLine(x + w, y, k, color);
+    // Bottom-Left corner
+    tft.drawFastHLine(x, y + h, k, color);
+    tft.drawFastVLine(x - 1, y + h - k, k, color);
+    // Bottom-Right corner
+    tft.drawFastHLine(x + w - k, y + h, k, color);
+    tft.drawFastVLine(x + w, y + h - k, k, color);
+  }
+}
+
+// ============================================================
 // DISPLAY JPEG
 // ============================================================
 
@@ -1401,6 +1452,10 @@ bool displayJpegOnTFT(
         drawHeight) /
        2);
 
+  lastJpegDrawX = x;
+  lastJpegDrawY = y;
+  lastJpegScale = scale;
+
   return
       TJpgDec.drawJpg(
           x,
@@ -1408,6 +1463,45 @@ bool displayJpegOnTFT(
           buf,
           len
       ) == JDR_OK;
+}
+
+// ============================================================
+// FACE RETICLE VIEWFINDER
+// ============================================================
+
+void drawFaceReticle(uint16_t color)
+{
+  int16_t cx = tft.width() / 2;
+  int16_t cy = (HEADER_HEIGHT + 20 + tft.height() - STATUS_HEIGHT - 4) / 2;
+  int16_t w = 110;
+  int16_t h = 130;
+  int16_t x0 = cx - w / 2;
+  int16_t y0 = cy - h / 2;
+  int16_t k = 14;
+
+  // Top-Left
+  tft.drawFastHLine(x0, y0, k, color);
+  tft.drawFastHLine(x0, y0 + 1, k, color);
+  tft.drawFastVLine(x0, y0, k, color);
+  tft.drawFastVLine(x0 + 1, y0, k, color);
+
+  // Top-Right
+  tft.drawFastHLine(x0 + w - k, y0, k, color);
+  tft.drawFastHLine(x0 + w - k, y0 + 1, k, color);
+  tft.drawFastVLine(x0 + w, y0, k, color);
+  tft.drawFastVLine(x0 + w - 1, y0, k, color);
+
+  // Bottom-Left
+  tft.drawFastHLine(x0, y0 + h, k, color);
+  tft.drawFastHLine(x0, y0 + h - 1, k, color);
+  tft.drawFastVLine(x0, y0 + h - k, color);
+  tft.drawFastVLine(x0 + 1, y0 + h - k, color);
+
+  // Bottom-Right
+  tft.drawFastHLine(x0 + w - k, y0 + h, k, color);
+  tft.drawFastHLine(x0 + w - k, y0 + h - 1, k, color);
+  tft.drawFastVLine(x0 + w, y0 + h - k, color);
+  tft.drawFastVLine(x0 + w - 1, y0 + h - k, color);
 }
 
 // ============================================================
@@ -1979,7 +2073,8 @@ bool postFaceVerify(
     const String &userId,
     const String &roomId,
     uint8_t *jpegBuf,
-    size_t jpegLen)
+    size_t jpegLen,
+    FaceBox *outBox = nullptr)
 {
   const String boundary =
       "----LabSyncBoundary7344";
@@ -2071,6 +2166,22 @@ bool postFaceVerify(
       doc["confidence"] |
       0.0f;
 
+  if (outBox != nullptr)
+  {
+    if (doc.containsKey("box") && !doc["box"].isNull())
+    {
+      outBox->x = doc["box"]["x"] | 0;
+      outBox->y = doc["box"]["y"] | 0;
+      outBox->w = doc["box"]["w"] | 0;
+      outBox->h = doc["box"]["h"] | 0;
+      outBox->valid = (outBox->w > 0 && outBox->h > 0);
+    }
+    else
+    {
+      outBox->valid = false;
+    }
+  }
+
   Serial.printf(
       "Face: %s Confidence %.1f%%\n",
       success
@@ -2089,7 +2200,8 @@ bool postFaceVerify(
 bool postFaceEnroll(
     const String &userId,
     uint8_t *jpegBuf,
-    size_t jpegLen)
+    size_t jpegLen,
+    FaceBox *outBox = nullptr)
 {
   const String boundary =
       "----LabSyncBoundary7344";
@@ -2159,16 +2271,36 @@ bool postFaceEnroll(
     return response.indexOf("\"success\":true") >= 0;
   }
 
-  return doc["success"] | false;
+  bool success = doc["success"] | false;
+
+  if (outBox != nullptr)
+  {
+    if (doc.containsKey("box") && !doc["box"].isNull())
+    {
+      outBox->x = doc["box"]["x"] | 0;
+      outBox->y = doc["box"]["y"] | 0;
+      outBox->w = doc["box"]["w"] | 0;
+      outBox->h = doc["box"]["h"] | 0;
+      outBox->valid = (outBox->w > 0 && outBox->h > 0);
+    }
+    else
+    {
+      outBox->valid = false;
+    }
+  }
+
+  return success;
 }
 
 // ============================================================
 // USER LOOKUP
+// ============================================================
 
 bool getUserByFingerId(
     int fingerId,
     String &outUserId,
-    String &outUserName)
+    String &outUserName,
+    String &outRole)
 {
   String response =
       httpGet(
@@ -2207,6 +2339,78 @@ bool getUserByFingerId(
 
   outUserName =
       doc["userName"] | "";
+
+  outRole =
+      doc["role"] | "user";
+
+  return
+      outUserId.length() >
+      0;
+}
+
+// Overload for backward compatibility
+bool getUserByFingerId(
+    int fingerId,
+    String &outUserId,
+    String &outUserName)
+{
+  String dummyRole = "user";
+  return getUserByFingerId(fingerId, outUserId, outUserName, dummyRole);
+}
+
+// ============================================================
+// NEXT AVAILABLE USER FOR HARDWARE ENROLLMENT
+// ============================================================
+
+bool getNextAvailableUser(
+    String &outUserId,
+    String &outUserName,
+    String &outRole,
+    const String &requestedRole = "")
+{
+  String path = "/api/esp32/next-available-user";
+  if (requestedRole.length() > 0)
+  {
+    path += "?role=" + requestedRole;
+  }
+
+  String response =
+      httpGet(path);
+
+  if (
+      response.length() ==
+      0)
+  {
+    return false;
+  }
+
+  DynamicJsonDocument doc(512);
+
+  if (
+      deserializeJson(
+          doc,
+          response
+      ) !=
+      DeserializationError::Ok)
+  {
+    return false;
+  }
+
+  if (
+      !(doc["found"] |
+        false))
+  {
+    return false;
+  }
+
+  outUserId =
+      doc["userId"] | "";
+
+  outUserName =
+      doc["userName"] | "";
+
+  outRole =
+      doc["role"] | "user";
 
   return
       outUserId.length() >
@@ -2400,25 +2604,30 @@ void reportEnrollmentFailure(
 }
 
 // ============================================================
-// ENROLLMENT
+// ENROLLMENT SEQUENCE (STEP 1: FINGERPRINT, STEP 2: FACE)
 // ============================================================
 
 bool runEnrollmentSequence(
     const String &userId,
-    const String &userName)
+    const String &userName,
+    const String &role = "user")
 {
   if (!fingerprintReady)
     return false;
 
+  // ------------------------------------------------------------
+  // STEP 1/2: FINGERPRINT SCAN & MERGE
+  // ------------------------------------------------------------
+
   tftShowFullScreen(
-      "ENROLL FINGER",
+      "ENROLL STEP 1/2",
       userName,
       COLOR_YELLOW
   );
 
   tftShowStatus(
-      "Place finger",
-      "First scan",
+      "Place finger on sensor",
+      "Scan 1 of 2",
       COLOR_YELLOW
   );
 
@@ -2452,9 +2661,9 @@ bool runEnrollmentSequence(
   }
 
   tftShowStatus(
-      "Lift finger",
-      "",
-      COLOR_YELLOW
+      "Lift finger...",
+      "Done scan 1",
+      COLOR_CYAN
   );
 
   while (
@@ -2474,10 +2683,8 @@ bool runEnrollmentSequence(
        attempt++)
   {
     tftShowStatus(
-        "Same finger again",
-        "Attempt " +
-            String(attempt) +
-            "/4",
+        "Place SAME finger",
+        "Scan 2/2 (Att " + String(attempt) + "/4)",
         COLOR_YELLOW
     );
 
@@ -2567,7 +2774,7 @@ bool runEnrollmentSequence(
   {
     tftShowFullScreen(
         "ENROLL FAILED",
-        "No free slots",
+        "No free sensor slots",
         COLOR_RED
     );
 
@@ -2602,6 +2809,8 @@ bool runEnrollmentSequence(
       userId +
       "\",\"userName\":\"" +
       userName +
+      "\",\"role\":\"" +
+      role +
       "\",\"roomId\":\"" +
       String(ROOM_ID) +
       "\"}";
@@ -2611,13 +2820,21 @@ bool runEnrollmentSequence(
       body
   );
 
-  // =========================================================
-  // WAKE CAMERA FOR FACE ENROLLMENT
-  // =========================================================
+  tftShowStatus(
+      "Fingerprint Saved!",
+      "Slot #" + String(nextId),
+      COLOR_GREEN
+  );
+
+  delay(1200);
+
+  // ------------------------------------------------------------
+  // STEP 2/2: FACE REGISTRATION (LIVE TFT PREVIEW)
+  // ------------------------------------------------------------
 
   tftShowFullScreen(
-      "FACE ENROLL",
-      "Waking camera",
+      "ENROLL STEP 2/2",
+      "Waking camera...",
       COLOR_CYAN
   );
 
@@ -2635,7 +2852,7 @@ bool runEnrollmentSequence(
   }
 
   prepareCameraScreen(
-      "FACE ENROLLMENT",
+      "FACE REGISTRATION",
       userName
   );
 
@@ -2666,9 +2883,12 @@ bool runEnrollmentSequence(
           jpegLen
       );
 
+      // Overlay targeting reticle on live stream
+      drawFaceReticle(COLOR_YELLOW);
+
       tftShowStatus(
-          "Look at camera",
-          "Registering face",
+          "Align face in frame",
+          "Capturing biometrics...",
           COLOR_CYAN
       );
 
@@ -2680,38 +2900,55 @@ bool runEnrollmentSequence(
           jpegLen >
               MIN_FACE_JPEG_BYTES)
       {
+        FaceBox enrolledBox;
         faceEnrolled =
             postFaceEnroll(
                 userId,
                 jpegBuffer,
-                jpegLen
+                jpegLen,
+                &enrolledBox
             );
+
+        if (enrolledBox.valid)
+        {
+          int bx = lastJpegDrawX + (enrolledBox.x / lastJpegScale);
+          int by = lastJpegDrawY + (enrolledBox.y / lastJpegScale);
+          int bw = enrolledBox.w / lastJpegScale;
+          int bh = enrolledBox.h / lastJpegScale;
+          drawDynamicFaceBox(bx, by, bw, bh, faceEnrolled ? COLOR_GREEN : COLOR_YELLOW);
+          if (faceEnrolled)
+          {
+            tftShowStatus("Face Captured!", "Biometrics Locked", COLOR_GREEN);
+            delay(800);
+          }
+        }
       }
     }
 
     delay(100);
   }
 
-  /*
-     ALWAYS put camera back into standby,
-     whether enrollment succeeds or fails.
-  */
-
+  // Always put camera back into standby
   stopCamera();
 
   if (faceEnrolled)
   {
     tftShowFullScreen(
-        "ENROLLED",
+        role.equalsIgnoreCase("admin") ? "ADMIN ENROLLED" : "USER ENROLLED",
         userName,
+        COLOR_GREEN
+    );
+    tftShowStatus(
+        "Biometrics Active",
+        "Google Sheets Synced",
         COLOR_GREEN
     );
   }
   else
   {
     tftShowFullScreen(
-        "FACE FAILED",
-        userName,
+        "FACE INCOMPLETE",
+        "Retry from admin menu",
         COLOR_RED
     );
   }
@@ -2722,7 +2959,154 @@ bool runEnrollmentSequence(
 }
 
 // ============================================================
-// ADMIN COMMANDS
+// AUTONOMOUS HARDWARE ENROLLMENT (100% STANDALONE)
+// ============================================================
+
+bool runAutonomousHardwareEnrollment(const String &requestedRole = "user")
+{
+  wakeToActive("Hardware Enrollment");
+
+  tftShowFullScreen(
+      "NEW ENROLLMENT",
+      "Fetching " + requestedRole + " slot...",
+      COLOR_CYAN
+  );
+
+  String userId = "";
+  String userName = "";
+  String role = requestedRole;
+
+  if (!getNextAvailableUser(userId, userName, role, requestedRole))
+  {
+    tftShowFullScreen(
+        "FETCH ERROR",
+        "Could not load " + requestedRole,
+        COLOR_RED
+    );
+    delay(2000);
+    return false;
+  }
+
+  tftShowFullScreen(
+      role.equalsIgnoreCase("admin") ? "ENROLLING ADMIN" : "ENROLLING USER",
+      userName + " (" + userId + ")",
+      COLOR_YELLOW
+  );
+  delay(1200);
+
+  bool success = runEnrollmentSequence(userId, userName, role);
+  return success;
+}
+
+// ============================================================
+// ADMIN HARDWARE MENU (TRIGGERED ON ADMIN LONG-PRESS)
+// ============================================================
+
+void showAdminHardwareMenu(const String &adminName)
+{
+  wakeToActive("Admin Terminal Menu");
+
+  tft.fillScreen(COLOR_BG);
+
+  // Header Banner
+  tft.fillRect(0, 0, tft.width(), 30, COLOR_YELLOW);
+  tft.setTextColor(COLOR_BG, COLOR_YELLOW);
+  tft.setTextSize(2);
+  tft.setCursor(8, 7);
+  tft.print("ADMIN TERMINAL");
+
+  // Admin greeting
+  tft.setTextColor(COLOR_WHITE, COLOR_BG);
+  tft.setTextSize(1);
+  tft.setCursor(8, 36);
+  tft.print("Admin: " + adminName);
+
+  // Option 1: Enroll User Box
+  tft.drawRoundRect(6, 50, tft.width() - 12, 38, 4, COLOR_CYAN);
+  tft.setTextColor(COLOR_CYAN, COLOR_BG);
+  tft.setTextSize(2);
+  tft.setCursor(14, 56);
+  tft.print("1. ENROLL USER");
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_WHITE, COLOR_BG);
+  tft.setCursor(14, 74);
+  tft.print("Tap sensor briefly (< 0.6s)");
+
+  // Option 2: Enroll Admin Box
+  tft.drawRoundRect(6, 94, tft.width() - 12, 38, 4, COLOR_YELLOW);
+  tft.setTextColor(COLOR_YELLOW, COLOR_BG);
+  tft.setTextSize(2);
+  tft.setCursor(14, 100);
+  tft.print("2. ENROLL ADMIN");
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_WHITE, COLOR_BG);
+  tft.setCursor(14, 118);
+  tft.print("Hold sensor 0.6s - 1.5s");
+
+  // Option 3: Unlock Door Box
+  tft.drawRoundRect(6, 138, tft.width() - 12, 38, 4, COLOR_GREEN);
+  tft.setTextColor(COLOR_GREEN, COLOR_BG);
+  tft.setTextSize(2);
+  tft.setCursor(14, 144);
+  tft.print("3. UNLOCK DOOR");
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_WHITE, COLOR_BG);
+  tft.setCursor(14, 162);
+  tft.print("Hold sensor > 1.5s");
+
+  // Footer status
+  tftShowStatus("Touch sensor to choose", "Timeout in 7 seconds", COLOR_YELLOW);
+
+  // Wait for admin selection
+  unsigned long startWait = millis();
+  bool actionTaken = false;
+
+  while (millis() - startWait < 7000 && !actionTaken)
+  {
+    uint8_t r = finger.getImage();
+    if (r == FINGERPRINT_OK)
+    {
+      unsigned long touchStart = millis();
+      while (finger.getImage() == FINGERPRINT_OK && (millis() - touchStart < 2500))
+      {
+        delay(50);
+      }
+      unsigned long touchDuration = millis() - touchStart;
+
+      while (finger.getImage() != FINGERPRINT_NOFINGER)
+      {
+        delay(50);
+      }
+
+      actionTaken = true;
+
+      if (touchDuration >= 1500)
+      {
+        tftShowFullScreen("ADMIN UNLOCK", adminName, COLOR_GREEN);
+        openDoor();
+      }
+      else if (touchDuration >= 600)
+      {
+        runAutonomousHardwareEnrollment("admin");
+      }
+      else
+      {
+        runAutonomousHardwareEnrollment("user");
+      }
+      break;
+    }
+    delay(50);
+  }
+
+  if (!actionTaken)
+  {
+    tftShowStatus("Menu timed out", "Returning to standby", COLOR_GRAY);
+    delay(1000);
+  }
+}
+
+// ============================================================
+// ADMIN COMMANDS (CLOUD / POLLING FALLBACK)
 // ============================================================
 
 void checkForAdminCommands()
@@ -2836,10 +3220,21 @@ void checkForAdminCommands()
             separator
         );
 
-    String userName =
+    String rem =
         command.substring(
             separator + 1
         );
+
+    String userName = rem;
+    String role = "user";
+
+    int sep2 = rem.indexOf(':');
+    if (sep2 > 0)
+    {
+      userName = rem.substring(0, sep2);
+      role = rem.substring(sep2 + 1);
+      role.trim();
+    }
 
     wakeToActive(
         "Enrollment"
@@ -2847,7 +3242,8 @@ void checkForAdminCommands()
 
     runEnrollmentSequence(
         userId,
-        userName
+        userName,
+        role
     );
 
     enterIdleMode();
@@ -2857,7 +3253,7 @@ void checkForAdminCommands()
 }
 
 // ============================================================
-// ACCESS FLOW
+// ACCESS FLOW (DUAL BIOMETRIC VERIFICATION)
 // ============================================================
 
 void runAccessFlow(
@@ -2865,10 +3261,11 @@ void runAccessFlow(
 {
   String userId = "";
   String userName = "";
+  String userRole = "user";
 
   tftShowFullScreen(
       "FINGER MATCHED",
-      "Checking account",
+      "Checking account...",
       COLOR_CYAN
   );
 
@@ -2876,7 +3273,8 @@ void runAccessFlow(
       !getUserByFingerId(
           fingerId,
           userId,
-          userName
+          userName,
+          userRole
       ))
   {
     tftShowFullScreen(
@@ -2888,6 +3286,43 @@ void runAccessFlow(
     delay(2500);
 
     return;
+  }
+
+  // ------------------------------------------------------------
+  // ADMIN LONG-PRESS CHECK FOR HARDWARE MENU
+  // ------------------------------------------------------------
+  if (userRole.equalsIgnoreCase("admin"))
+  {
+    // Check if admin is holding finger on sensor to open hardware menu
+    unsigned long pressStart = millis();
+    bool isLongPress = false;
+
+    while (millis() - pressStart < 1800)
+    {
+      if (finger.getImage() == FINGERPRINT_OK)
+      {
+        if (millis() - pressStart > 1200)
+        {
+          isLongPress = true;
+          break;
+        }
+      }
+      else
+      {
+        break;
+      }
+      delay(50);
+    }
+
+    if (isLongPress)
+    {
+      while (finger.getImage() != FINGERPRINT_NOFINGER)
+      {
+        delay(50);
+      }
+      showAdminHardwareMenu(userName);
+      return;
+    }
   }
 
   tftShowFullScreen(
@@ -2902,11 +3337,11 @@ void runAccessFlow(
   );
 
   // =========================================================
-  // WAKE ESP32-CAM
+  // WAKE ESP32-CAM FOR LIVE FACE VERIFICATION
   // =========================================================
 
   tftShowStatus(
-      "Waking camera",
+      "Waking camera...",
       "",
       COLOR_CYAN
   );
@@ -2956,9 +3391,12 @@ void runAccessFlow(
           jpegLen
       );
 
+      // Draw centering reticle on top of live camera stream
+      drawFaceReticle(COLOR_CYAN);
+
       tftShowStatus(
           "Look at camera",
-          "Verifying identity",
+          "Verifying identity...",
           COLOR_CYAN
       );
 
@@ -2970,32 +3408,40 @@ void runAccessFlow(
           jpegLen >
               MIN_FACE_JPEG_BYTES)
       {
+        FaceBox verifyBox;
         faceVerified =
             postFaceVerify(
                 userId,
                 String(ROOM_ID),
                 jpegBuffer,
-                jpegLen
+                jpegLen,
+                &verifyBox
             );
+
+        if (verifyBox.valid)
+        {
+          int bx = lastJpegDrawX + (verifyBox.x / lastJpegScale);
+          int by = lastJpegDrawY + (verifyBox.y / lastJpegScale);
+          int bw = verifyBox.w / lastJpegScale;
+          int bh = verifyBox.h / lastJpegScale;
+          drawDynamicFaceBox(bx, by, bw, bh, faceVerified ? COLOR_GREEN : COLOR_YELLOW);
+          if (faceVerified)
+          {
+            tftShowStatus("Identity Confirmed!", "Face Matched", COLOR_GREEN);
+            delay(900);
+          }
+        }
       }
     }
 
     delay(100);
   }
 
-  /*
-     IMPORTANT:
-
-     Camera is stopped immediately after face
-     verification process finishes.
-
-     It is stopped on BOTH success and failure.
-  */
-
+  // Put camera into standby immediately
   stopCamera();
 
   // =========================================================
-  // SUCCESS
+  // OUTCOME
   // =========================================================
 
   if (faceVerified)
@@ -3018,10 +3464,6 @@ void runAccessFlow(
 
     return;
   }
-
-  // =========================================================
-  // FAILURE
-  // =========================================================
 
   tftShowFullScreen(
       "ACCESS DENIED",
@@ -3065,7 +3507,7 @@ bool processFingerprintIfPresent()
   );
 
   tftShowStatus(
-      "Reading fingerprint",
+      "Reading fingerprint...",
       "",
       COLOR_CYAN
   );
@@ -3150,13 +3592,6 @@ bool processFingerprintIfPresent()
     enterIdleMode();
 
     return true;
-  }
-
-  while (
-      finger.getImage() !=
-      FINGERPRINT_NOFINGER)
-  {
-    delay(75);
   }
 
   runAccessFlow(
