@@ -935,6 +935,11 @@ class _UserProfileScreenState extends State<UserProfileScreen> {
                     'ID: $objectId',
                     style: TextStyle(color: AppColors.textMuted, fontSize: 11),
                   ),
+                if (borrowTime != null)
+                  Text(
+                    'Borrowed: ${borrowTime.day}/${borrowTime.month}/${borrowTime.year}',
+                    style: TextStyle(color: AppColors.textMuted, fontSize: 11),
+                  ),
                 if (deadline != null)
                   Text(
                     'Due: ${deadline.day}/${deadline.month}/${deadline.year}',
@@ -1011,6 +1016,11 @@ class _UserProfileScreenState extends State<UserProfileScreen> {
                 if (borrowTime != null)
                   Text(
                     'Borrowed: ${borrowTime.day}/${borrowTime.month}/${borrowTime.year}',
+                    style: TextStyle(color: AppColors.textMuted, fontSize: 11),
+                  ),
+                if (returnTime != null && status == 'Returned')
+                  Text(
+                    'Returned: ${returnTime.day}/${returnTime.month}/${returnTime.year}',
                     style: TextStyle(color: AppColors.textMuted, fontSize: 11),
                   ),
               ],
