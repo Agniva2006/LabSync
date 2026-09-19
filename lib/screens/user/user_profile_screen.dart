@@ -6,7 +6,6 @@ import '../../services/api_service.dart';
 import '../../core/current_user.dart';
 import '../../utils/validators.dart';
 import '../user/borrow_history_screen.dart';
-import '../user/face_enrollment_screen.dart';
 import '../user/dual_auth_screen.dart';
 import '../settings_screen.dart';
 
@@ -359,29 +358,30 @@ class _UserProfileScreenState extends State<UserProfileScreen> {
                               ),
                               const SizedBox(height: 16),
 
-                              // Face Recognition Enrollment
+                              // Face Recognition (ESP32-CAM Hardware)
                               _buildBiometricItem(
                                 icon: Icons.face,
                                 title: 'Face Recognition',
                                 subtitle: _isFaceEnrolled
-                                    ? '✅ Face enrolled for biometric access'
-                                    : '⚠️ Enroll your face for face-based access',
+                                    ? '✅ Enrolled via ESP32-CAM terminal'
+                                    : 'Enrolled at ESP32 door terminal',
                                 color: _isFaceEnrolled
                                     ? AppColors.success
-                                    : AppColors.neonPurple,
+                                    : AppColors.textSecondary,
                                 trailing: _isFaceEnrolled
                                     ? const Icon(Icons.check_circle,
                                         color: AppColors.success, size: 20)
-                                    : const Icon(Icons.arrow_forward_ios,
-                                        color: AppColors.neonPurple, size: 16),
+                                    : const Icon(Icons.info_outline,
+                                        color: AppColors.textSecondary, size: 16),
                                 onTap: () {
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) =>
-                                          const FaceEnrollmentScreen(),
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text(_isFaceEnrolled
+                                          ? 'Face biometrics are active and managed via the ESP32-CAM terminal.'
+                                          : 'Face and fingerprint enrollments are conducted exclusively at the ESP32 hardware terminal.'),
+                                      backgroundColor: AppColors.surfaceDark,
                                     ),
-                                  ).then((_) => _checkFaceEnrollmentStatus());
+                                  );
                                 },
                               ),
                               const Divider(

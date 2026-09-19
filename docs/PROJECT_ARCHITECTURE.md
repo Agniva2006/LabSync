@@ -22,6 +22,7 @@ Welcome to **LabSync**! This document provides a complete technical reference fo
 
 **LabSync** is an IoT laboratory access control and biometric management system. It provides:
 - **Dual Biometric Authentication**: Optical fingerprint scanning (Adafruit DSP sensor) paired with facial recognition (TensorFlow.js / SSD MobileNet v1).
+- **Strict Hardware-Only Biometric Enrollment**: All fingerprint and facial biometric registrations are conducted exclusively at the physical ESP32 + ESP32-CAM door terminal (no mobile or web camera enrollment).
 - **Physical Access Control**: Low-latency 5V relay door triggers with automatic mechanical safety timers.
 - **Real-Time Monitoring & Telemetry**: Room access logs, night lockout enforcement, equipment borrowing, and device heartbeat monitoring.
 - **Multi-Platform Management App**: Flutter Web & Mobile dashboard for admins and lab researchers.
@@ -167,7 +168,7 @@ LabSync uses a Google Spreadsheet (`LabSync DB`) as its primary database. Each t
 ### Frontend Flutter Application
 - Responsive web and mobile client featuring a dark glassmorphism aesthetic.
 - Interacts with backend REST API using `ApiService`.
-- Handles live admin command triggers, real-time polling, and biometric enrollment interfaces.
+- Handles live admin command triggers, real-time telemetry, access logs, user management, and remote hardware enrollment dispatch (physical capture is strictly hardware-only).
 
 ---
 

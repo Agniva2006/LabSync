@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../core/constants.dart';
 import '../../services/api_service.dart';
-import '../user/face_enrollment_screen.dart';
 
 class AdminDoorControlScreen extends StatefulWidget {
   final String userId;
@@ -322,40 +321,6 @@ class _AdminDoorControlScreenState extends State<AdminDoorControlScreen> {
                 onPressed: () => Navigator.pop(context),
                 child: const Text('Cancel', style: TextStyle(color: AppColors.textSecondary)),
               ),
-              OutlinedButton.icon(
-                onPressed: () async {
-                  final userId = userIdController.text.trim();
-                  final name = nameController.text.trim();
-
-                  if (userId.isEmpty || name.isEmpty) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('User ID and Name are required'),
-                        backgroundColor: AppColors.warning,
-                      ),
-                    );
-                    return;
-                  }
-
-                  Navigator.pop(context);
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => FaceEnrollmentScreen(
-                        targetUserId: userId,
-                        targetUserName: name,
-                      ),
-                    ),
-                  );
-                },
-                icon: const Icon(Icons.face, size: 18),
-                label: const Text('Enroll Face'),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: AppColors.neonCyan,
-                  side: BorderSide(color: AppColors.neonCyan.withOpacity(0.5)),
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                ),
-              ),
               ElevatedButton.icon(
                 onPressed: () async {
                   final userId = userIdController.text.trim();
@@ -385,7 +350,7 @@ class _AdminDoorControlScreenState extends State<AdminDoorControlScreen> {
                   );
                 },
                 icon: const Icon(Icons.fingerprint, size: 18),
-                label: const Text('Enroll Fingerprint', style: TextStyle(fontWeight: FontWeight.bold)),
+                label: const Text('Enroll on ESP32 Terminal', style: TextStyle(fontWeight: FontWeight.bold)),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: AppColors.neonPurple,
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),

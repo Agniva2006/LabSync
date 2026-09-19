@@ -51,71 +51,15 @@ const handleMulterError = (err, req, res, next) => {
   next();
 };
 
-// ==================== FACE ENROLLMENT ====================
-
-router.post('/enroll', verifyToken, upload.single('faceImage'), handleMulterError, async (req, res) => {
-  try {
-    const { userId, userName } = req.body;
-
-    console.log(`\n========================================`);
-    console.log(`📝 FACE ENROLLMENT REQUEST`);
-    console.log(`User ID: ${userId}`);
-    console.log(`User Name: ${userName}`);
-    console.log(`========================================\n`);
-
-    // Validate input
-    if (!userId || !userName) {
-      console.log('❌ Missing userId or userName');
-      return res.status(400).json({
-        success: false,
-        message: 'userId and userName are required',
-      });
-    }
-
-    if (!req.file) {
-      console.log('❌ No image file provided');
-      return res.status(400).json({
-        success: false,
-        message: 'No image file provided. Please upload a face image.',
-      });
-    }
-
-    console.log(`📦 Image received: ${req.file.size} bytes`);
-
-    // Initialize face service
-    await faceService.initialize();
-
-    // Enroll face
-    console.log('⏳ Processing face enrollment...');
-    const result = await faceService.enrollFace(userId, req.file.buffer);
-
-    if (!result.success) {
-      console.log(`❌ Enrollment failed: ${result.message}`);
-      return res.status(400).json(result);
-    }
-
-    console.log(`✅ Enrollment successful for ${userId}\n`);
-    
-    res.json({
-      success: true,
-      message: result.message || 'Face enrolled successfully',
-      confidence: result.confidence,
-      samplesUsed: result.samplesUsed || 1,
-      rotationAngle: result.rotationAngle || 0,
-      userId: userId,
-    });
-
-  } catch (error) {
-    console.error(`\n❌ ENROLLMENT ERROR:`);
-    console.error(error);
-    console.error(`Stack:`, error.stack);
-    console.log(`========================================\n`);
-    
-    res.status(500).json({
-      success: false,
-      message: 'Failed to enroll face: ' + error.message,
-    });
-  }
+// ==================== APP/WEB FACE ENROLLMENT (DECOMMISSIONED) ====================
+// Face enrollment via Flutter App / Web is disabled.
+// All biometric enrollments (fingerprint & face) are performed strictly via the ESP32 + ESP32-CAM terminal.
+router.post('/enroll', (req, res) => {
+  console.warn('⚠️ Rejected attempt to enroll face via App/Web. Biometrics are hardware-only.');
+  return res.status(403).json({
+    success: false,
+    message: 'App/Web face enrollment is disabled. All biometric enrollments must be conducted at the physical ESP32 door terminal.',
+  });
 });
 
 // ==================== HARDWARE FACE ENROLLMENT ====================

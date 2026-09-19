@@ -13,9 +13,13 @@ This guide details all end-to-end execution flows, state machine transitions, se
 
 ---
 
-## 1. Biometric Fingerprint Enrollment Sequence
+## 1. Unified Hardware Biometric Enrollment Sequence
+*(Strict Hardware-Only: Fingerprint + ESP32-CAM Face)*
 
-This workflow registers a user's fingerprint on the Adafruit optical sensor via admin command from the Flutter App.
+> [!IMPORTANT]
+> **Strict Hardware-Only Biometrics**: In LabSync, all biometric registrations (both fingerprint and face) are strictly performed at the physical ESP32 + ESP32-CAM door terminal. In-app and web camera enrollments are fully disabled to guarantee physical presence and prevent remote image spoofing.
+
+This workflow registers a user's fingerprint on the Adafruit optical sensor followed immediately by facial biometric enrollment via the ESP32-CAM on the hardware terminal.
 
 ### Sequence Flow Diagram
 

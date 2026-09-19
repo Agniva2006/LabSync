@@ -1,8 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
-import 'dart:io';
-import 'package:image_picker/image_picker.dart';
 import '../../core/constants.dart';
 
 class UserManagementScreen extends StatefulWidget {
@@ -216,25 +214,11 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                     trailing: PopupMenuButton(
                       itemBuilder: (context) => [
                         PopupMenuItem(
-                          child: Text('Enroll Fingerprint'),
+                          child: const Text('Enroll on ESP32 Terminal'),
                           onTap: () => _triggerFingerprintEnrollment(
                             user['userId'],
                             user['userName'],
                           ),
-                        ),
-                        PopupMenuItem(
-                          child: Text('Enroll Face'),
-                          onTap: () {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (context) => FaceEnrollScreen(
-                                  userId: user['userId'],
-                                  userName: user['userName'],
-                                ),
-                              ),
-                            );
-                          },
                         ),
                       ],
                     ),
@@ -245,113 +229,6 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
       floatingActionButton: FloatingActionButton(
         onPressed: _addUser,
         child: Icon(Icons.add),
-      ),
-    );
-  }
-}
-
-// ================= FACE ENROLLMENT SCREEN =================
-
-class FaceEnrollScreen extends StatefulWidget {
-  final String userId;
-  final String userName;
-
-  const FaceEnrollScreen({
-    Key? key,
-    required this.userId,
-    required this.userName,
-  }) : super(key: key);
-
-  @override
-  _FaceEnrollScreenState createState() => _FaceEnrollScreenState();
-}
-
-class _FaceEnrollScreenState extends State<FaceEnrollScreen> {
-  File? _image;
-  bool _isLoading = false;
-  final ImagePicker _picker = ImagePicker();
-
-  final String faceApiUrl = "https://labsync-face-api.onrender.com";
-  final String mainBackendUrl = AppConstants.baseUrl;
-
-  Future<void> _captureAndEnroll() async {
-    final XFile? photo = await _picker.pickImage(source: ImageSource.camera);
-
-    if (photo != null) {
-      setState(() {
-        _image = File(photo.path);
-        _isLoading = true;
-      });
-
-      try {
-        var request =
-            http.MultipartRequest('POST', Uri.parse('$faceApiUrl/enroll'));
-        request.fields['userId'] = widget.userId;
-        request.fields['userName'] = widget.userName;
-        request.files
-            .add(await http.MultipartFile.fromPath('faceImage', _image!.path));
-
-        var response = await request.send();
-        var resBody = await http.Response.fromStream(response);
-
-        if (response.statusCode == 200) {
-          await http.post(
-            Uri.parse('$mainBackendUrl/users/update-face-status'),
-            headers: {'Content-Type': 'application/json'},
-            body: json.encode({
-              'userId': widget.userId,
-              'faceStatus': 'ENROLLED',
-            }),
-          );
-
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('✅ Face enrolled successfully!')),
-          );
-          Navigator.pop(context);
-        } else {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('❌ Failed: ${resBody.body}')),
-          );
-        }
-      } catch (e) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('❌ Error: $e')),
-        );
-      } finally {
-        setState(() => _isLoading = false);
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: Text('Enroll Face: ${widget.userName}')),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            _image == null
-                ? const Icon(Icons.face, size: 100, color: Colors.grey)
-                : Image.file(_image!, height: 200),
-            const SizedBox(height: 20),
-            const Text(
-              "Tap the button to capture your face",
-              style: TextStyle(fontSize: 16),
-            ),
-            const SizedBox(height: 20),
-            ElevatedButton.icon(
-              icon: const Icon(Icons.camera_alt),
-              label:
-                  Text(_isLoading ? 'Enrolling...' : 'Capture & Enroll Face'),
-              onPressed: _isLoading ? null : _captureAndEnroll,
-              style: ElevatedButton.styleFrom(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 30, vertical: 15),
-              ),
-            ),
-          ],
-        ),
       ),
     );
   }
