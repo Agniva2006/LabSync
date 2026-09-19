@@ -5,6 +5,7 @@ const pendingCommands = new Map(); // roomId -> { command, userName, adminId, ti
 const deviceStatus = new Map();
 const enrollmentStatus = new Map();
 const pendingFaceAuth = new Map(); // roomId -> { userId, fingerId, timestamp, status }
+const cameraRegistry = new Map(); // roomId -> { ip, lastSeen, status }
 
 // ==================== GARBAGE COLLECTION ====================
 // Prevent memory leaks by cleaning up pending face auths older than 60 seconds
@@ -22,5 +23,6 @@ module.exports = {
   pendingCommands,
   deviceStatus,
   enrollmentStatus,
-  pendingFaceAuth
+  pendingFaceAuth,
+  cameraRegistry
 };

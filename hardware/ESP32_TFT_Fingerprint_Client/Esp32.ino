@@ -30,6 +30,7 @@
 #include <ESPmDNS.h>
 #include <HTTPClient.h>
 #include <NetworkClient.h>
+#include <Preferences.h>
 #include <SPI.h>
 #include <TJpg_Decoder.h>
 #include <WiFi.h>
@@ -42,16 +43,15 @@
 const char *WIFI_SSID = "Galaxy";           // ← Change to your WiFi name
 const char *WIFI_PASSWORD = "password2006"; // ← Change to your WiFi password
 
-const char *SERVER_URL = "https://labsync-pnr8.onrender.com";
+// Default Server URL (Can be changed dynamically via Preferences / Serial without reflashing)
+const char *DEFAULT_SERVER_URL = "https://labsync-pnr8.onrender.com";
+String activeServerUrl = DEFAULT_SERVER_URL;
 
 const char *CAMERA_MDNS_NAME = "esp32cam";
 
 /*
    CAMERA_IP_FALLBACK:
-   If mDNS fails (common on mobile hotspots), the ESP32
-   will use this IP to reach the ESP32-CAM.
-   Check Serial Monitor on the ESP32-CAM to find its IP.
-   Set to "" to disable fallback (pure mDNS only).
+   Used only if mDNS, Backend Registry, and NVS Cache all fail.
 */
 const char *CAMERA_IP_FALLBACK = ""; // ← Set to CAM IP if mDNS fails (e.g. "192.168.1.100")
 
@@ -832,6 +832,9 @@ bool ipIsZero(
       ip[3] == 0;
 }
 
+// Forward declaration for dynamic camera resolution via backend
+String httpGet(const String &path);
+
 bool resolveCamera()
 {
   if (
@@ -843,59 +846,124 @@ bool resolveCamera()
     return false;
   }
 
+  // =========================================================
+  // TIER 1: DYNAMIC mDNS QUERY
+  // =========================================================
   if (!mdnsStarted)
   {
-    if (!startMainMDNS())
-      return false;
+    startMainMDNS();
   }
 
-  Serial.println(
-      "Searching esp32cam.local..."
-  );
-
-  for (int attempt = 1;
-       attempt <= 5;
-       attempt++)
+  if (mdnsStarted)
   {
-    Serial.printf(
-        "Camera discovery %d/5\n",
-        attempt
+    Serial.println(
+        "Attempting dynamic mDNS discovery (esp32cam.local)..."
     );
 
-    IPAddress camIp =
-        MDNS.queryHost(
-            CAMERA_MDNS_NAME,
-            3000
+    for (int attempt = 1;
+         attempt <= 2;
+         attempt++)
+    {
+      IPAddress camIp =
+          MDNS.queryHost(
+              CAMERA_MDNS_NAME,
+              2000
+          );
+
+      if (!ipIsZero(camIp))
+      {
+        cameraBaseUrl =
+            "http://" +
+            camIp.toString();
+
+        Serial.println(
+            "✅ ESP32-CAM dynamic IP resolved via mDNS: " +
+            cameraBaseUrl
         );
 
-    if (!ipIsZero(camIp))
-    {
-      cameraBaseUrl =
-          "http://" +
-          camIp.toString();
+        // Cache working IP in NVS
+        Preferences prefs;
+        prefs.begin("labsync", false);
+        prefs.putString("cam_ip", camIp.toString());
+        prefs.end();
 
-      Serial.println(
-          "ESP32-CAM found"
-      );
+        return true;
+      }
 
-      Serial.println(
-          "Camera IP: " +
-          camIp.toString()
-      );
-
-      return true;
+      delay(150);
     }
-
-    delay(400);
   }
 
-  cameraBaseUrl = "";
-
+  // =========================================================
+  // TIER 2: QUERY CLOUD/BACKEND DYNAMIC CAMERA REGISTRY
+  // Solves mobile hotspot / isolated subnet mDNS blockage!
+  // =========================================================
   Serial.println(
-      "Camera mDNS discovery failed"
+      "Querying backend registry for dynamic camera IP..."
   );
 
-  // Fallback to hardcoded IP if configured
+  String response =
+      httpGet(
+          "/api/esp32/camera-ip/" +
+          String(ROOM_ID)
+      );
+
+  if (response.length() > 0)
+  {
+    StaticJsonDocument<256> doc;
+    DeserializationError err =
+        deserializeJson(doc, response);
+
+    if (!err && doc["success"] == true)
+    {
+      const char *dynIp = doc["ip"];
+      if (dynIp && strlen(dynIp) > 0)
+      {
+        cameraBaseUrl =
+            "http://" +
+            String(dynIp);
+
+        Serial.println(
+            "✅ ESP32-CAM dynamic IP resolved via Backend Registry: " +
+            cameraBaseUrl
+        );
+
+        // Cache working IP in NVS
+        Preferences prefs;
+        prefs.begin("labsync", false);
+        prefs.putString("cam_ip", String(dynIp));
+        prefs.end();
+
+        return true;
+      }
+    }
+  }
+
+  // =========================================================
+  // TIER 3: CHECK CACHED DYNAMIC IP FROM NVS
+  // =========================================================
+  Preferences prefs;
+  prefs.begin("labsync", true);
+  String cachedIp = prefs.getString("cam_ip", "");
+  prefs.end();
+
+  if (cachedIp.length() > 0)
+  {
+    cameraBaseUrl =
+        "http://" +
+        cachedIp;
+
+    Serial.println(
+        "Using cached dynamic Camera IP from NVS: " +
+        cameraBaseUrl
+    );
+
+    return true;
+  }
+
+  // =========================================================
+  // TIER 4: MANUAL FALLBACK IP
+  // =========================================================
   if (
       strlen(CAMERA_IP_FALLBACK) > 0)
   {
@@ -904,15 +972,17 @@ bool resolveCamera()
         String(CAMERA_IP_FALLBACK);
 
     Serial.println(
-        "Using fallback IP: " +
+        "Using manual fallback IP: " +
         cameraBaseUrl
     );
 
     return true;
   }
 
+  cameraBaseUrl = "";
+
   Serial.println(
-      "No fallback IP configured"
+      "❌ All dynamic camera discovery methods exhausted"
   );
 
   return false;
@@ -1529,7 +1599,7 @@ String httpGet(
   }
 
   String url =
-      String(SERVER_URL) +
+      activeServerUrl +
       path;
 
   HTTPClient http;
@@ -1634,7 +1704,7 @@ String httpPostJson(
   }
 
   String url =
-      String(SERVER_URL) +
+      activeServerUrl +
       path;
 
   HTTPClient http;
@@ -1750,7 +1820,7 @@ bool postMultipartStreaming(
   }
 
   String server =
-      String(SERVER_URL);
+      activeServerUrl;
 
   bool https =
       server.startsWith(
@@ -3616,6 +3686,30 @@ void setup()
   delay(300);
 
   // =========================================================
+  // LOAD DYNAMIC SERVER URL FROM NVS
+  // =========================================================
+  Preferences prefs;
+  prefs.begin("labsync", true);
+  String savedServer = prefs.getString("server_url", "");
+  prefs.end();
+
+  if (savedServer.length() > 0)
+  {
+    activeServerUrl = savedServer;
+    Serial.println(
+        "🌐 Dynamic Server URL loaded from NVS: " +
+        activeServerUrl
+    );
+  }
+  else
+  {
+    Serial.println(
+        "🌐 Using default Server URL: " +
+        activeServerUrl
+    );
+  }
+
+  // =========================================================
   // RELAY
   // =========================================================
 
@@ -3742,6 +3836,47 @@ void setup()
 void loop()
 {
   retryFingerprintIfNeeded();
+
+  // =========================================================
+  // LIVE RUNTIME SERIAL COMMANDS FOR DYNAMIC IP CONTROL
+  // =========================================================
+  if (Serial.available())
+  {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+
+    if (line.startsWith("SET_SERVER "))
+    {
+      String newUrl = line.substring(11);
+      newUrl.trim();
+      if (newUrl.length() > 0)
+      {
+        activeServerUrl = newUrl;
+        Preferences p;
+        p.begin("labsync", false);
+        p.putString("server_url", activeServerUrl);
+        p.end();
+        Serial.println("✅ Dynamic Server URL updated and saved: " + activeServerUrl);
+      }
+    }
+    else if (line == "RESET_SERVER")
+    {
+      activeServerUrl = DEFAULT_SERVER_URL;
+      Preferences p;
+      p.begin("labsync", false);
+      p.remove("server_url");
+      p.end();
+      Serial.println("✅ Server URL reset to Render cloud: " + activeServerUrl);
+    }
+    else if (line == "IP_STATUS")
+    {
+      Serial.println("=== LABSYNC DYNAMIC IP STATUS ===");
+      Serial.println("ESP32 Local IP: " + WiFi.localIP().toString());
+      Serial.println("Camera Base URL: " + (cameraBaseUrl.length() > 0 ? cameraBaseUrl : "NOT RESOLVED"));
+      Serial.println("Server URL:      " + activeServerUrl);
+      Serial.println("================================");
+    }
+  }
 
   // Fingerprint has highest priority.
   if (

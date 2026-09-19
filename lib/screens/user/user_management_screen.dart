@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import '../../core/constants.dart';
+import '../../services/api_service.dart';
 
 class UserManagementScreen extends StatefulWidget {
   @override
@@ -12,7 +13,7 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
   List<dynamic> users = [];
   bool isLoading = true;
 
-  final String backendUrl = AppConstants.baseUrl;
+  String get backendUrl => ApiService.effectiveBaseUrl;
 
   @override
   void initState() {

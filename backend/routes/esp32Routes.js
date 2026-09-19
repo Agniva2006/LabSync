@@ -4,7 +4,7 @@ const { getSheetData, appendRow, findRowIndex, updateRow, logAccessEvent } = req
 const { createNotification } = require('../services/notificationService');
 const { checkNightLockout, trackFailedAttempt, clearFailedAttempts } = require('../services/securityService');
 
-const { pendingCommands, deviceStatus, enrollmentStatus, pendingFaceAuth } = require('../services/sharedState');
+const { pendingCommands, deviceStatus, enrollmentStatus, pendingFaceAuth, cameraRegistry } = require('../services/sharedState');
 
 // ==================== DUAL AUTH — STEP 1: FINGERPRINT VERIFIED ====================
 // Called by ESP32 DevKit after fingerSearch() succeeds
@@ -504,6 +504,37 @@ router.get('/enrollment-status/:userId', (req, res) => {
     }
   }
   res.json({ success: true, enrolled: false, failed: false });
+});
+
+// ==================== DYNAMIC CAMERA IP REGISTRY ====================
+// ESP32-CAM reports its dynamically assigned DHCP IP upon connecting to WiFi
+router.post('/register-camera', (req, res) => {
+  const { roomId, ip } = req.body;
+  let clientIp = ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  if (typeof clientIp === 'string' && clientIp.includes('::ffff:')) {
+    clientIp = clientIp.replace('::ffff:', '');
+  }
+  const targetRoom = roomId || 'ROOM-001';
+
+  cameraRegistry.set(targetRoom, {
+    ip: clientIp,
+    lastSeen: new Date().toISOString(),
+  });
+
+  console.log(`📷 Dynamic Camera IP registered for ${targetRoom}: http://${clientIp}`);
+  res.json({ success: true, message: `Camera dynamic IP registered for ${targetRoom}`, ip: clientIp });
+});
+
+// Master ESP32 queries this to dynamically connect to the camera without hardcoding IPs
+router.get('/camera-ip/:roomId', (req, res) => {
+  const { roomId } = req.params;
+  const reg = cameraRegistry.get(roomId || 'ROOM-001');
+
+  if (reg && reg.ip) {
+    return res.json({ success: true, ip: reg.ip, lastSeen: reg.lastSeen });
+  }
+
+  res.status(404).json({ success: false, message: 'No camera registered for this room yet' });
 });
 
 // ==================== DEBUG (remove in production) ====================

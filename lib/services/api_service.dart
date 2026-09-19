@@ -6,10 +6,55 @@ import 'package:http_parser/http_parser.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:go_router/go_router.dart';
 import '../core/constants.dart';
+import '../core/current_user.dart';
 import '../core/globals.dart';
 
 class ApiService {
-  final String baseUrl = AppConstants.baseUrl;
+  // ==================== DYNAMIC BASE URL CONFIGURATION ====================
+  static String? _customBaseUrl;
+
+  static Future<void> initCustomBaseUrl() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _customBaseUrl = prefs.getString('custom_base_url');
+      if (_customBaseUrl != null && _customBaseUrl!.isNotEmpty) {
+        print('🌐 ApiService initialized with dynamic custom URL: $_customBaseUrl');
+      } else {
+        print('🌐 ApiService initialized with default URL: ${AppConstants.baseUrl}');
+      }
+    } catch (e) {
+      print('⚠️ Error loading custom base URL: $e');
+    }
+  }
+
+  static Future<void> setCustomBaseUrl(String? url) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (url == null || url.trim().isEmpty) {
+        await prefs.remove('custom_base_url');
+        _customBaseUrl = null;
+        print('🔄 Server URL reset to default: ${AppConstants.baseUrl}');
+      } else {
+        String clean = url.trim();
+        while (clean.endsWith('/')) {
+          clean = clean.substring(0, clean.length - 1);
+        }
+        if (!clean.endsWith('/api')) {
+          clean = '$clean/api';
+        }
+        await prefs.setString('custom_base_url', clean);
+        _customBaseUrl = clean;
+        print('✅ Server URL dynamically updated to: $_customBaseUrl');
+      }
+    } catch (e) {
+      print('❌ Error setting custom base URL: $e');
+    }
+  }
+
+  static String get effectiveBaseUrl => _customBaseUrl ?? AppConstants.baseUrl;
+  static bool get isUsingCustomUrl => _customBaseUrl != null && _customBaseUrl!.isNotEmpty;
+
+  String get baseUrl => effectiveBaseUrl;
 
   // ==================== TIMEOUT CONFIGURATION ====================
   static const Duration _defaultTimeout = Duration(seconds: 15);
@@ -737,12 +782,13 @@ class ApiService {
     required String roomId,
     required String userId,
     required String userName,
-    required String adminId,
+    String? adminId,
     String? email,
     String? department,
     String? role,
     String? authorizedRooms,
   }) async {
+    final effectiveAdminId = adminId ?? (CurrentUser.id.isNotEmpty ? CurrentUser.id : 'ADMIN-001');
     final url = Uri.parse('$baseUrl/esp32/send-command');
     print(
         '📡 Starting fingerprint enrollment for user: $userName ($userId) [Role: ${role ?? 'user'}] in room: $roomId');
@@ -757,7 +803,7 @@ class ApiService {
               'command': 'ENROLL:$userId:$userName:${role ?? 'user'}',
               'userId': userId,
               'userName': userName,
-              'adminId': adminId,
+              'adminId': effectiveAdminId,
               'email': email ?? '',
               'department': department ?? '',
               'role': role ?? 'user',

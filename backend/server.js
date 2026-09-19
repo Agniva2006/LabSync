@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const rateLimit = require('express-rate-limit');
 
 // ==================== IMPORT ROUTES ====================
@@ -251,12 +252,33 @@ async function startServer() {
     });
 
     // Start server FIRST (don't wait for face service)
-    app.listen(PORT, () => {
+    app.listen(PORT, '0.0.0.0', () => {
       console.log('\n🚀 ========================================');
-      console.log(`🚀 Server running on port ${PORT}`);
+      console.log(`🚀 Server running on port ${PORT} (0.0.0.0 - all network interfaces)`);
       console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
       console.log(`⏰ Started at: ${new Date().toISOString()}`);
       console.log('🚀 ========================================\n');
+
+      // Discover and log all dynamic LAN IPs so ESP32 & Flutter know where to connect
+      const networkInterfaces = os.networkInterfaces();
+      const localIps = [];
+      for (const name of Object.keys(networkInterfaces)) {
+        for (const net of networkInterfaces[name]) {
+          if (net.family === 'IPv4' && !net.internal) {
+            localIps.push({ iface: name, ip: net.address });
+          }
+        }
+      }
+
+      console.log('🌐 DYNAMIC NETWORK INTERFACES (LAN):');
+      if (localIps.length > 0) {
+        localIps.forEach(net => {
+          console.log(`   ${net.iface.padEnd(16)}: http://${net.ip}:${PORT}/api`);
+        });
+      } else {
+        console.log(`   Loopback only   : http://127.0.0.1:${PORT}/api`);
+      }
+      console.log('');
       
       console.log('📡 ENDPOINTS:');
       console.log(`   Health Check:     http://localhost:${PORT}/`);

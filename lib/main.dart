@@ -131,6 +131,9 @@ final GoRouter _router = GoRouter(
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // Initialize dynamic server base URL from preferences
+  await ApiService.initCustomBaseUrl();
+
   // Lock to portrait mode
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,

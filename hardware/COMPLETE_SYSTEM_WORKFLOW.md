@@ -390,8 +390,12 @@ Be prepared to answer these key technical questions from professors during your 
 #### Q2: "How does the system ensure the enrolled face image is clean and not blurry?"
 > **Answer**: In `faceService.js`, we implemented an **Enrollment Quality Gate**. Unlike verification (which uses a lenient 0.15 fallback), first-time enrollment requires a minimum neural detection confidence of **$\ge 0.45$** and a minimum face bounding box size of **$65 \times 65$ pixels**. If a user moves or stands too far, the backend rejects the frame and returns bounding box coordinates with a warning. The ESP32 draws a **yellow box** on the live TFT and continues capturing until a clear, high-scoring frame arrives, at which point it locks a **green box** and saves the master 128-d descriptor.
 
-#### Q3: "How does the ESP32 communicate with the ESP32-CAM on a single network?"
-> **Answer**: Both modules share the same Wi-Fi subnet (e.g. mobile hotspot or router). The ESP32 discovers the camera via mDNS (`esp32cam.local`) with an automatic static IP fallback. The master ESP32 acts as the HTTP client, requesting `GET /capture` to receive the raw JPEG stream, decoding it on the ILI9341 TFT display, and forwarding frames to the Node.js backend using multipart HTTP streaming.
+#### Q3: "How does the ESP32 communicate with the ESP32-CAM when IP addresses are dynamic?"
+> **Answer**: In real-world environments like university campus Wi-Fi or mobile hotspots, DHCP dynamically assigns and re-leases IP addresses, making hardcoded constant IPs fragile. LabSync solves this through a **4-Tier Dynamic Discovery Engine**:
+> 1. **mDNS Announcement**: The camera advertises `esp32cam.local` using Multicast DNS.
+> 2. **Backend Dynamic Camera Registry (`POST /api/esp32/register-camera`)**: Upon connecting or reconnecting to Wi-Fi, the ESP32-CAM automatically announces its current DHCP IP to the cloud backend. When mDNS packets are dropped (a known issue on phone hotspots), the Master ESP32 queries `GET /api/esp32/camera-ip/ROOM-001` and retrieves the exact active dynamic IP in milliseconds.
+> 3. **Non-Volatile Storage (NVS) Caching**: The last known working IP is stored in ESP32 `Preferences` so reconnects are instantaneous.
+> 4. **Adaptive Failure Recovery**: If any capture or command fails due to a network lease change, the Master ESP32 flushes `cameraBaseUrl = ""` and dynamically re-resolves the new IP on the fly without rebooting.
 
 #### Q4: "Why use Google Sheets instead of MySQL or MongoDB?"
 > **Answer**: Google Sheets provides zero-cost cloud persistence, built-in cloud backup, and an immediate visual spreadsheet interface that lab directors can audit without running database queries. To prevent Google Sheets API rate-limit quota exhaustion (which happens if devices poll every 3 seconds), we designed an **in-memory caching layer** (`sharedState.js`). Device polling and commands execute in RAM, and Google Sheets is updated only on permanent state changes (such as access granted or new user enrolled).
@@ -401,3 +405,54 @@ Be prepared to answer these key technical questions from professors during your 
 
 #### Q6: "How do you handle faces at different angles or if the camera is tilted?"
 > **Answer**: The backend implements a **4-way auto-rotation matrix** using `node-canvas`. Every received frame is evaluated across cardinal angles ($0^\circ$, $90^\circ$, $180^\circ$, $270^\circ$). The neural detector automatically finds the face regardless of camera orientation and normalizes the landmarks before computing the 128-dimensional Euclidean distance.
+
+---
+
+## 11. Dynamic IP Architecture & Zero-Config Network Shaping
+
+```
+   ┌────────────────────────────────────────────────────────┐
+   │          DHCP ROUTER / MOBILE HOTSPOT (DYNAMIC)        │
+   │           Assigns dynamic IPs: 192.168.X.Y             │
+   └──────────┬───────────────────────────────┬─────────────┘
+              │ DHCP                          │ DHCP
+              ▼                               ▼
+    ┌──────────────────┐            ┌──────────────────┐
+    │    ESP32-CAM     │            │   MASTER ESP32   │
+    │  (OV2640 Server) │            │ (TFT+FP+Relay)   │
+    └─────────┬────────┘            └────────┬─────────┘
+              │                              │
+     1. Boot/Reconnect:                      │ 2. mDNS fail?
+        POST /register-camera                │    GET /camera-ip/:roomId
+        { roomId, ip }                       │    Returns active IP
+              │                              │
+              ▼                              ▼
+    ┌──────────────────────────────────────────────────┐
+    │             BACKEND SERVER (Cloud / LAN)         │
+    │          cameraRegistry: { ROOM-001 -> IP }      │
+    └─────────────────────────▲────────────────────────┘
+                              │
+                    3. Dynamic URL Switching
+                       via App Settings
+                              │
+                    ┌─────────┴────────┐
+                    │  FLUTTER CLIENT  │
+                    │ (Android/iOS)    │
+                    └──────────────────┘
+```
+
+### Key Principles of Dynamic Shaping:
+1. **Never Hardcode Static IPs**:
+   - Both `Camera.ino` and `Esp32.ino` treat network addresses as fluid, dynamic entities.
+   - When moving between home Wi-Fi, lab routers, or Android/iPhone mobile hotspots, the hardware adapts without requiring any code changes or reflashing.
+2. **Flutter In-App Server Switching**:
+   - Developers and evaluators can switch between **Cloud Render** (`https://labsync-pnr8.onrender.com/api`) and **Local Laptop IP** (`http://192.168.X.Y:5000/api`) directly inside the mobile app (**Settings > Dynamic Server & Network Config**).
+   - The setting is persisted in `SharedPreferences` and takes effect across all app services instantly.
+3. **Master ESP32 Serial Runtime Commands**:
+   - Master ESP32 can be reconfigured directly via Serial Monitor during live demos:
+     - `SET_SERVER http://192.168.43.100:5000` -> updates server URL and saves to NVS `Preferences`.
+     - `RESET_SERVER` -> resets to default Render cloud.
+     - `IP_STATUS` -> prints local IP, resolved camera URL, and server URL.
+4. **Backend LAN Enumeration**:
+   - On startup, the Node.js server detects all active IPv4 local network interfaces (`os.networkInterfaces()`) and logs clickable URLs for mobile and hardware clients.
+

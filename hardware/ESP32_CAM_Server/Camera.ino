@@ -47,6 +47,8 @@
 #include <Arduino.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 
 // ============================================================
 // ⚠️  CHANGE THESE — WiFi credentials for your lab network
@@ -57,6 +59,15 @@ const char *WIFI_SSID =
 
 const char *WIFI_PASSWORD =
     "password2006";             // ← Change to your WiFi password
+
+// ============================================================
+// DYNAMIC IP REGISTRATION CONFIGURATION
+// ESP32-CAM automatically announces its dynamic DHCP IP to the backend.
+// ============================================================
+const char *SERVER_URL = "https://labsync-pnr8.onrender.com";
+const char *ROOM_ID = "ROOM-001";
+unsigned long lastDynamicIpRegister = 0;
+constexpr unsigned long DYNAMIC_IP_REFRESH_INTERVAL_MS = 60000; // Refresh dynamic IP announcement every 60s
 
 /*
    IMPORTANT:
@@ -901,6 +912,9 @@ void connectWiFi()
         WiFi.localIP()
     );
 
+    // Announce dynamic IP to backend so Master ESP32 can resolve it without mDNS/hardcoding
+    registerCameraWithBackend();
+
     /*
        Camera is normally asleep, so enable
        modem sleep once connected.
@@ -916,6 +930,63 @@ void connectWiFi()
     Serial.println(
         "WiFi connection failed"
     );
+  }
+}
+
+// ============================================================
+// DYNAMIC IP REGISTRATION WITH BACKEND
+// ============================================================
+
+void registerCameraWithBackend()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    return;
+  }
+
+  String localIp = WiFi.localIP().toString();
+  Serial.print("Announcing dynamic camera IP (");
+  Serial.print(localIp);
+  Serial.println(") to backend...");
+
+  HTTPClient http;
+  http.setTimeout(6000);
+
+  String registerUrl = String(SERVER_URL) + "/api/esp32/register-camera";
+  bool isHttps = registerUrl.startsWith("https://");
+
+  int httpCode = -1;
+  String payload = "{\"roomId\":\"" + String(ROOM_ID) + "\",\"ip\":\"" + localIp + "\"}";
+
+  if (isHttps)
+  {
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure(); // Skip TLS cert verify for embedded client
+    if (http.begin(secureClient, registerUrl))
+    {
+      http.addHeader("Content-Type", "application/json");
+      httpCode = http.POST(payload);
+      http.end();
+    }
+  }
+  else
+  {
+    WiFiClient client;
+    if (http.begin(client, registerUrl))
+    {
+      http.addHeader("Content-Type", "application/json");
+      httpCode = http.POST(payload);
+      http.end();
+    }
+  }
+
+  if (httpCode > 0)
+  {
+    Serial.printf("✅ Dynamic Camera IP registered to backend (HTTP %d): %s\n", httpCode, localIp.c_str());
+  }
+  else
+  {
+    Serial.printf("⚠️ Failed to register dynamic camera IP (HTTP error: %s)\n", http.errorToString(httpCode).c_str());
   }
 }
 
@@ -1126,6 +1197,18 @@ void loop()
           "Reconnected IP: " +
           WiFi.localIP().toString()
       );
+
+      // Re-announce dynamic IP to backend
+      registerCameraWithBackend();
+    }
+  }
+  else
+  {
+    // Periodic refresh in case DHCP renewed or backend restarted
+    if (millis() - lastDynamicIpRegister > DYNAMIC_IP_REFRESH_INTERVAL_MS)
+    {
+      lastDynamicIpRegister = millis();
+      registerCameraWithBackend();
     }
   }
 

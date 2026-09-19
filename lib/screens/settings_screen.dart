@@ -132,6 +132,120 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
             const SizedBox(height: 24),
 
+            // 2. Dynamic Server & Network Configuration Card
+            GlassCard(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text(
+                        'DYNAMIC SERVER & NETWORK CONFIG',
+                        style: TextStyle(
+                          color: AppColors.neonCyan,
+                          fontSize: 11,
+                          letterSpacing: 2,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: ApiService.isUsingCustomUrl
+                              ? AppColors.warning.withOpacity(0.2)
+                              : AppColors.neonGreen.withOpacity(0.2),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(
+                            color: ApiService.isUsingCustomUrl
+                                ? AppColors.warning
+                                : AppColors.neonGreen,
+                            width: 1,
+                          ),
+                        ),
+                        child: Text(
+                          ApiService.isUsingCustomUrl ? 'DYNAMIC LAN IP' : 'CLOUD RENDER',
+                          style: TextStyle(
+                            color: ApiService.isUsingCustomUrl
+                                ? AppColors.warning
+                                : AppColors.neonGreen,
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    'Active Server Endpoint:',
+                    style: TextStyle(color: AppColors.textSecondary, fontSize: 12),
+                  ),
+                  const SizedBox(height: 4),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: AppColors.bgDark,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: AppColors.surfaceLight),
+                    ),
+                    child: Text(
+                      ApiService.effectiveBaseUrl,
+                      style: const TextStyle(
+                        color: AppColors.neonCyan,
+                        fontSize: 13,
+                        fontFamily: 'monospace',
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _showDynamicIpDialog,
+                          icon: const Icon(Icons.edit_location_alt, size: 16),
+                          label: const Text('Change IP / Endpoint'),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: AppColors.neonCyan,
+                            side: const BorderSide(color: AppColors.neonCyan),
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                          ),
+                        ),
+                      ),
+                      if (ApiService.isUsingCustomUrl) ...[
+                        const SizedBox(width: 12),
+                        IconButton(
+                          tooltip: 'Reset to Cloud Render',
+                          icon: const Icon(Icons.cloud_sync, color: AppColors.neonGreen),
+                          onPressed: () async {
+                            await ApiService.setCustomBaseUrl(null);
+                            if (mounted) {
+                              setState(() {});
+                              _measureLatency();
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('☁️ Reset to Cloud Render endpoint'),
+                                  backgroundColor: AppColors.success,
+                                ),
+                              );
+                            }
+                          },
+                        ),
+                      ],
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 24),
+
             // 2. Biometric Preferences Section
             GlassCard(
               padding: const EdgeInsets.all(20),
@@ -268,7 +382,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                     ),
                     const SizedBox(height: 12),
-                    _buildInfoRow('API Endpoint:', AppConstants.baseUrl),
+                    _buildInfoRow('API Endpoint:', ApiService.effectiveBaseUrl),
+                    _buildInfoRow('Network Mode:', ApiService.isUsingCustomUrl ? 'Custom Dynamic IP' : 'Cloud Render (Production)'),
                     _buildInfoRow('Sheets Sync Engine:', 'Batch append (appendRows Enabled)'),
                     _buildInfoRow('Neural Models Path:', 'backend/models (Local Disk)'),
                     _buildInfoRow('Auto-Rotation Engine:', '4-Way Canvas (0°, 180°, 90°, 270°)'),
@@ -324,6 +439,122 @@ class _SettingsScreenState extends State<SettingsScreen> {
               style: const TextStyle(color: AppColors.textPrimary, fontSize: 13, fontWeight: FontWeight.w600),
               overflow: TextOverflow.ellipsis,
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showDynamicIpDialog() {
+    final controller = TextEditingController(text: ApiService.effectiveBaseUrl);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surfaceDark,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: const BorderSide(color: AppColors.neonCyan, width: 1),
+        ),
+        title: const Row(
+          children: [
+            Icon(Icons.dns, color: AppColors.neonCyan),
+            SizedBox(width: 10),
+            Text(
+              'Dynamic Server IP',
+              style: TextStyle(color: AppColors.textPrimary, fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Enter your backend server address. This shapes dynamically across hotspots, LANs, and cloud without rebuilding the app.',
+                style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: controller,
+                style: const TextStyle(color: AppColors.textPrimary),
+                decoration: InputDecoration(
+                  labelText: 'Server URL or IP',
+                  labelStyle: const TextStyle(color: AppColors.neonCyan),
+                  hintText: 'e.g. http://192.168.43.100:5000/api',
+                  hintStyle: const TextStyle(color: AppColors.textSecondary),
+                  prefixIcon: const Icon(Icons.link, color: AppColors.neonCyan),
+                  filled: true,
+                  fillColor: AppColors.bgDark,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    borderSide: const BorderSide(color: AppColors.surfaceLight),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    borderSide: const BorderSide(color: AppColors.neonCyan),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 14),
+              const Text('Quick Presets:', style: TextStyle(color: AppColors.textSecondary, fontSize: 12, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  ActionChip(
+                    backgroundColor: AppColors.bgDark,
+                    label: const Text('☁️ Cloud Render', style: TextStyle(color: AppColors.neonGreen, fontSize: 11)),
+                    onPressed: () => controller.text = AppConstants.baseUrl,
+                  ),
+                  ActionChip(
+                    backgroundColor: AppColors.bgDark,
+                    label: const Text('📱 Emulator (10.0.2.2)', style: TextStyle(color: AppColors.neonCyan, fontSize: 11)),
+                    onPressed: () => controller.text = 'http://10.0.2.2:5000/api',
+                  ),
+                  ActionChip(
+                    backgroundColor: AppColors.bgDark,
+                    label: const Text('💻 Local Port 5000', style: TextStyle(color: AppColors.neonPurple, fontSize: 11)),
+                    onPressed: () => controller.text = 'http://192.168.1.100:5000/api',
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel', style: TextStyle(color: AppColors.textSecondary)),
+          ),
+          ElevatedButton.icon(
+            icon: const Icon(Icons.check, size: 16),
+            label: const Text('Apply Dynamic IP'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.neonCyan,
+              foregroundColor: AppColors.bgDark,
+            ),
+            onPressed: () async {
+              final newUrl = controller.text.trim();
+              if (newUrl == AppConstants.baseUrl) {
+                await ApiService.setCustomBaseUrl(null);
+              } else {
+                await ApiService.setCustomBaseUrl(newUrl);
+              }
+              Navigator.pop(ctx);
+              if (mounted) {
+                setState(() {});
+                _measureLatency();
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text('🌐 Server IP updated to: ${ApiService.effectiveBaseUrl}'),
+                    backgroundColor: AppColors.success,
+                  ),
+                );
+              }
+            },
           ),
         ],
       ),

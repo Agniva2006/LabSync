@@ -27,7 +27,8 @@ class AppColors {
   static const Color textSecondaryLight = Color(0xFF5A6478);
   static const Color textMutedLight = Color(0xFF9CA3AF);
 
-  // Status
+  // Status & Accents
+  static const Color neonGreen = Color(0xFF00FF9D);
   static const Color success = Color(0xFF00FF9D);
   static const Color warning = Color(0xFFFFB800);
   static const Color danger = Color(0xFFFF3366);
