@@ -1,5 +1,7 @@
 # 🔌 LabSync Hardware Flashing Guide
 
+> 📖 **Full System Architecture & Workflow**: For the complete end-to-end hardware, backend, database, and Flutter workflow manual with diagrams, see **[COMPLETE_SYSTEM_WORKFLOW.md](file:///c:/Users/User/Desktop/best_resume_maker/project_done_during_internship_IIT_KGP/LabSync/hardware/COMPLETE_SYSTEM_WORKFLOW.md)**.
+
 Step-by-step guide for lab personnel to flash and test the ESP32 devices.
 
 ---

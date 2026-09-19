@@ -221,7 +221,7 @@ class FaceRecognitionService {
     return cvs;
   }
 
-  async detectFace(imageBuffer) {
+  async detectFace(imageBuffer, isEnrollment = false) {
     if (!this.modelsLoaded) {
       console.log('⚠️ Models not yet loaded — initializing now...');
       await this.initialize();
@@ -232,15 +232,15 @@ class FaceRecognitionService {
         throw new Error('Invalid image buffer');
       }
 
-      console.log(`📷 Detecting face in ${imageBuffer.length} byte image...`);
+      console.log(`📷 Detecting face in ${imageBuffer.length} byte image (mode: ${isEnrollment ? 'ENROLLMENT-QUALITY' : 'VERIFICATION'})...`);
       const rawImg = await loadImage(imageBuffer);
 
       // Try 4 cardinal orientations: 0°, 180° (upside down), 90°, 270° (sideways)
       const angles = [0, 180, 90, 270];
 
-      // Pass 1: Standard confidence (0.25)
-      // Pass 2: Low-light / tilt fallback confidence (0.15)
-      const confidenceLevels = [0.25, 0.15];
+      // For enrollment: require clean, high-confidence frame (0.40).
+      // For verification: standard confidence (0.25) + fallback (0.15).
+      const confidenceLevels = isEnrollment ? [0.40] : [0.25, 0.15];
 
       for (const minConf of confidenceLevels) {
         const options = new faceapi.SsdMobilenetv1Options({ minConfidence: minConf });
@@ -279,6 +279,29 @@ class FaceRecognitionService {
                 width: dBox.height,
                 height: dBox.width,
               };
+            }
+
+            // Quality Gate for Enrollment: Reject blurry, far-away, or low-scoring faces
+            if (isEnrollment) {
+              const dScore = detection.detection.score;
+              const isTooSmall = origBox.width < 65 || origBox.height < 65;
+              const isLowScore = dScore < 0.45;
+
+              if (isTooSmall || isLowScore) {
+                console.warn(`   ⚠️ Enrollment rejected low quality frame: score=${dScore.toFixed(3)}, size=${Math.round(origBox.width)}x${Math.round(origBox.height)}`);
+                return {
+                  success: false,
+                  message: isTooSmall
+                    ? 'Face too far from camera. Please stand closer.'
+                    : 'Face not clear enough. Please hold still in good lighting.',
+                  box: {
+                    x: Math.round(origBox.x),
+                    y: Math.round(origBox.y),
+                    w: Math.round(origBox.width),
+                    h: Math.round(origBox.height),
+                  },
+                };
+              }
             }
 
             return {
@@ -357,21 +380,28 @@ class FaceRecognitionService {
 
       for (let i = 0; i < imageBuffers.length; i++) {
         console.log(`   Processing sample ${i + 1}/${imageBuffers.length}...`);
-        const result = await this.detectFace(imageBuffers[i]);
+        const result = await this.detectFace(imageBuffers[i], true);
+        if (result.box) lastBox = result.box;
+
         if (result.success) {
           validDescriptors.push(result.descriptor);
           scores.push(result.score);
           lastAngle = result.rotationAngle || 0;
-          if (result.box) lastBox = result.box;
         } else {
-          console.warn(`   ⚠️ Sample ${i + 1} face detection failed: ${result.message}`);
+          console.warn(`   ⚠️ Sample ${i + 1} face detection rejected: ${result.message}`);
         }
       }
 
       if (validDescriptors.length === 0) {
         return {
           success: false,
-          message: 'No face detected in any of the provided enrollment samples.',
+          message: 'No clean face detected. Please ensure face is well-lit, centered, and looking directly at camera.',
+          box: lastBox ? {
+            x: Math.round(lastBox.x),
+            y: Math.round(lastBox.y),
+            w: Math.round(lastBox.w || lastBox.width),
+            h: Math.round(lastBox.h || lastBox.height),
+          } : null,
         };
       }
 
