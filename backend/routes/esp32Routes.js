@@ -108,10 +108,15 @@ router.post('/clear-pending/:roomId', (req, res) => {
 // ==================== SEND COMMAND (from backend/admin/face-verify result) ====================
 router.post('/send-command', async (req, res) => {
   try {
-    const { roomId, command, userName, adminId, userId, email, department, role, authorizedRooms } = req.body;
+    let { roomId, command, userName, adminId, userId, email, department, role, authorizedRooms } = req.body;
 
     if (!roomId || !command) {
       return res.status(400).json({ success: false, message: 'roomId and command required' });
+    }
+
+    // Resilience: Normalize simple 'enroll' command string to 'ENROLL:userId:userName:role'
+    if (typeof command === 'string' && command.toLowerCase() === 'enroll' && userId) {
+      command = `ENROLL:${userId}:${userName || 'User'}:${role || 'user'}`;
     }
 
     console.log(`\n📡 COMMAND QUEUED: ${command} → Room ${roomId}`);

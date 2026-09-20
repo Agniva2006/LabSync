@@ -117,7 +117,7 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
         headers: {'Content-Type': 'application/json'},
         body: json.encode({
           'roomId': 'ROOM-001',
-          'command': 'enroll',
+          'command': 'ENROLL:$userId:$userName:user',
           'userId': userId,
           'userName': userName,
         }),
