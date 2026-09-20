@@ -142,7 +142,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       const Text(
-                        'DYNAMIC SERVER & NETWORK CONFIG',
+                        'CLOUD BACKEND ENDPOINT',
                         style: TextStyle(
                           color: AppColors.neonCyan,
                           fontSize: 11,
@@ -153,23 +153,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                         decoration: BoxDecoration(
-                          color: ApiService.isUsingCustomUrl
-                              ? AppColors.warning.withOpacity(0.2)
-                              : AppColors.neonGreen.withOpacity(0.2),
+                          color: AppColors.neonGreen.withOpacity(0.2),
                           borderRadius: BorderRadius.circular(6),
                           border: Border.all(
-                            color: ApiService.isUsingCustomUrl
-                                ? AppColors.warning
-                                : AppColors.neonGreen,
+                            color: AppColors.neonGreen,
                             width: 1,
                           ),
                         ),
-                        child: Text(
-                          ApiService.isUsingCustomUrl ? 'DYNAMIC LAN IP' : 'CLOUD RENDER',
+                        child: const Text(
+                          'RENDER CLOUD 24/7',
                           style: TextStyle(
-                            color: ApiService.isUsingCustomUrl
-                                ? AppColors.warning
-                                : AppColors.neonGreen,
+                            color: AppColors.neonGreen,
                             fontSize: 10,
                             fontWeight: FontWeight.bold,
                           ),
@@ -177,12 +171,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                     ],
                   ),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 8),
                   const Text(
-                    'Active Server Endpoint:',
+                    'Hosted remotely on Render Cloud. Always accessible anywhere without any local PC or laptop server.',
                     style: TextStyle(color: AppColors.textSecondary, fontSize: 12),
                   ),
-                  const SizedBox(height: 4),
+                  const SizedBox(height: 12),
                   Container(
                     width: double.infinity,
                     padding: const EdgeInsets.all(12),
@@ -207,8 +201,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       Expanded(
                         child: OutlinedButton.icon(
                           onPressed: _showDynamicIpDialog,
-                          icon: const Icon(Icons.edit_location_alt, size: 16),
-                          label: const Text('Change IP / Endpoint'),
+                          icon: const Icon(Icons.cloud_sync, size: 16),
+                          label: const Text('Change Cloud Endpoint'),
                           style: OutlinedButton.styleFrom(
                             foregroundColor: AppColors.neonCyan,
                             side: const BorderSide(color: AppColors.neonCyan),
@@ -222,8 +216,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       if (ApiService.isUsingCustomUrl) ...[
                         const SizedBox(width: 12),
                         IconButton(
-                          tooltip: 'Reset to Cloud Render',
-                          icon: const Icon(Icons.cloud_sync, color: AppColors.neonGreen),
+                          tooltip: 'Reset to Default Render Cloud',
+                          icon: const Icon(Icons.refresh, color: AppColors.neonGreen),
                           onPressed: () async {
                             await ApiService.setCustomBaseUrl(null);
                             if (mounted) {
@@ -231,7 +225,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               _measureLatency();
                               ScaffoldMessenger.of(context).showSnackBar(
                                 const SnackBar(
-                                  content: Text('☁️ Reset to Cloud Render endpoint'),
+                                  content: Text('☁️ Reset to Default Render Cloud endpoint'),
                                   backgroundColor: AppColors.success,
                                 ),
                               );
@@ -457,10 +451,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
         title: const Row(
           children: [
-            Icon(Icons.dns, color: AppColors.neonCyan),
-            SizedBox(width: 10),
-            Text(
-              'Dynamic Server IP',
+            const Icon(Icons.cloud_done, color: AppColors.neonCyan),
+            const SizedBox(width: 10),
+            const Text(
+              'Cloud Server Endpoint',
               style: TextStyle(color: AppColors.textPrimary, fontSize: 18, fontWeight: FontWeight.bold),
             ),
           ],
@@ -471,7 +465,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'Enter your backend server address. This shapes dynamically across hotspots, LANs, and cloud without rebuilding the app.',
+                'Enter your remote cloud backend endpoint. Default is your 24/7 production server on Render.',
                 style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
               ),
               const SizedBox(height: 16),
@@ -479,9 +473,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 controller: controller,
                 style: const TextStyle(color: AppColors.textPrimary),
                 decoration: InputDecoration(
-                  labelText: 'Server URL or IP',
+                  labelText: 'Cloud Backend URL',
                   labelStyle: const TextStyle(color: AppColors.neonCyan),
-                  hintText: 'e.g. http://192.168.43.100:5000/api',
+                  hintText: 'https://labsync-pnr8.onrender.com/api',
                   hintStyle: const TextStyle(color: AppColors.textSecondary),
                   prefixIcon: const Icon(Icons.link, color: AppColors.neonCyan),
                   filled: true,
@@ -498,28 +492,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
               const SizedBox(height: 14),
-              const Text('Quick Presets:', style: TextStyle(color: AppColors.textSecondary, fontSize: 12, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  ActionChip(
-                    backgroundColor: AppColors.bgDark,
-                    label: const Text('☁️ Cloud Render', style: TextStyle(color: AppColors.neonGreen, fontSize: 11)),
-                    onPressed: () => controller.text = AppConstants.baseUrl,
-                  ),
-                  ActionChip(
-                    backgroundColor: AppColors.bgDark,
-                    label: const Text('📱 Emulator (10.0.2.2)', style: TextStyle(color: AppColors.neonCyan, fontSize: 11)),
-                    onPressed: () => controller.text = 'http://10.0.2.2:5000/api',
-                  ),
-                  ActionChip(
-                    backgroundColor: AppColors.bgDark,
-                    label: const Text('💻 Local Port 5000', style: TextStyle(color: AppColors.neonPurple, fontSize: 11)),
-                    onPressed: () => controller.text = 'http://192.168.1.100:5000/api',
-                  ),
-                ],
+              ActionChip(
+                backgroundColor: AppColors.bgDark,
+                avatar: const Icon(Icons.cloud, color: AppColors.neonGreen, size: 16),
+                label: const Text('Default Render Cloud', style: TextStyle(color: AppColors.neonGreen, fontSize: 12)),
+                onPressed: () => controller.text = AppConstants.baseUrl,
               ),
             ],
           ),
@@ -531,7 +508,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           ElevatedButton.icon(
             icon: const Icon(Icons.check, size: 16),
-            label: const Text('Apply Dynamic IP'),
+            label: const Text('Save Cloud Endpoint'),
             style: ElevatedButton.styleFrom(
               backgroundColor: AppColors.neonCyan,
               foregroundColor: AppColors.bgDark,
