@@ -3,6 +3,7 @@ const router = express.Router();
 const { getSheetData, appendRow, findRowIndex, updateRow, logAccessEvent } = require('../services/sheetsService');
 const { createNotification } = require('../services/notificationService');
 const { checkNightLockout, trackFailedAttempt, clearFailedAttempts } = require('../services/securityService');
+const faceService = require('../services/faceService');
 
 const { pendingCommands, deviceStatus, enrollmentStatus, pendingFaceAuth, cameraRegistry } = require('../services/sharedState');
 
@@ -66,8 +67,8 @@ router.get('/pending-face-auth/:roomId', (req, res) => {
   const { roomId } = req.params;
   const pending = pendingFaceAuth.get(roomId);
 
-  // Expire after 30 seconds
-  if (pending && Date.now() - pending.timestamp > 30000) {
+  // Expire after 12 seconds (matches ESP32's 10s face window + 2s grace)
+  if (pending && Date.now() - pending.timestamp > 12000) {
     console.log(`⏰ Face auth timeout for room ${roomId}`);
     pendingFaceAuth.delete(roomId);
 
@@ -353,30 +354,60 @@ router.get('/user-by-finger/:fingerId', async (req, res) => {
   }
 });
 
-// ==================== ENROLLMENT COMPLETE (ESP32 calls after enroll) ====================
+// ==================== ENROLLMENT COMPLETE (ESP32 calls after fingerprint stored) ====================
+// CRITICAL FIX: This runs BEFORE face enrollment completes (race condition).
+// We must PRESERVE any existing faceDescriptor + faceStatus from:
+//   1. In-memory faceDatabase (faceService) — may have been set milliseconds ago
+//   2. Google Sheets row data — fallback
+// Previously this was overwriting face data with empty strings.
 router.post('/enrollment-complete', async (req, res) => {
   try {
     const { fingerId, userId, userName, roomId, role } = req.body;
 
-    console.log(`\n📝 ENROLLMENT COMPLETE`);
+    console.log(`\n📝 ENROLLMENT COMPLETE (FINGERPRINT)`);
     console.log(`   Finger ID: ${fingerId} | User: ${userName} (${userId}) | Role: ${role || 'N/A'}`);
 
-    // Track in-memory for polling
+    // Track in-memory for polling (preserve face status if already set)
+    const existingStatus = enrollmentStatus.get(userId);
     enrollmentStatus.set(userId, {
       completed: true,
       fingerprintId: fingerId,
       enrolledAt: new Date().toISOString(),
       userName,
       role: role || 'user',
+      // Preserve face enrollment status from concurrent face enrollment
+      faceEnrolled: existingStatus?.faceEnrolled || false,
+      faceEnrolledAt: existingStatus?.faceEnrolledAt || null,
     });
 
-    // Update USERS sheet fingerprintId column
+    // Update USERS sheet fingerprintId column — PRESERVE face data
     const users = await getSheetData('USERS');
     let rowIndex = await findRowIndex('USERS', 'userid', userId);
     if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', userId);
 
     if (rowIndex !== -1) {
       const user = users.find(u => (u.userid || u.userId) === userId);
+
+      // RACE CONDITION FIX: Check in-memory faceDatabase FIRST (may have been
+      // enrolled by the concurrent FreeRTOS face task milliseconds ago).
+      // If not in memory, fall back to whatever is already in the Sheets row.
+      let faceDescriptorStr = '';
+      let faceStatus = 'NOT_ENROLLED';
+
+      const memoryFace = faceService.getDescriptorForUser(userId);
+      if (memoryFace && memoryFace.descriptor) {
+        faceDescriptorStr = JSON.stringify(memoryFace.descriptor);
+        faceStatus = memoryFace.status || 'ENROLLED';
+        console.log(`   🧠 Preserved face descriptor from memory (${faceDescriptorStr.length} chars)`);
+      } else {
+        // Fall back to Sheets row data
+        faceDescriptorStr = user.facedescriptor || user.faceDescriptor || '';
+        faceStatus = user.facestatus || user.faceStatus || 'NOT_ENROLLED';
+        if (faceDescriptorStr) {
+          console.log(`   📊 Preserved face descriptor from Sheets (${faceDescriptorStr.length} chars)`);
+        }
+      }
+
       await updateRow('USERS', rowIndex, [
         user.userid || user.userId,
         user.username || user.name,
@@ -385,11 +416,11 @@ router.post('/enrollment-complete', async (req, res) => {
         role || user.role || 'user',
         user.department,
         user.authorized_rooms || '',
-        fingerId.toString(),                            // fingerprintId
-        user.facedescriptor || user.faceDescriptor || '', // preserve faceDescriptor
-        user.facestatus || user.faceStatus || 'NOT_ENROLLED',
+        fingerId.toString(),       // fingerprintId — this is the new data
+        faceDescriptorStr,          // PRESERVED face descriptor (not empty!)
+        faceStatus,                 // PRESERVED face status (not reset!)
       ]);
-      console.log(`✅ Updated fingerprintId to ${fingerId} for user ${userId} [Role: ${role || user.role}]`);
+      console.log(`✅ Updated fingerprintId to ${fingerId} for user ${userId} [Role: ${role || user.role}] [Face: ${faceStatus}]`);
     }
 
     // Send notification to user
@@ -480,9 +511,14 @@ router.get('/status', (req, res) => {
 });
 
 // ==================== ENROLLMENT STATUS POLL ====================
+// Now includes face enrollment status alongside fingerprint
 router.get('/enrollment-status/:userId', (req, res) => {
   const { userId } = req.params;
   const status = enrollmentStatus.get(userId);
+
+  // Also check live face enrollment status from faceService
+  const faceEnrolled = faceService.isUserEnrolled(userId);
+
   if (status) {
     if (status.failed) {
       return res.json({
@@ -491,6 +527,7 @@ router.get('/enrollment-status/:userId', (req, res) => {
         failed: true,
         error: status.error,
         details: status.details,
+        faceEnrolled: faceEnrolled,
       });
     }
     if (status.completed) {
@@ -500,10 +537,12 @@ router.get('/enrollment-status/:userId', (req, res) => {
         failed: false,
         fingerprintId: status.fingerprintId,
         enrolledAt: status.enrolledAt,
+        faceEnrolled: faceEnrolled || status.faceEnrolled || false,
+        faceEnrolledAt: status.faceEnrolledAt || null,
       });
     }
   }
-  res.json({ success: true, enrolled: false, failed: false });
+  res.json({ success: true, enrolled: false, failed: false, faceEnrolled: faceEnrolled });
 });
 
 // ==================== DYNAMIC CAMERA IP REGISTRY ====================
