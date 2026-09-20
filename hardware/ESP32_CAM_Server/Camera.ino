@@ -429,10 +429,12 @@ bool initializeCamera()
         1);
 
     // Physical camera orientation.
+    // Vertical flip disabled to correct the upside-down TFT image.
     sensor->set_vflip(
         sensor,
-        1);
+        0);
 
+    // Keep left/right orientation unchanged.
     sensor->set_hmirror(
         sensor,
         0);
