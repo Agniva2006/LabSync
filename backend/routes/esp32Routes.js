@@ -71,8 +71,8 @@ router.get('/pending-face-auth/:roomId', (req, res) => {
   const { roomId } = req.params;
   const pending = pendingFaceAuth.get(roomId);
 
-  // Expire after 12 seconds (matches ESP32's 10s face window + 2s grace)
-  if (pending && Date.now() - pending.timestamp > 12000) {
+  // Expire after 40 seconds (matches ESP32's 25s face window + 15s grace)
+  if (pending && Date.now() - pending.timestamp > 40000) {
     console.log(`⏰ Face auth timeout for room ${roomId}`);
     pendingFaceAuth.delete(roomId);
 
@@ -263,13 +263,13 @@ router.get('/next-available-user', async (req, res) => {
     const requestedRole = (req.query.role || req.body?.role || 'user').trim().toLowerCase();
     const isAdmin = requestedRole === 'admin';
 
-    // 1. Check for any user marked PENDING or NOT_ENROLLED in Google Sheets matching the role
+    // 1. Check for any user needing fingerprint enrollment (empty fingerprint or status PENDING)
     const pendingUser = users.find(u => {
       const status = (u.facestatus || u.faceStatus || '').toUpperCase();
-      const fp = (u.fingerprintid || u.fingerprintId || '').trim();
+      const fp = (u.fingerprintid || u.fingerprintId || '').toString().trim();
       const userRole = (u.role || 'user').toLowerCase();
       const roleMatches = !req.query.role || userRole === requestedRole;
-      return roleMatches && (status === 'PENDING' || status === 'NOT_ENROLLED' || fp === '');
+      return roleMatches && (fp === '' || status === 'PENDING');
     });
 
     if (pendingUser) {
@@ -354,9 +354,18 @@ router.get('/user-by-finger/:fingerId', async (req, res) => {
 
     const userId = user.userid || user.userId;
     const userName = user.username || user.name;
+    const faceStatus = (user.facestatus || user.faceStatus || '').toUpperCase();
+    const faceDesc = (user.facedescriptor || user.faceDescriptor || '').trim();
+    const isFaceEnrolled = (faceStatus === 'ENROLLED' && faceDesc.length > 20) || faceService.isUserEnrolled(userId);
 
-    console.log(`✅ Fingerprint ${fingerId} → User: ${userName} (${userId}) [Role: ${user.role}]`);
-    res.json({ found: true, userId, userName, role: user.role });
+    console.log(`✅ Fingerprint ${fingerId} → User: ${userName} (${userId}) [Role: ${user.role}] [FaceEnrolled: ${isFaceEnrolled}]`);
+    res.json({
+      found: true,
+      userId,
+      userName,
+      role: user.role || 'user',
+      faceEnrolled: isFaceEnrolled
+    });
   } catch (error) {
     console.error('❌ user-by-finger error:', error);
     res.status(500).json({ success: false, message: error.message });

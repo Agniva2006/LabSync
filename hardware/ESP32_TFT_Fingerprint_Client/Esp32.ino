@@ -99,7 +99,7 @@ constexpr unsigned long RELAY_OPEN_MS = 5000;
 
 constexpr uint32_t LIVE_VIEW_TIME_MS = 25000;
 constexpr uint32_t FACE_REQUEST_INTERVAL_MS = 900;
-constexpr uint32_t FACE_UPLOAD_TIMEOUT_MS = 20000;
+constexpr uint32_t FACE_UPLOAD_TIMEOUT_MS = 25000;
 constexpr uint32_t COMMAND_POLL_INTERVAL_MS = 3000;
 constexpr uint32_t HEARTBEAT_INTERVAL_MS = 30000;
 constexpr uint32_t FP_RETRY_INTERVAL_MS = 5000;
@@ -1720,7 +1720,7 @@ bool postMultipartStreaming( const String &path, const String &part1, uint8_t *j
     WiFiClientSecure client;
 
     client.setInsecure();
-    client.setHandshakeTimeout(6);
+    client.setHandshakeTimeout(15);
     client.setTimeout(FACE_UPLOAD_TIMEOUT_MS);
 
     if (!client.connect( host.c_str(), port)) {
@@ -2243,7 +2243,7 @@ void drawCameraFaceBox(
 // USER LOOKUP
 // ============================================================
 
-bool getUserByFingerId( int fingerId, String &outUserId, String &outUserName, String &outRole) {
+bool getUserByFingerId( int fingerId, String &outUserId, String &outUserName, String &outRole, bool &outFaceEnrolled) {
   String response = httpGet( "/api/esp32/user-by-finger/" + String(fingerId) );
 
   if ( response.length() == 0) {
@@ -2266,13 +2266,21 @@ bool getUserByFingerId( int fingerId, String &outUserId, String &outUserName, St
 
   outRole = doc["role"] | "user";
 
+  outFaceEnrolled = doc["faceEnrolled"] | false;
+
   return outUserId.length() > 0;
 }
 
 // Overload for backward compatibility
+bool getUserByFingerId( int fingerId, String &outUserId, String &outUserName, String &outRole) {
+  bool dummyFace = false;
+  return getUserByFingerId(fingerId, outUserId, outUserName, outRole, dummyFace);
+}
+
 bool getUserByFingerId( int fingerId, String &outUserId, String &outUserName) {
   String dummyRole = "user";
-  return getUserByFingerId(fingerId, outUserId, outUserName, dummyRole);
+  bool dummyFace = false;
+  return getUserByFingerId(fingerId, outUserId, outUserName, dummyRole, dummyFace);
 }
 
 // ============================================================
@@ -2425,6 +2433,111 @@ void reportEnrollmentFailure( const String &userId, const String &userName, int 
 }
 
 // ============================================================
+// STEP 2: FACE REGISTRATION (STANDALONE & DUAL RE-ENROLLMENT)
+// ============================================================
+
+bool runFaceRegistrationOnly(const String &userId, const String &userName, const String &role = "user") {
+  tftShowFullScreen( "ENROLL STEP 2/2", "Waking camera...", COLOR_CYAN );
+
+  if (!startCamera()) {
+    tftShowFullScreen( "CAMERA ERROR", "Unable to wake camera", COLOR_RED );
+    delay(2000);
+    return false;
+  }
+
+  prepareCameraScreen( "FACE REGISTRATION", userName );
+
+  bool faceEnrolled = false;
+  uint32_t faceSession = beginFaceSession();
+  unsigned long start = millis();
+  unsigned long lastFaceRequest = 0;
+  FaceBox overlayBox = {0, 0, 0, 0, false};
+  uint16_t overlayColor = COLOR_YELLOW;
+  uint16_t reticleColor = COLOR_YELLOW;
+
+  while (millis() - start < LIVE_VIEW_TIME_MS && !faceEnrolled) {
+    bool resultSuccess = false;
+    FaceBox resultBox = {0, 0, 0, 0, false};
+
+    if (takeFaceResult(faceSession, FACE_REQUEST_ENROLL, resultSuccess, resultBox)) {
+      overlayBox = resultBox;
+      faceEnrolled = resultSuccess;
+      overlayColor = faceEnrolled ? COLOR_GREEN : COLOR_RED;
+      reticleColor = faceEnrolled ? COLOR_GREEN : COLOR_RED;
+    }
+
+    size_t jpegLen = fetchJpegFrame(jpegBuffer, jpegBufferCapacity);
+    if (jpegLen > 0) {
+      displayJpegOnTFT(jpegBuffer, jpegLen);
+      drawFaceReticle(reticleColor);
+
+      if (overlayBox.valid) {
+        drawCameraFaceBox(overlayBox, overlayColor);
+      }
+
+      if (faceEnrolled) {
+        tftShowStatus("Face Captured!", "Biometrics locked", COLOR_GREEN);
+        delay(500);
+        break;
+      }
+
+      if (faceRequestBusy) {
+        tftShowStatus("Align face in frame", "Checking image...", COLOR_CYAN);
+      }
+      else {
+        tftShowStatus("Align face in frame", "Live preview", COLOR_CYAN);
+      }
+
+      unsigned long now = millis();
+      if (!faceRequestBusy && !faceResultReady && jpegLen > MIN_FACE_JPEG_BYTES && now - lastFaceRequest >= FACE_REQUEST_INTERVAL_MS) {
+        if (startFaceRequestAsync(FACE_REQUEST_ENROLL, faceSession, userId, "", jpegBuffer, jpegLen)) {
+          lastFaceRequest = now;
+          reticleColor = COLOR_YELLOW;
+        }
+      }
+    }
+    delay(10);
+  }
+
+  // Grace period while candidate is being evaluated on server (up to 15s)
+  unsigned long enrollGraceStart = millis();
+  while (!faceEnrolled && faceRequestBusy && millis() - enrollGraceStart < 15000) {
+    size_t jpegLen = fetchJpegFrame(jpegBuffer, jpegBufferCapacity);
+    if (jpegLen > 0) {
+      displayJpegOnTFT(jpegBuffer, jpegLen);
+      drawFaceReticle(COLOR_YELLOW);
+      if (overlayBox.valid) {
+        drawCameraFaceBox(overlayBox, overlayColor);
+      }
+      tftShowStatus("Align face in frame", "Finishing capture...", COLOR_CYAN);
+    }
+
+    bool resultSuccess = false;
+    FaceBox resultBox = {0, 0, 0, 0, false};
+    if (takeFaceResult(faceSession, FACE_REQUEST_ENROLL, resultSuccess, resultBox)) {
+      faceEnrolled = resultSuccess;
+      overlayBox = resultBox;
+      overlayColor = faceEnrolled ? COLOR_GREEN : COLOR_RED;
+      break;
+    }
+    delay(10);
+  }
+
+  stopCamera();
+
+  if (faceEnrolled) {
+    tftShowFullScreen( role.equalsIgnoreCase("admin") ? "ADMIN ENROLLED" : "USER ENROLLED", userName, COLOR_GREEN );
+    tftShowStatus( "Biometrics Active", "Google Sheets Synced", COLOR_GREEN );
+  }
+  else {
+    tftShowFullScreen( "FACE INCOMPLETE", "Retry from admin menu", COLOR_RED );
+  }
+
+  delay(2000);
+  return faceEnrolled;
+}
+
+// ============================================================
 // ENROLLMENT SEQUENCE (STEP 1: FINGERPRINT, STEP 2: FACE)
 // ============================================================
 
@@ -2559,230 +2672,7 @@ bool runEnrollmentSequence( const String &userId, const String &userName, const 
   // ------------------------------------------------------------
   // STEP 2/2: FACE REGISTRATION (LIVE TFT PREVIEW)
   // ------------------------------------------------------------
-
-  tftShowFullScreen( "ENROLL STEP 2/2", "Waking camera...", COLOR_CYAN );
-
-  if (!startCamera()) {
-    tftShowFullScreen( "CAMERA ERROR", "Unable to wake camera", COLOR_RED );
-
-    delay(2000);
-
-    return false;
-
-  }
-
-  prepareCameraScreen( "FACE REGISTRATION", userName );
-
-  bool faceEnrolled = false;
-
-  uint32_t faceSession =
-      beginFaceSession();
-
-  unsigned long start =
-      millis();
-
-  unsigned long lastFaceRequest =
-      0;
-
-  FaceBox overlayBox =
-      {0, 0, 0, 0, false};
-
-  uint16_t overlayColor =
-      COLOR_YELLOW;
-
-  uint16_t reticleColor =
-      COLOR_YELLOW;
-
-  while (
-      millis() - start <
-          LIVE_VIEW_TIME_MS &&
-      !faceEnrolled) {
-    // Consume the last backend result without blocking the preview.
-    bool resultSuccess = false;
-    FaceBox resultBox =
-        {0, 0, 0, 0, false};
-
-    if (
-        takeFaceResult(
-            faceSession,
-            FACE_REQUEST_ENROLL,
-            resultSuccess,
-            resultBox)) {
-      overlayBox =
-          resultBox;
-
-      faceEnrolled =
-          resultSuccess;
-
-      overlayColor =
-          faceEnrolled
-              ? COLOR_GREEN
-              : COLOR_RED;
-
-      reticleColor =
-          faceEnrolled
-              ? COLOR_GREEN
-              : COLOR_RED;
-    }
-
-    size_t jpegLen =
-        fetchJpegFrame(
-            jpegBuffer,
-            jpegBufferCapacity);
-
-    if (jpegLen > 0) {
-      displayJpegOnTFT(
-          jpegBuffer,
-          jpegLen);
-
-      drawFaceReticle(
-          reticleColor);
-
-      if (overlayBox.valid) {
-        drawCameraFaceBox(
-            overlayBox,
-            overlayColor);
-      }
-
-      if (faceEnrolled) {
-        tftShowStatus(
-            "Face Captured!",
-            "Biometrics locked",
-            COLOR_GREEN);
-
-        delay(500);
-        break;
-      }
-
-      if (faceRequestBusy) {
-        tftShowStatus(
-            "Align face in frame",
-            "Checking image...",
-            COLOR_CYAN);
-      }
-      else {
-        tftShowStatus(
-            "Align face in frame",
-            "Live preview",
-            COLOR_CYAN);
-      }
-
-      unsigned long now =
-          millis();
-
-      // Capture rule:
-      // The camera supplies every frame for live preview.
-      // A JPEG becomes a backend candidate only when:
-      //   1) it is larger than MIN_FACE_JPEG_BYTES,
-      //   2) no previous face request is running, and
-      //   3) FACE_REQUEST_INTERVAL_MS has elapsed.
-      if (
-          !faceRequestBusy &&
-          !faceResultReady &&
-          jpegLen >
-              MIN_FACE_JPEG_BYTES &&
-          now -
-                  lastFaceRequest >=
-              FACE_REQUEST_INTERVAL_MS) {
-        if (
-            startFaceRequestAsync(
-                FACE_REQUEST_ENROLL,
-                faceSession,
-                userId,
-                "",
-                jpegBuffer,
-                jpegLen)) {
-          lastFaceRequest =
-              now;
-
-          // Return to neutral while this candidate is being checked.
-          reticleColor =
-              COLOR_YELLOW;
-        }
-      }
-    }
-
-    delay(10);
-  }
-
-  // Give the last asynchronous enrollment request a short grace
-  // period while the camera preview continues to update.
-  unsigned long enrollGraceStart =
-      millis();
-
-  while (
-      !faceEnrolled &&
-      faceRequestBusy &&
-      millis() -
-              enrollGraceStart <
-          1800) {
-    size_t jpegLen =
-        fetchJpegFrame(
-            jpegBuffer,
-            jpegBufferCapacity);
-
-    if (jpegLen > 0) {
-      displayJpegOnTFT(
-          jpegBuffer,
-          jpegLen);
-
-      drawFaceReticle(
-          COLOR_YELLOW);
-
-      if (overlayBox.valid) {
-        drawCameraFaceBox(
-            overlayBox,
-            overlayColor);
-      }
-
-      tftShowStatus(
-          "Align face in frame",
-          "Finishing capture...",
-          COLOR_CYAN);
-    }
-
-    bool resultSuccess = false;
-
-    FaceBox resultBox =
-        {0, 0, 0, 0, false};
-
-    if (
-        takeFaceResult(
-            faceSession,
-            FACE_REQUEST_ENROLL,
-            resultSuccess,
-            resultBox)) {
-      faceEnrolled =
-          resultSuccess;
-
-      overlayBox =
-          resultBox;
-
-      overlayColor =
-          faceEnrolled
-              ? COLOR_GREEN
-              : COLOR_RED;
-
-      break;
-    }
-
-    delay(10);
-  }
-
-  // Always put camera back into standby
-  stopCamera();
-
-  if (faceEnrolled) {
-    tftShowFullScreen( role.equalsIgnoreCase("admin") ? "ADMIN ENROLLED" : "USER ENROLLED", userName, COLOR_GREEN );
-    tftShowStatus( "Biometrics Active", "Google Sheets Synced", COLOR_GREEN );
-  }
-  else {
-    tftShowFullScreen( "FACE INCOMPLETE", "Retry from admin menu", COLOR_RED );
-  }
-
-  delay(2500);
-
-  return faceEnrolled;
+  return runFaceRegistrationOnly(userId, userName, role);
 }
 
 // ============================================================
@@ -3004,6 +2894,7 @@ void runAccessFlow(int fingerId) {
   String userId = "";
   String userName = "";
   String userRole = "user";
+  bool faceEnrolled = false;
 
   tftShowFullScreen(
       "FINGER MATCHED",
@@ -3015,7 +2906,8 @@ void runAccessFlow(int fingerId) {
           fingerId,
           userId,
           userName,
-          userRole)) {
+          userRole,
+          faceEnrolled)) {
     tftShowFullScreen(
         "USER NOT FOUND",
         "Fingerprint not linked",
@@ -3081,6 +2973,25 @@ void runAccessFlow(int fingerId) {
   notifyFingerprintVerified(
       userId,
       fingerId);
+
+  // If user has not completed face enrollment yet, smoothly transition to Step 2/2
+  if (!faceEnrolled) {
+    tftShowFullScreen(
+        "ENROLL FACE",
+        "Step 2: Register Face",
+        COLOR_CYAN);
+    delay(1200);
+
+    if (runFaceRegistrationOnly(userId, userName, userRole)) {
+      openDoor();
+      tftShowFullScreen(
+          "WELCOME",
+          userName,
+          COLOR_GREEN);
+      delay(1800);
+    }
+    return;
+  }
 
   // =========================================================
   // WAKE ESP32-CAM
@@ -3250,7 +3161,7 @@ void runAccessFlow(int fingerId) {
       faceRequestBusy &&
       millis() -
               graceStart <
-          1800) {
+          15000) {
     size_t jpegLen =
         fetchJpegFrame(
             jpegBuffer,
