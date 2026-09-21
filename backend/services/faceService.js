@@ -225,9 +225,8 @@ class FaceRecognitionService {
 
   /**
    * Universal Biometric Sync & Healing System
-   * Ensures ALL users (Agniva, Arun, Subhradip, Milan, yui, hui, kloo, etc.)
-   * have their fingerprints and face vectors synchronized between memory,
-   * local_db.json, and Google Sheets without losing or wiping any data.
+   * Ensures all users across the system have their fingerprints and face vectors
+   * synchronized between memory, local_db.json, and Google Sheets without losing or wiping any data.
    */
   async syncAndHealAllBiometrics(cachedUsers = null) {
     try {
@@ -358,9 +357,9 @@ class FaceRecognitionService {
   }
 
   /**
-   * Backwards compatible alias for Arun restore
+   * Universal Biometric Sync alias
    */
-  async ensureArunEnrolledWithFace(cachedUsers = null) {
+  async syncBiometrics(cachedUsers = null) {
     return this.syncAndHealAllBiometrics(cachedUsers);
   }
 
@@ -519,11 +518,11 @@ class FaceRecognitionService {
         console.warn('   ⚠️ TinyFaceDetector primary pass error:', err.message);
       }
 
-      // Pass 2: Retry with wider threshold if verification and first pass was empty
-      if (!detection && !isEnrollment) {
+      // Pass 2: Retry with sensitive threshold if first pass was empty (handles low-light OV2640 frames)
+      if (!detection) {
         try {
           detection = await faceapi
-            .detectSingleFace(cvs, new faceapi.TinyFaceDetectorOptions({ inputSize: 160, scoreThreshold: 0.15 }))
+            .detectSingleFace(cvs, new faceapi.TinyFaceDetectorOptions({ inputSize: 160, scoreThreshold: isEnrollment ? 0.16 : 0.15 }))
             .withFaceLandmarks()
             .withFaceDescriptor();
         } catch (e) {}
@@ -550,7 +549,7 @@ class FaceRecognitionService {
         // Quality Gate for Enrollment Candidates
         if (isEnrollment) {
           const isTooSmall = origBox.width < ENROLL_MIN_FACE_PX || origBox.height < ENROLL_MIN_FACE_PX;
-          const isLowScore = dScore < 0.18;
+          const isLowScore = dScore < 0.15;
 
           if (isTooSmall || isLowScore) {
             console.warn(`   ⚠️ [ENROLL-QUALITY-GATE-REJECT] Face rejected: score=${dScore.toFixed(3)}, size=${Math.round(origBox.width)}x${Math.round(origBox.height)}`);

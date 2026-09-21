@@ -68,13 +68,66 @@ function extractImageBuffer(req) {
   return { buffer: null, source: 'NONE' };
 }
 
-// ==================== APP/WEB FACE ENROLLMENT ====================
-router.post('/enroll', (req, res) => {
-  console.warn('⚠️ [ENROLL-REJECTED] In-app camera enrollment is disabled. Biometrics are hardware-only at ESP32 terminal.');
-  return res.status(403).json({
-    success: false,
-    message: 'App/Web face enrollment is disabled. All biometric enrollments must be conducted at the physical ESP32 door terminal.',
-  });
+// ==================== UNIVERSAL REMOTE / APP / WEB FACE ENROLLMENT ====================
+router.post('/enroll', upload.single('faceImage'), handleMulterError, async (req, res) => {
+  try {
+    const { userId } = req.body;
+    const { buffer: imageBuffer, source } = extractImageBuffer(req);
+
+    console.log(`\n============================================================`);
+    console.log(`🌐 [REMOTE-FACE-ENROLL] Enrollment request for User ID: ${userId || 'N/A'}`);
+    console.log(`   Source: ${source} | Buffer: ${imageBuffer?.length || 0} bytes`);
+
+    if (!userId) {
+      return res.status(400).json({ success: false, message: 'userId is required' });
+    }
+
+    if (!imageBuffer || imageBuffer.length === 0) {
+      return res.status(400).json({ success: false, message: 'No face image provided (must provide multipart file or base64 faceImage).' });
+    }
+
+    await faceService.initialize();
+    const result = await faceService.enrollFace(userId, imageBuffer);
+
+    if (result.success) {
+      const existingStatus = enrollmentStatus.get(userId);
+      if (existingStatus) {
+        existingStatus.faceEnrolled = true;
+        existingStatus.faceEnrolledAt = new Date().toISOString();
+      } else {
+        enrollmentStatus.set(userId, {
+          completed: true,
+          faceEnrolled: true,
+          faceEnrolledAt: new Date().toISOString(),
+        });
+      }
+
+      console.log(`🎉 [REMOTE-FACE-ENROLL] Successfully enrolled face for ${userId}`);
+      console.log(`============================================================\n`);
+
+      return res.json({
+        success: true,
+        message: 'Face enrolled successfully',
+        userId,
+        confidence: result.confidence,
+        box: result.box || null,
+      });
+    } else {
+      console.warn(`❌ [REMOTE-FACE-ENROLL-FAILED] ${result.message}`);
+      console.log(`============================================================\n`);
+      return res.status(400).json({
+        success: false,
+        message: result.message || 'Face enrollment failed',
+      });
+    }
+  } catch (error) {
+    console.error(`❌ [REMOTE-FACE-ENROLL-ERROR]:`, error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during remote face enrollment',
+      error: error.message,
+    });
+  }
 });
 
 // ==================== HARDWARE FACE ENROLLMENT (ESP32-CAM MULTI-SAMPLE) ====================

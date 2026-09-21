@@ -627,6 +627,57 @@ router.post('/debug/clear-all', (req, res) => {
   res.json({ success: true, message: 'Cleared' });
 });
 
+// ==================== UNIVERSAL REMOTE FINGERPRINT BINDING ====================
+router.post('/bind-fingerprint', async (req, res) => {
+  try {
+    const { fingerId, userId } = req.body;
+    const targetFp = parseInt(fingerId, 10);
+
+    if (isNaN(targetFp) || !userId) {
+      return res.status(400).json({ success: false, message: 'Valid fingerId and userId are required' });
+    }
+
+    console.log(`🔗 [BIND-FINGERPRINT] Remotely binding Slot ${targetFp} to User: ${userId}`);
+
+    let rowIndex = await findRowIndex('USERS', 'userid', userId);
+    if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', userId);
+
+    const users = await getSheetData('USERS');
+    const localUsers = getLocalDbData('USERS');
+    const normId = String(userId).toLowerCase();
+    const user = (users || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId) ||
+                 (localUsers || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId);
+
+    if (rowIndex !== -1 && user) {
+      await updateRow('USERS', rowIndex, [
+        user.userid || user.userId || userId,
+        user.username || user.name || 'User',
+        user.email || '',
+        user.password || '$2a$10$qSbfQoa5HHuxXzaTM4BnzuZGfscQPGgSQHyHhgCeN2Vn9Wbr/DcHu',
+        user.role || 'user',
+        user.department || 'Laboratory',
+        user.authorized_rooms || 'ROOM-001',
+        String(targetFp),
+        user.facedescriptor || user.faceDescriptor || '',
+        user.facestatus || user.faceStatus || 'NOT_ENROLLED'
+      ]);
+    }
+
+    // Trigger universal sync so memory is instantly updated
+    await faceService.syncAndHealAllBiometrics();
+
+    res.json({
+      success: true,
+      message: `Fingerprint slot ${targetFp} successfully bound to ${userId}`,
+      userId,
+      fingerId: targetFp
+    });
+  } catch (err) {
+    console.error('❌ bind-fingerprint error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ==================== UNIVERSAL BIOMETRICS SYNC & RESTORE ====================
 router.all(['/sync-biometrics', '/restore-arun'], async (req, res) => {
   try {

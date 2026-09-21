@@ -249,27 +249,32 @@ async function getSheetData(sheetName) {
       sheetDataCache.set(cacheKey, { timestamp: Date.now(), data });
       console.log(`📊 [DATABASE-READ] (Sheets) Loaded ${data.length} row(s) from "${sheetName}" (${Date.now() - startTime}ms)`);
       
-      // Mirror to local DB for backup — cleanly merge to preserve any local biometrics
-      const prevLocal = localDb[cacheKey] || [];
-      const merged = data.map(sheetItem => {
-        const id = (sheetItem.userid || sheetItem.userId || sheetItem.id || '').toLowerCase();
-        const localMatch = prevLocal.find(l => (l.userid || l.userId || l.id || '').toLowerCase() === id);
-        if (!localMatch) return sheetItem;
-        return {
-          ...sheetItem,
-          // Preserve local fingerprint if sheets is empty
-          fingerprintid: sheetItem.fingerprintid || localMatch.fingerprintid || localMatch.fingerprintId || '',
-          fingerprintId: sheetItem.fingerprintId || localMatch.fingerprintId || localMatch.fingerprintid || '',
-          // Preserve local faceDescriptor if sheets is empty
-          facedescriptor: sheetItem.facedescriptor || localMatch.facedescriptor || localMatch.faceDescriptor || '',
-          faceDescriptor: sheetItem.faceDescriptor || localMatch.faceDescriptor || localMatch.facedescriptor || '',
-          // Preserve local faceStatus if sheets is empty or NOT_ENROLLED but local has ENROLLED
-          facestatus: (sheetItem.facestatus && sheetItem.facestatus !== 'NOT_ENROLLED') ? sheetItem.facestatus : (localMatch.facestatus || localMatch.faceStatus || sheetItem.facestatus || 'NOT_ENROLLED'),
-          faceStatus: (sheetItem.faceStatus && sheetItem.faceStatus !== 'NOT_ENROLLED') ? sheetItem.faceStatus : (localMatch.faceStatus || localMatch.facestatus || sheetItem.faceStatus || 'NOT_ENROLLED'),
-        };
+      // Mirror to local DB for backup — cleanly merge to preserve all users & biometrics
+      const userMap = new Map();
+      (localDb[cacheKey] || []).forEach(item => {
+        const id = (item.userid || item.userId || item.id || '').toLowerCase();
+        if (id) userMap.set(id, item);
       });
 
-      localDb[cacheKey] = merged;
+      data.forEach(sheetItem => {
+        const id = (sheetItem.userid || sheetItem.userId || sheetItem.id || '').toLowerCase();
+        if (id) {
+          const localMatch = userMap.get(id) || {};
+          userMap.set(id, {
+            ...localMatch,
+            ...sheetItem,
+            _rowNumber: sheetItem._rowNumber || localMatch._rowNumber,
+            fingerprintid: (sheetItem.fingerprintid && sheetItem.fingerprintid !== '') ? sheetItem.fingerprintid : (localMatch.fingerprintid || localMatch.fingerprintId || ''),
+            fingerprintId: (sheetItem.fingerprintId && sheetItem.fingerprintId !== '') ? sheetItem.fingerprintId : (localMatch.fingerprintId || localMatch.fingerprintid || ''),
+            facedescriptor: (sheetItem.facedescriptor && sheetItem.facedescriptor.length > 50) ? sheetItem.facedescriptor : (localMatch.facedescriptor || localMatch.faceDescriptor || ''),
+            faceDescriptor: (sheetItem.faceDescriptor && sheetItem.faceDescriptor.length > 50) ? sheetItem.faceDescriptor : (localMatch.faceDescriptor || localMatch.facedescriptor || ''),
+            facestatus: (sheetItem.facestatus && sheetItem.facestatus !== 'NOT_ENROLLED') ? sheetItem.facestatus : (localMatch.facestatus || localMatch.faceStatus || sheetItem.facestatus || 'NOT_ENROLLED'),
+            faceStatus: (sheetItem.faceStatus && sheetItem.faceStatus !== 'NOT_ENROLLED') ? sheetItem.faceStatus : (localMatch.faceStatus || localMatch.facestatus || sheetItem.faceStatus || 'NOT_ENROLLED'),
+          });
+        }
+      });
+
+      localDb[cacheKey] = Array.from(userMap.values());
       saveLocalDb();
       return data;
     } catch (sheetErr) {
