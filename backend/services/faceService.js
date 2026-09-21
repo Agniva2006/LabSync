@@ -59,8 +59,8 @@ const ENROLL_MIN_FACE_PX = 45;          // Minimum face box dimension (px) for e
 const VERIFY_CONFIDENCE_PRIMARY = 0.20; // Primary detection threshold for verification
 const VERIFY_CONFIDENCE_FALLBACK = 0.12;// Fallback for low-light verification
 const VERIFY_DISTANCE_THRESHOLD = 0.65; // Euclidean distance threshold for match (<= 0.65 is standard for SSD MobileNet)
-const SAMPLES_NEEDED_FOR_ENROLLMENT = 3;// Number of good samples before averaging and saving
-const HIGH_QUALITY_SINGLE_SCORE = 0.80; // If a single sample scores >= 0.80, can enroll immediately
+const SAMPLES_NEEDED_FOR_ENROLLMENT = 1;// Finalize immediately on first valid face frame so ESP32 never times out
+const HIGH_QUALITY_SINGLE_SCORE = 0.35; // Any detected face passing quality gate (score >= 0.35) can enroll immediately
 
 class FaceRecognitionService {
   constructor() {

@@ -97,9 +97,9 @@ constexpr unsigned long RELAY_OPEN_MS = 5000;
 // TIMING
 // ============================================================
 
-constexpr uint32_t LIVE_VIEW_TIME_MS = 10000;
+constexpr uint32_t LIVE_VIEW_TIME_MS = 25000;
 constexpr uint32_t FACE_REQUEST_INTERVAL_MS = 900;
-constexpr uint32_t FACE_UPLOAD_TIMEOUT_MS = 8000;
+constexpr uint32_t FACE_UPLOAD_TIMEOUT_MS = 20000;
 constexpr uint32_t COMMAND_POLL_INTERVAL_MS = 3000;
 constexpr uint32_t HEARTBEAT_INTERVAL_MS = 30000;
 constexpr uint32_t FP_RETRY_INTERVAL_MS = 5000;
