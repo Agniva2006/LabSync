@@ -623,4 +623,19 @@ router.post('/debug/clear-all', (req, res) => {
   res.json({ success: true, message: 'Cleared' });
 });
 
+// ==================== RESTORE ARUN BIOMETRICS (DIRECT TRIGGER) ====================
+router.all('/restore-arun', async (req, res) => {
+  try {
+    const result = await faceService.ensureArunEnrolledWithFace();
+    res.json({
+      success: true,
+      message: 'Arun restored in Google Sheets with Fingerprint 22 and genuine face vector',
+      result
+    });
+  } catch (error) {
+    console.error('❌ restore-arun error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 module.exports = router;
