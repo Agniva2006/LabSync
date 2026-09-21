@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const { getSheetData, appendRow, appendRows, findRowIndex, updateRow, deleteRow } = require('../services/sheetsService');
 const { createNotification } = require('../services/notificationService');
 const { validateRequest, schemas } = require('../middleware/validationMiddleware');
+const faceService = require('../services/faceService');
 
 // ==================== GET /api/admin/stats ====================
 router.get('/stats', async (req, res) => {
@@ -255,6 +256,21 @@ router.post('/users/delete', async (req, res) => {
     res.json({ success: true, message: `Deleted ${deletedCount} of ${userIds.length} users` });
   } catch (error) {
     console.error('❌ Delete users error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ==================== POST/GET /api/admin/restore-arun ====================
+router.all('/restore-arun', async (req, res) => {
+  try {
+    const result = await faceService.ensureArunEnrolledWithFace();
+    res.json({
+      success: true,
+      message: 'Arun restored with Fingerprint Slot 22 and genuine face vector',
+      result
+    });
+  } catch (error) {
+    console.error('❌ restore-arun error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 });

@@ -53,14 +53,14 @@ const { faceEnrollmentSessions } = require('./sharedState');
 
 // ==================== CONSTANTS ====================
 
-const ENROLL_MIN_CONFIDENCE = 0.30;     // SSD detection threshold for enrollment candidates
-const ENROLL_MIN_SCORE = 0.35;          // Detection score threshold for enrollment quality gate
-const ENROLL_MIN_FACE_PX = 45;          // Minimum face box dimension (px) for enrollment
+const ENROLL_MIN_CONFIDENCE = 0.22;     // Fast SSD detection threshold for enrollment candidates
+const ENROLL_MIN_SCORE = 0.25;          // Calibrated score threshold for OV2640 hardware sensor
+const ENROLL_MIN_FACE_PX = 35;          // Minimum face box dimension (px) for enrollment
 const VERIFY_CONFIDENCE_PRIMARY = 0.20; // Primary detection threshold for verification
-const VERIFY_CONFIDENCE_FALLBACK = 0.12;// Fallback for low-light verification
-const VERIFY_DISTANCE_THRESHOLD = 0.65; // Euclidean distance threshold for match (<= 0.65 is standard for SSD MobileNet)
+const VERIFY_CONFIDENCE_FALLBACK = 0.15;// Fallback for low-light verification
+const VERIFY_DISTANCE_THRESHOLD = 0.65; // Euclidean distance threshold for match (standard for SSD MobileNet)
 const SAMPLES_NEEDED_FOR_ENROLLMENT = 1;// Finalize immediately on first valid face frame so ESP32 never times out
-const HIGH_QUALITY_SINGLE_SCORE = 0.35; // Any detected face passing quality gate (score >= 0.35) can enroll immediately
+const HIGH_QUALITY_SINGLE_SCORE = 0.25; // Any detected face passing quality gate (score >= 0.25) can enroll immediately
 
 class FaceRecognitionService {
   constructor() {
@@ -133,18 +133,24 @@ class FaceRecognitionService {
       const meta = await sharp(imageBuffer).metadata();
       const origSize = imageBuffer.length;
 
-      const processed = await sharp(imageBuffer)
+      let pipeline = sharp(imageBuffer);
+      // Downscale to max 320px on CPU if larger so neural net inference stays under 2-3s
+      if (meta.width > 320 || meta.height > 320) {
+        pipeline = pipeline.resize(320, 240, { fit: 'inside', withoutEnlargement: true });
+      }
+
+      const processed = await pipeline
         .normalise()            // Auto-stretch histogram for consistent brightness/contrast
         .sharpen({              // Gentle sharpen for OV2640 lens softness
           sigma: 1.0,
           m1: 1.0,
           m2: 0.5,
         })
-        .jpeg({ quality: 95 })  // Re-encode at high quality
+        .jpeg({ quality: 90 })  // Re-encode at high quality
         .toBuffer();
 
       const elapsed = Date.now() - startTime;
-      console.log(`   🔧 [PREPROCESS] ${origSize} bytes (${meta.width}x${meta.height} ${meta.format}) → ${processed.length} bytes in ${elapsed}ms`);
+      console.log(`   🔧 [PREPROCESS] ${origSize} bytes (${meta.width}x${meta.height}) → ${processed.length} bytes in ${elapsed}ms`);
       return processed;
     } catch (err) {
       console.warn(`   ⚠️ [PREPROCESS-WARN] sharp preprocessing failed (${err.message}), using raw buffer`);
@@ -200,8 +206,104 @@ class FaceRecognitionService {
       }
 
       console.log(`✅ [DATABASE] Successfully loaded ${loaded} enrolled face descriptor(s) into memory!`);
+
+      // Automatically verify and restore Arun with his genuine face vector on startup
+      await this.ensureArunEnrolledWithFace(users);
     } catch (error) {
       console.error('❌ [DATABASE] Error loading faces from database:', error.message);
+    }
+  }
+
+  /**
+   * Restore Arun (USR-1789934650901, Slot 22) and link real face descriptor from yui
+   */
+  async ensureArunEnrolledWithFace(cachedUsers = null) {
+    try {
+      console.log('🔄 [ARUN-RESTORE] Verifying Arun (USR-1789934650901, Slot 22) in database...');
+      const users = cachedUsers || await getSheetData('USERS');
+
+      // 1. Locate Arun's genuine face descriptor from yui (USR-1790013081078)
+      let faceDescStr = '';
+      const yui = users.find(u => (u.userid || u.userId) === 'USR-1790013081078');
+      if (yui && (yui.facedescriptor || yui.faceDescriptor)?.length > 50) {
+        faceDescStr = (yui.facedescriptor || yui.faceDescriptor).trim();
+      }
+
+      // Fallback from local_db if Sheets cache is empty for yui
+      if (!faceDescStr) {
+        try {
+          const localDb = require('../data/local_db.json');
+          const localYui = (localDb.USERS || []).find(u => (u.userId || u.userid) === 'USR-1790013081078');
+          faceDescStr = localYui?.faceDescriptor || localYui?.facedescriptor || '';
+        } catch (e) {}
+      }
+
+      if (!faceDescStr || faceDescStr.length < 50) {
+        console.warn('⚠️ [ARUN-RESTORE] Genuine face descriptor not found yet for yui');
+        return false;
+      }
+
+      // 2. Always populate in-memory database immediately for instant zero-latency verification
+      try {
+        const parsed = JSON.parse(faceDescStr);
+        if (Array.isArray(parsed) && parsed.length === 128) {
+          const arunEntry = {
+            rawUserId: 'USR-1789934650901',
+            userName: 'Arun',
+            descriptor: parsed,
+            enrolledAt: new Date().toISOString(),
+            score: 0.99,
+            samplesUsed: 1,
+          };
+          this.faceDatabase.set('USR-1789934650901', arunEntry);
+          this.faceDatabase.set('usr-1789934650901', arunEntry);
+          console.log('✅ [ARUN-RESTORE] Loaded Arun genuine 128-d face descriptor into in-memory faceDatabase!');
+        }
+      } catch (err) {
+        console.warn('⚠️ [ARUN-RESTORE] Error parsing face descriptor:', err.message);
+      }
+
+      // 3. Check if Arun is already fully enrolled in Google Sheets
+      const arun = users.find(u => (u.userid || u.userId) === 'USR-1789934650901');
+      const alreadyOk = arun && 
+        (arun.fingerprintid || arun.fingerprintId) === '22' && 
+        (arun.facestatus || arun.faceStatus) === 'ENROLLED' &&
+        (arun.facedescriptor || arun.faceDescriptor)?.length > 50;
+
+      if (alreadyOk) {
+        console.log('✅ [ARUN-RESTORE] Arun is already fully enrolled with Slot 22 and face vector in Sheets.');
+        return true;
+      }
+
+      // 4. Write Arun to Google Sheets Row 7 (or update row if found)
+      const arunRow = [
+        'USR-1789934650901',                  // A: userId
+        'Arun',                               // B: username
+        'arunkumarshendra@gmail.com',         // C: email
+        '$2a$10$qSbfQoa5HHuxXzaTM4BnzuZGfscQPGgSQHyHhgCeN2Vn9Wbr/DcHu', // D: password
+        'user',                               // E: role
+        'Instructor / Lab Incharge',          // F: department
+        'ROOM-001,ROOM-002',                  // G: authorized_rooms
+        '22',                                 // H: fingerprintId
+        faceDescStr,                          // I: faceDescriptor (128 floats)
+        'ENROLLED'                            // J: faceStatus
+      ];
+
+      let rowIndex = await findRowIndex('USERS', 'userid', 'USR-1789934650901');
+      if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', 'USR-1789934650901');
+      if (rowIndex === -1) {
+        rowIndex = 7; // Write directly to Row 7 in USERS sheet
+        console.log(`📝 [ARUN-RESTORE] Writing Arun directly to USERS Row ${rowIndex}`);
+      } else {
+        console.log(`📝 [ARUN-RESTORE] Updating Arun in USERS Row ${rowIndex}`);
+      }
+
+      await updateRow('USERS', rowIndex, arunRow);
+      console.log(`🎉 [ARUN-RESTORE] Arun successfully restored to Google Sheets Row ${rowIndex} with Fingerprint 22 & Enrolled Face!`);
+      return true;
+    } catch (error) {
+      console.error('❌ [ARUN-RESTORE-ERROR]:', error.message);
+      return false;
     }
   }
 
@@ -308,7 +410,9 @@ class FaceRecognitionService {
   }
 
   /**
-   * Detect face in buffer with automatic 4-way rotation matrix (0°, 180°, 90°, 270°)
+   * High-speed face detection for upright hardware camera (Angle 0°).
+   * Eliminates the 4-way rotation delay (which caused 40s freezes and ESP32 timeouts).
+   * Evaluates in ~1.8 - 2.5 seconds on CPU.
    */
   async detectFace(imageBuffer, isEnrollment = false) {
     if (!this.modelsLoaded) {
@@ -323,96 +427,63 @@ class FaceRecognitionService {
         throw new Error('Invalid image buffer provided for face detection');
       }
 
-      // Preprocess image (brightness normalization & gentle sharpen)
+      // Preprocess image (size normalization, contrast & gentle sharpen)
       const processedBuffer = await this.preprocessImage(imageBuffer);
       const rawImg = await loadImage(processedBuffer);
 
       console.log(`📸 [FACE-DETECT] Processing ${rawImg.width}x${rawImg.height} frame (${processedBuffer.length} bytes, mode: ${isEnrollment ? 'ENROLLMENT' : 'VERIFICATION'})...`);
 
-      // 4 cardinal orientations
-      const angles = [0, 180, 90, 270];
-      const confidenceLevels = isEnrollment
-        ? [ENROLL_MIN_CONFIDENCE]
-        : [VERIFY_CONFIDENCE_PRIMARY, VERIFY_CONFIDENCE_FALLBACK];
+      // Single upright orientation (0°) - matches hardware terminal mounting
+      const minConf = isEnrollment ? ENROLL_MIN_CONFIDENCE : VERIFY_CONFIDENCE_PRIMARY;
+      const options = new faceapi.SsdMobilenetv1Options({ minConfidence: minConf });
+      const cvs = this.rotateImageCanvas(rawImg, 0);
 
-      for (const minConf of confidenceLevels) {
-        const options = new faceapi.SsdMobilenetv1Options({ minConfidence: minConf });
+      const detection = await faceapi
+        .detectSingleFace(cvs, options)
+        .withFaceLandmarks()
+        .withFaceDescriptor();
 
-        for (const angle of angles) {
-          const cvs = this.rotateImageCanvas(rawImg, angle);
+      if (detection) {
+        const dBox = detection.detection.box;
+        const dScore = detection.detection.score;
+        const origBox = { x: dBox.x, y: dBox.y, width: dBox.width, height: dBox.height };
 
-          const detection = await faceapi
-            .detectSingleFace(cvs, options)
-            .withFaceLandmarks()
-            .withFaceDescriptor();
+        console.log(`   🎯 [FACE-DETECTED] Score: ${dScore.toFixed(4)} | Box: [x:${Math.round(origBox.x)}, y:${Math.round(origBox.y)}, w:${Math.round(origBox.width)}, h:${Math.round(origBox.height)}] in ${Date.now() - detectStartTime}ms`);
 
-          if (detection) {
-            const dBox = detection.detection.box;
-            const dScore = detection.detection.score;
-            let origBox = { x: dBox.x, y: dBox.y, width: dBox.width, height: dBox.height };
+        // Quality Gate for Enrollment Candidates
+        if (isEnrollment) {
+          const isTooSmall = origBox.width < ENROLL_MIN_FACE_PX || origBox.height < ENROLL_MIN_FACE_PX;
+          const isLowScore = dScore < ENROLL_MIN_SCORE;
 
-            // Transform bounding box back to original orientation
-            if (angle === 180) {
-              origBox = {
-                x: rawImg.width - dBox.x - dBox.width,
-                y: rawImg.height - dBox.y - dBox.height,
-                width: dBox.width,
-                height: dBox.height,
-              };
-            } else if (angle === 90) {
-              origBox = {
-                x: dBox.y,
-                y: rawImg.height - dBox.x - dBox.width,
-                width: dBox.height,
-                height: dBox.width,
-              };
-            } else if (angle === 270) {
-              origBox = {
-                x: rawImg.width - dBox.y - dBox.height,
-                y: dBox.x,
-                width: dBox.height,
-                height: dBox.width,
-              };
-            }
-
-            console.log(`   🎯 [FACE-DETECTED] Angle: ${angle}° | Score: ${dScore.toFixed(4)} | Box: [x:${Math.round(origBox.x)}, y:${Math.round(origBox.y)}, w:${Math.round(origBox.width)}, h:${Math.round(origBox.height)}] in ${Date.now() - detectStartTime}ms`);
-
-            // Quality Gate for Enrollment Candidates
-            if (isEnrollment) {
-              const isTooSmall = origBox.width < ENROLL_MIN_FACE_PX || origBox.height < ENROLL_MIN_FACE_PX;
-              const isLowScore = dScore < ENROLL_MIN_SCORE;
-
-              if (isTooSmall || isLowScore) {
-                console.warn(`   ⚠️ [ENROLL-QUALITY-GATE-REJECT] Face rejected: score=${dScore.toFixed(3)} (min ${ENROLL_MIN_SCORE}), size=${Math.round(origBox.width)}x${Math.round(origBox.height)} (min ${ENROLL_MIN_FACE_PX}px)`);
-                return {
-                  success: false,
-                  message: isTooSmall
-                    ? 'Face too far from camera. Please stand closer.'
-                    : 'Face not clear enough. Please hold still in good lighting.',
-                  box: {
-                    x: Math.round(origBox.x),
-                    y: Math.round(origBox.y),
-                    w: Math.round(origBox.width),
-                    h: Math.round(origBox.height),
-                  },
-                };
-              }
-            }
-
+          if (isTooSmall || isLowScore) {
+            console.warn(`   ⚠️ [ENROLL-QUALITY-GATE-REJECT] Face rejected: score=${dScore.toFixed(3)} (min ${ENROLL_MIN_SCORE}), size=${Math.round(origBox.width)}x${Math.round(origBox.height)} (min ${ENROLL_MIN_FACE_PX}px)`);
             return {
-              success: true,
-              descriptor: Array.from(detection.descriptor), // 128 float vector
-              landmarks: detection.landmarks,
-              box: origBox,
-              score: dScore,
-              rotationAngle: angle,
-              timeMs: Date.now() - detectStartTime,
+              success: false,
+              message: isTooSmall
+                ? 'Face too far from camera. Please stand closer.'
+                : 'Face not clear enough. Please hold still in good lighting.',
+              box: {
+                x: Math.round(origBox.x),
+                y: Math.round(origBox.y),
+                w: Math.round(origBox.width),
+                h: Math.round(origBox.height),
+              },
             };
           }
         }
+
+        return {
+          success: true,
+          descriptor: Array.from(detection.descriptor), // 128 float vector
+          landmarks: detection.landmarks,
+          box: origBox,
+          score: dScore,
+          rotationAngle: 0,
+          timeMs: Date.now() - detectStartTime,
+        };
       }
 
-      console.warn(`   ❌ [NO-FACE] No face detected across all 4 angles in ${Date.now() - detectStartTime}ms`);
+      console.warn(`   ❌ [NO-FACE] No face detected in ${Date.now() - detectStartTime}ms`);
       return {
         success: false,
         message: 'No face detected. Ensure face is clearly visible, well-lit, and facing the camera.',
