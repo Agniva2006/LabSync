@@ -260,17 +260,17 @@ router.post('/users/delete', async (req, res) => {
   }
 });
 
-// ==================== POST/GET /api/admin/restore-arun ====================
-router.all('/restore-arun', async (req, res) => {
+// ==================== POST/GET /api/admin/sync-biometrics (UNIVERSAL) ====================
+router.all(['/sync-biometrics', '/restore-arun'], async (req, res) => {
   try {
-    const result = await faceService.ensureArunEnrolledWithFace();
+    const result = await faceService.syncAndHealAllBiometrics();
     res.json({
       success: true,
-      message: 'Arun restored with Fingerprint Slot 22 and genuine face vector',
+      message: 'Universal biometric synchronization and healing complete for all users',
       result
     });
   } catch (error) {
-    console.error('❌ restore-arun error:', error);
+    console.error('❌ sync-biometrics error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 });

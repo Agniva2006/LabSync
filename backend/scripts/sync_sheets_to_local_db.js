@@ -69,39 +69,18 @@ async function syncSheetsToLocalDb() {
       role: role || existing.role || 'user',
       department: department || existing.department || 'Lab Member',
       authorized_rooms: authorized_rooms || existing.authorized_rooms || 'ROOM-001',
-      fingerprintid: fingerprintId || existing.fingerprintId || '',
-      fingerprintId: fingerprintId || existing.fingerprintId || '',
-      facedescriptor: faceDescriptor || existing.faceDescriptor || '',
-      faceDescriptor: faceDescriptor || existing.faceDescriptor || '',
-      facestatus: faceStatus || existing.faceStatus || 'NOT_ENROLLED',
-      faceStatus: faceStatus || existing.faceStatus || 'NOT_ENROLLED',
-    });
-  }
-
-  // Ensure Arun is present with Slot 22
-  if (!userMap.has('USR-1789934650901')) {
-    userMap.set('USR-1789934650901', {
-      userid: 'USR-1789934650901',
-      userId: 'USR-1789934650901',
-      username: 'Arun',
-      name: 'Arun',
-      email: 'arunkumarshendra@gmail.com',
-      password: '$2a$10$qSbfQoa5HHuxXzaTM4BnzuZGfscQPGgSQHyHhgCeN2Vn9Wbr/DcHu',
-      role: 'user',
-      department: 'Instructor / Lab Incharge',
-      authorized_rooms: 'ROOM-001,ROOM-002',
-      fingerprintid: '22',
-      fingerprintId: '22',
-      facedescriptor: '',
-      faceDescriptor: '',
-      facestatus: 'NOT_ENROLLED',
-      faceStatus: 'NOT_ENROLLED'
+      fingerprintid: (fingerprintId && fingerprintId !== '') ? fingerprintId : (existing.fingerprintid || existing.fingerprintId || ''),
+      fingerprintId: (fingerprintId && fingerprintId !== '') ? fingerprintId : (existing.fingerprintId || existing.fingerprintid || ''),
+      facedescriptor: (faceDescriptor && faceDescriptor.length > 50) ? faceDescriptor : (existing.facedescriptor || existing.faceDescriptor || ''),
+      faceDescriptor: (faceDescriptor && faceDescriptor.length > 50) ? faceDescriptor : (existing.faceDescriptor || existing.facedescriptor || ''),
+      facestatus: (faceStatus && faceStatus !== 'NOT_ENROLLED') ? faceStatus : (existing.facestatus || existing.faceStatus || faceStatus || 'NOT_ENROLLED'),
+      faceStatus: (faceStatus && faceStatus !== 'NOT_ENROLLED') ? faceStatus : (existing.faceStatus || existing.facestatus || faceStatus || 'NOT_ENROLLED'),
     });
   }
 
   currentDb.USERS = Array.from(userMap.values());
   fs.writeFileSync(localDbPath, JSON.stringify(currentDb, null, 2), 'utf8');
-  console.log(`✅ Synced ${currentDb.USERS.length} users into local_db.json!`);
+  console.log(`✅ Universal sync complete: ${currentDb.USERS.length} users updated in local_db.json!`);
 }
 
 syncSheetsToLocalDb().catch(console.error);

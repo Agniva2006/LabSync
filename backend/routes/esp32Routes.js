@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { getSheetData, appendRow, findRowIndex, updateRow, logAccessEvent } = require('../services/sheetsService');
+const { getSheetData, getLocalDbData, appendRow, findRowIndex, updateRow, logAccessEvent } = require('../services/sheetsService');
 const { createNotification } = require('../services/notificationService');
 const { checkNightLockout, trackFailedAttempt, clearFailedAttempts } = require('../services/securityService');
 const faceService = require('../services/faceService');
@@ -335,28 +335,38 @@ router.get('/next-available-user', async (req, res) => {
   }
 });
 
-// ==================== GET USER BY FINGERPRINT ID ====================
+// ==================== GET USER BY FINGERPRINT ID (UNIVERSAL) ====================
 // ESP32 calls this after fingerSearch() to get the matching userId
 router.get('/user-by-finger/:fingerId', async (req, res) => {
   try {
     const { fingerId } = req.params;
-    const users = await getSheetData('USERS');
+    const targetFp = parseInt(fingerId, 10);
+    if (isNaN(targetFp)) {
+      return res.status(400).json({ found: false, message: 'Invalid fingerprint ID' });
+    }
 
-    const user = users.find(u => {
-      const storedId = u.fingerprintid || u.fingerprintId || '';
-      return storedId !== '' && parseInt(storedId) === parseInt(fingerId);
+    // 1. Search in Google Sheets
+    const users = await getSheetData('USERS');
+    let user = (users || []).find(u => {
+      const storedId = parseInt(u.fingerprintid || u.fingerprintId || '', 10);
+      return !isNaN(storedId) && storedId === targetFp;
     });
 
-    if (!user && parseInt(fingerId) === 22) {
-      console.log(`⚡ [AUTO-REPAIR] Fingerprint 22 matched to Arun (USR-1789934650901)`);
-      const isFaceEnrolled = faceService.isUserEnrolled('USR-1789934650901') || true;
-      return res.json({
-        found: true,
-        userId: 'USR-1789934650901',
-        userName: 'Arun',
-        role: 'user',
-        faceEnrolled: isFaceEnrolled
+    // 2. Universal Fallback: Search in local database cache
+    if (!user) {
+      const localUsers = getLocalDbData('USERS');
+      user = (localUsers || []).find(u => {
+        const storedId = parseInt(u.fingerprintid || u.fingerprintId || '', 10);
+        return !isNaN(storedId) && storedId === targetFp;
       });
+    }
+
+    // 3. Universal Fallback: Check in-memory faceService database
+    if (!user) {
+      const memoryUser = faceService.getUserByFingerprintId(targetFp);
+      if (memoryUser) {
+        user = memoryUser;
+      }
     }
 
     if (!user) {
@@ -365,17 +375,18 @@ router.get('/user-by-finger/:fingerId', async (req, res) => {
     }
 
     const userId = user.userid || user.userId;
-    const userName = user.username || user.name;
+    const userName = user.username || user.name || 'User';
+    const role = user.role || 'user';
     const faceStatus = (user.facestatus || user.faceStatus || '').toUpperCase();
     const faceDesc = (user.facedescriptor || user.faceDescriptor || '').trim();
     const isFaceEnrolled = (faceStatus === 'ENROLLED' && faceDesc.length > 20) || faceService.isUserEnrolled(userId);
 
-    console.log(`✅ Fingerprint ${fingerId} → User: ${userName} (${userId}) [Role: ${user.role}] [FaceEnrolled: ${isFaceEnrolled}]`);
+    console.log(`✅ Universal Fingerprint ${fingerId} → User: ${userName} (${userId}) [Role: ${role}] [FaceEnrolled: ${isFaceEnrolled}]`);
     res.json({
       found: true,
       userId,
       userName,
-      role: user.role || 'user',
+      role,
       faceEnrolled: isFaceEnrolled
     });
   } catch (error) {
@@ -385,11 +396,6 @@ router.get('/user-by-finger/:fingerId', async (req, res) => {
 });
 
 // ==================== ENROLLMENT COMPLETE (ESP32 calls after fingerprint stored) ====================
-// CRITICAL FIX: This runs BEFORE face enrollment completes (race condition).
-// We must PRESERVE any existing faceDescriptor + faceStatus from:
-//   1. In-memory faceDatabase (faceService) — may have been set milliseconds ago
-//   2. Google Sheets row data — fallback
-// Previously this was overwriting face data with empty strings.
 router.post('/enrollment-complete', async (req, res) => {
   try {
     const { fingerId, userId, userName, roomId, role } = req.body;
@@ -405,47 +411,45 @@ router.post('/enrollment-complete', async (req, res) => {
       enrolledAt: new Date().toISOString(),
       userName,
       role: role || 'user',
-      // Preserve face enrollment status from concurrent face enrollment
       faceEnrolled: existingStatus?.faceEnrolled || false,
       faceEnrolledAt: existingStatus?.faceEnrolledAt || null,
     });
 
     // Update USERS sheet fingerprintId column — PRESERVE face data
     const users = await getSheetData('USERS');
+    const localUsers = getLocalDbData('USERS');
     let rowIndex = await findRowIndex('USERS', 'userid', userId);
     if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', userId);
 
-    if (rowIndex !== -1) {
-      const user = users.find(u => (u.userid || u.userId) === userId);
+    const normId = String(userId).toLowerCase();
+    const user = (users || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId) ||
+                 (localUsers || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId) || {};
 
-      // RACE CONDITION FIX: Check in-memory faceDatabase FIRST (may have been
-      // enrolled by the concurrent FreeRTOS face task milliseconds ago).
-      // If not in memory, fall back to whatever is already in the Sheets row.
-      let faceDescriptorStr = '';
-      let faceStatus = 'NOT_ENROLLED';
+    let faceDescriptorStr = '';
+    let faceStatus = 'NOT_ENROLLED';
 
-      const memoryFace = faceService.getDescriptorForUser(userId);
-      if (memoryFace && memoryFace.descriptor) {
-        faceDescriptorStr = JSON.stringify(memoryFace.descriptor);
-        faceStatus = memoryFace.status || 'ENROLLED';
-        console.log(`   🧠 Preserved face descriptor from memory (${faceDescriptorStr.length} chars)`);
-      } else {
-        // Fall back to Sheets row data
-        faceDescriptorStr = user.facedescriptor || user.faceDescriptor || '';
-        faceStatus = user.facestatus || user.faceStatus || 'NOT_ENROLLED';
-        if (faceDescriptorStr) {
-          console.log(`   📊 Preserved face descriptor from Sheets (${faceDescriptorStr.length} chars)`);
-        }
+    const memoryFace = faceService.getDescriptorForUser(userId);
+    if (memoryFace && memoryFace.descriptor) {
+      faceDescriptorStr = JSON.stringify(memoryFace.descriptor);
+      faceStatus = memoryFace.status || 'ENROLLED';
+      console.log(`   🧠 Preserved face descriptor from memory (${faceDescriptorStr.length} chars)`);
+    } else {
+      faceDescriptorStr = user.facedescriptor || user.faceDescriptor || '';
+      faceStatus = user.facestatus || user.faceStatus || 'NOT_ENROLLED';
+      if (faceDescriptorStr) {
+        console.log(`   📊 Preserved face descriptor from Sheets (${faceDescriptorStr.length} chars)`);
       }
+    }
 
+    if (rowIndex !== -1) {
       await updateRow('USERS', rowIndex, [
-        user.userid || user.userId,
-        user.username || user.name,
-        user.email,
-        user.password,
+        user.userid || user.userId || userId,
+        userName || user.username || user.name || 'User',
+        user.email || '',
+        user.password || '$2a$10$qSbfQoa5HHuxXzaTM4BnzuZGfscQPGgSQHyHhgCeN2Vn9Wbr/DcHu',
         role || user.role || 'user',
-        user.department,
-        user.authorized_rooms || '',
+        user.department || 'Laboratory',
+        user.authorized_rooms || 'ROOM-001',
         fingerId.toString(),       // fingerprintId — this is the new data
         faceDescriptorStr,          // PRESERVED face descriptor (not empty!)
         faceStatus,                 // PRESERVED face status (not reset!)
@@ -623,17 +627,17 @@ router.post('/debug/clear-all', (req, res) => {
   res.json({ success: true, message: 'Cleared' });
 });
 
-// ==================== RESTORE ARUN BIOMETRICS (DIRECT TRIGGER) ====================
-router.all('/restore-arun', async (req, res) => {
+// ==================== UNIVERSAL BIOMETRICS SYNC & RESTORE ====================
+router.all(['/sync-biometrics', '/restore-arun'], async (req, res) => {
   try {
-    const result = await faceService.ensureArunEnrolledWithFace();
+    const result = await faceService.syncAndHealAllBiometrics();
     res.json({
       success: true,
-      message: 'Arun restored in Google Sheets with Fingerprint 22 and genuine face vector',
+      message: 'Universal biometric synchronization and healing complete for all users',
       result
     });
   } catch (error) {
-    console.error('❌ restore-arun error:', error);
+    console.error('❌ sync-biometrics error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 });

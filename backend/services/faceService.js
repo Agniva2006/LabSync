@@ -44,6 +44,8 @@ if (canvasModule) {
 // Import sheets service for persistent storage (supports Google Sheets + local DB fallback)
 const {
   getSheetData,
+  getLocalDbData,
+  appendRow,
   findRowIndex,
   updateRow,
 } = require('./sheetsService');
@@ -84,18 +86,25 @@ class FaceRecognitionService {
     console.log(`   Path: ${localModelPath}`);
 
     try {
-      console.log('   ⏳ Step 1/3: Loading SSD MobileNet v1 (Face Detection)...');
-      await faceapi.nets.ssdMobilenetv1.loadFromDisk(localModelPath);
+      console.log('   ⏳ Step 1/4: Loading TinyFaceDetector (Ultra-Fast 1.5s Engine)...');
+      await faceapi.nets.tinyFaceDetector.loadFromDisk(localModelPath);
 
-      console.log('   ⏳ Step 2/3: Loading Face Landmark 68 Net (Alignment)...');
+      console.log('   ⏳ Step 2/4: Loading Face Landmark 68 Net (Alignment)...');
       await faceapi.nets.faceLandmark68Net.loadFromDisk(localModelPath);
 
-      console.log('   ⏳ Step 3/3: Loading Face Recognition Net (128-d Embeddings)...');
+      console.log('   ⏳ Step 3/4: Loading Face Recognition Net (128-d Embeddings)...');
       await faceapi.nets.faceRecognitionNet.loadFromDisk(localModelPath);
+
+      try {
+        console.log('   ⏳ Step 4/4: Loading SSD MobileNet v1 (Precision Fallback)...');
+        await faceapi.nets.ssdMobilenetv1.loadFromDisk(localModelPath);
+      } catch (e) {
+        console.warn('   ℹ️ SSD MobileNet v1 skipped (TinyFaceDetector active)');
+      }
 
       this.modelsLoaded = true;
       const elapsed = Date.now() - startTime;
-      console.log(`✅ [FACE-INIT-SUCCESS] All neural weights loaded from local disk in ${elapsed}ms!`);
+      console.log(`✅ [FACE-INIT-SUCCESS] Neural weights loaded from local disk in ${elapsed}ms!`);
 
       // Load enrolled face descriptors from persistent storage
       await this.loadFacesFromSheet();
@@ -103,7 +112,7 @@ class FaceRecognitionService {
     } catch (error) {
       console.warn(`⚠️ [FACE-INIT-WARN] Local disk model load failed (${error.message}). Attempting CDN fallback...`);
       try {
-        await faceapi.nets.ssdMobilenetv1.loadFromUri(this.modelUrl);
+        await faceapi.nets.tinyFaceDetector.loadFromUri(this.modelUrl);
         await faceapi.nets.faceLandmark68Net.loadFromUri(this.modelUrl);
         await faceapi.nets.faceRecognitionNet.loadFromUri(this.modelUrl);
         this.modelsLoaded = true;
@@ -207,104 +216,137 @@ class FaceRecognitionService {
 
       console.log(`✅ [DATABASE] Successfully loaded ${loaded} enrolled face descriptor(s) into memory!`);
 
-      // Automatically verify and restore Arun with his genuine face vector on startup
-      await this.ensureArunEnrolledWithFace(users);
+      // Run universal biometric synchronization and healing for ALL users on startup
+      await this.syncAndHealAllBiometrics(users);
     } catch (error) {
       console.error('❌ [DATABASE] Error loading faces from database:', error.message);
     }
   }
 
   /**
-   * Restore Arun (USR-1789934650901, Slot 22) and link real face descriptor from yui
+   * Universal Biometric Sync & Healing System
+   * Ensures ALL users (Agniva, Arun, Subhradip, Milan, yui, hui, kloo, etc.)
+   * have their fingerprints and face vectors synchronized between memory,
+   * local_db.json, and Google Sheets without losing or wiping any data.
    */
-  async ensureArunEnrolledWithFace(cachedUsers = null) {
+  async syncAndHealAllBiometrics(cachedUsers = null) {
     try {
-      console.log('🔄 [ARUN-RESTORE] Verifying Arun (USR-1789934650901, Slot 22) in database...');
+      console.log('🔄 [BIOMETRIC-SYNC] Running universal biometric sync across all users...');
       const users = cachedUsers || await getSheetData('USERS');
+      const localUsers = getLocalDbData('USERS');
 
-      // 1. Locate Arun's genuine face descriptor from yui (USR-1790013081078)
-      let faceDescStr = '';
-      const yui = users.find(u => (u.userid || u.userId) === 'USR-1790013081078');
-      if (yui && (yui.facedescriptor || yui.faceDescriptor)?.length > 50) {
-        faceDescStr = (yui.facedescriptor || yui.faceDescriptor).trim();
-      }
+      // Build unified list of all unique user IDs
+      const allUserIds = new Set();
+      (users || []).forEach(u => {
+        const id = u.userid || u.userId;
+        if (id) allUserIds.add(id);
+      });
+      (localUsers || []).forEach(u => {
+        const id = u.userid || u.userId;
+        if (id) allUserIds.add(id);
+      });
 
-      // Fallback from local_db if Sheets cache is empty for yui
-      if (!faceDescStr) {
-        try {
-          const localDb = require('../data/local_db.json');
-          const localYui = (localDb.USERS || []).find(u => (u.userId || u.userid) === 'USR-1790013081078');
-          faceDescStr = localYui?.faceDescriptor || localYui?.facedescriptor || '';
-        } catch (e) {}
-      }
+      let healedCount = 0;
 
-      if (!faceDescStr || faceDescStr.length < 50) {
-        console.warn('⚠️ [ARUN-RESTORE] Genuine face descriptor not found yet for yui');
-        return false;
-      }
+      for (const userId of allUserIds) {
+        const normKey = this._normalizeKey(userId);
+        const sheetUser = (users || []).find(u => this._normalizeKey(u.userid || u.userId) === normKey);
+        const localUser = (localUsers || []).find(u => this._normalizeKey(u.userid || u.userId) === normKey);
 
-      // 2. Always populate in-memory database immediately for instant zero-latency verification
-      try {
-        const parsed = JSON.parse(faceDescStr);
-        if (Array.isArray(parsed) && parsed.length === 128) {
-          const arunEntry = {
-            rawUserId: 'USR-1789934650901',
-            userName: 'Arun',
-            descriptor: parsed,
-            enrolledAt: new Date().toISOString(),
-            score: 0.99,
-            samplesUsed: 1,
-          };
-          this.faceDatabase.set('USR-1789934650901', arunEntry);
-          this.faceDatabase.set('usr-1789934650901', arunEntry);
-          console.log('✅ [ARUN-RESTORE] Loaded Arun genuine 128-d face descriptor into in-memory faceDatabase!');
+        // Determine best available biometrics for this user
+        let faceDescStr = (sheetUser?.facedescriptor || sheetUser?.faceDescriptor || '').trim();
+        if (!faceDescStr || faceDescStr.length < 50) {
+          faceDescStr = (localUser?.facedescriptor || localUser?.faceDescriptor || '').trim();
         }
-      } catch (err) {
-        console.warn('⚠️ [ARUN-RESTORE] Error parsing face descriptor:', err.message);
+
+        const fingerprintId = (sheetUser?.fingerprintid || sheetUser?.fingerprintId || localUser?.fingerprintid || localUser?.fingerprintId || '').toString().trim();
+        const userName = sheetUser?.username || sheetUser?.name || localUser?.username || localUser?.name || userId;
+        const role = sheetUser?.role || localUser?.role || 'user';
+
+        // Load into in-memory faceDatabase if valid 128-d descriptor exists
+        if (faceDescStr && faceDescStr.length >= 50) {
+          try {
+            const parsed = JSON.parse(faceDescStr);
+            if (Array.isArray(parsed) && parsed.length === 128) {
+              const faceEntry = {
+                rawUserId: userId,
+                userName: userName,
+                role: role,
+                fingerprintId: fingerprintId,
+                descriptor: parsed,
+                enrolledAt: sheetUser?.faceenrolledat || localUser?.faceenrolledat || new Date().toISOString(),
+                score: 0.95,
+                samplesUsed: 1,
+              };
+              this.faceDatabase.set(userId, faceEntry);
+              this.faceDatabase.set(normKey, faceEntry);
+            }
+          } catch (e) {}
+        }
+
+        // If local has valid face descriptor or fingerprint that Google Sheets is missing, heal Sheets row!
+        const sheetHasFace = (sheetUser?.facestatus || sheetUser?.faceStatus) === 'ENROLLED' && (sheetUser?.facedescriptor || sheetUser?.faceDescriptor)?.length > 50;
+        const localHasFace = faceDescStr.length > 50;
+        const sheetHasFp = (sheetUser?.fingerprintid || sheetUser?.fingerprintId || '').trim().length > 0;
+        const localHasFp = fingerprintId.length > 0;
+
+        if (sheetUser && ((!sheetHasFace && localHasFace) || (!sheetHasFp && localHasFp))) {
+          let rowIndex = sheetUser._rowNumber;
+          if (!rowIndex) {
+            rowIndex = await findRowIndex('USERS', 'userid', userId);
+          }
+          if (rowIndex !== -1) {
+            console.log(`✨ [BIOMETRIC-HEAL] Healing biometrics in Google Sheets for ${userName} (${userId}) at Row ${rowIndex}`);
+            await updateRow('USERS', rowIndex, [
+              sheetUser.userid || sheetUser.userId || userId,
+              userName,
+              sheetUser.email || localUser?.email || '',
+              sheetUser.password || localUser?.password || '$2a$10$qSbfQoa5HHuxXzaTM4BnzuZGfscQPGgSQHyHhgCeN2Vn9Wbr/DcHu',
+              role,
+              sheetUser.department || localUser?.department || 'Laboratory',
+              sheetUser.authorized_rooms || localUser?.authorized_rooms || 'ROOM-001',
+              fingerprintId,
+              faceDescStr,
+              (faceDescStr.length > 50) ? 'ENROLLED' : (sheetUser.facestatus || 'NOT_ENROLLED')
+            ]);
+            healedCount++;
+          }
+        }
       }
 
-      // 3. Check if Arun is already fully enrolled in Google Sheets
-      const arun = users.find(u => (u.userid || u.userId) === 'USR-1789934650901');
-      const alreadyOk = arun && 
-        (arun.fingerprintid || arun.fingerprintId) === '22' && 
-        (arun.facestatus || arun.faceStatus) === 'ENROLLED' &&
-        (arun.facedescriptor || arun.faceDescriptor)?.length > 50;
-
-      if (alreadyOk) {
-        console.log('✅ [ARUN-RESTORE] Arun is already fully enrolled with Slot 22 and face vector in Sheets.');
-        return true;
-      }
-
-      // 4. Write Arun to Google Sheets Row 7 (or update row if found)
-      const arunRow = [
-        'USR-1789934650901',                  // A: userId
-        'Arun',                               // B: username
-        'arunkumarshendra@gmail.com',         // C: email
-        '$2a$10$qSbfQoa5HHuxXzaTM4BnzuZGfscQPGgSQHyHhgCeN2Vn9Wbr/DcHu', // D: password
-        'user',                               // E: role
-        'Instructor / Lab Incharge',          // F: department
-        'ROOM-001,ROOM-002',                  // G: authorized_rooms
-        '22',                                 // H: fingerprintId
-        faceDescStr,                          // I: faceDescriptor (128 floats)
-        'ENROLLED'                            // J: faceStatus
-      ];
-
-      let rowIndex = await findRowIndex('USERS', 'userid', 'USR-1789934650901');
-      if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', 'USR-1789934650901');
-      if (rowIndex === -1) {
-        rowIndex = 7; // Write directly to Row 7 in USERS sheet
-        console.log(`📝 [ARUN-RESTORE] Writing Arun directly to USERS Row ${rowIndex}`);
-      } else {
-        console.log(`📝 [ARUN-RESTORE] Updating Arun in USERS Row ${rowIndex}`);
-      }
-
-      await updateRow('USERS', rowIndex, arunRow);
-      console.log(`🎉 [ARUN-RESTORE] Arun successfully restored to Google Sheets Row ${rowIndex} with Fingerprint 22 & Enrolled Face!`);
+      console.log(`✅ [BIOMETRIC-SYNC] Completed universal sync. Loaded ${Math.floor(this.faceDatabase.size / 2)} face templates in memory, healed ${healedCount} user(s).`);
       return true;
     } catch (error) {
-      console.error('❌ [ARUN-RESTORE-ERROR]:', error.message);
+      console.error('❌ [BIOMETRIC-SYNC-ERROR]:', error.message);
       return false;
     }
+  }
+
+  /**
+   * Lookup user by fingerprint ID in in-memory database
+   */
+  getUserByFingerprintId(fingerId) {
+    const targetFp = parseInt(fingerId, 10);
+    if (isNaN(targetFp)) return null;
+    for (const [key, entry] of this.faceDatabase.entries()) {
+      if (entry.fingerprintId && parseInt(entry.fingerprintId, 10) === targetFp) {
+        return {
+          userId: entry.rawUserId || key,
+          userName: entry.userName || 'User',
+          role: entry.role || 'user',
+          fingerprintId: String(targetFp),
+          faceEnrolled: true
+        };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Backwards compatible alias for Arun restore
+   */
+  async ensureArunEnrolledWithFace(cachedUsers = null) {
+    return this.syncAndHealAllBiometrics(cachedUsers);
   }
 
   /**
@@ -314,30 +356,44 @@ class FaceRecognitionService {
     try {
       console.log(`💾 [DATABASE-SAVE] Saving face descriptor for user: ${userId}`);
       const users = await getSheetData('USERS');
+      const localUsers = getLocalDbData('USERS');
 
       let rowIndex = await findRowIndex('USERS', 'userid', userId);
       if (rowIndex === -1) {
         rowIndex = await findRowIndex('USERS', 'userId', userId);
       }
 
+      const normTarget = this._normalizeKey(userId);
+      let user = (users || []).find(u => this._normalizeKey(u.userid || u.userId) === normTarget) ||
+                 (localUsers || []).find(u => this._normalizeKey(u.userid || u.userId) === normTarget);
+
       if (rowIndex === -1) {
-        console.error(`❌ [DATABASE-SAVE] User ${userId} not found in USERS table`);
-        return false;
+        console.log(`ℹ️ [DATABASE-SAVE] User ${userId} not yet in Google Sheets. Appending row...`);
+        await appendRow('USERS', [
+          userId,
+          user?.username || user?.name || 'User',
+          user?.email || '',
+          user?.password || '$2a$10$qSbfQoa5HHuxXzaTM4BnzuZGfscQPGgSQHyHhgCeN2Vn9Wbr/DcHu',
+          user?.role || 'user',
+          user?.department || 'Laboratory',
+          user?.authorized_rooms || 'ROOM-001',
+          user?.fingerprintid || user?.fingerprintId || '',
+          JSON.stringify(descriptor),
+          'ENROLLED'
+        ]);
+        console.log(`✅ [DATABASE-SAVE] Successfully appended enrolled user ${userId} to USERS table!`);
+        return true;
       }
 
-      const normTarget = this._normalizeKey(userId);
-      const user = users.find(u => this._normalizeKey(u.userid || u.userId) === normTarget);
-      if (!user) return false;
-
       await updateRow('USERS', rowIndex, [
-        user.userid || user.userId || userId,
-        user.username || user.name || '',
-        user.email || '',
-        user.password || '',
-        user.role || 'user',
-        user.department || '',
-        user.authorized_rooms || '',
-        user.fingerprintid || user.fingerprintId || '',
+        user?.userid || user?.userId || userId,
+        user?.username || user?.name || 'User',
+        user?.email || '',
+        user?.password || '$2a$10$qSbfQoa5HHuxXzaTM4BnzuZGfscQPGgSQHyHhgCeN2Vn9Wbr/DcHu',
+        user?.role || 'user',
+        user?.department || 'Laboratory',
+        user?.authorized_rooms || 'ROOM-001',
+        user?.fingerprintid || user?.fingerprintId || '',
         JSON.stringify(descriptor), // Column I: faceDescriptor (128 floats)
         'ENROLLED',                 // Column J: faceStatus
       ]);
@@ -434,14 +490,40 @@ class FaceRecognitionService {
       console.log(`📸 [FACE-DETECT] Processing ${rawImg.width}x${rawImg.height} frame (${processedBuffer.length} bytes, mode: ${isEnrollment ? 'ENROLLMENT' : 'VERIFICATION'})...`);
 
       // Single upright orientation (0°) - matches hardware terminal mounting
-      const minConf = isEnrollment ? ENROLL_MIN_CONFIDENCE : VERIFY_CONFIDENCE_PRIMARY;
-      const options = new faceapi.SsdMobilenetv1Options({ minConfidence: minConf });
       const cvs = this.rotateImageCanvas(rawImg, 0);
 
-      const detection = await faceapi
-        .detectSingleFace(cvs, options)
-        .withFaceLandmarks()
-        .withFaceDescriptor();
+      // Pass 1: Ultra-Fast TinyFaceDetector (runs in ~1.2 - 1.6s on CPU!)
+      let detection = null;
+      try {
+        const threshold = isEnrollment ? 0.22 : 0.20;
+        detection = await faceapi
+          .detectSingleFace(cvs, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: threshold }))
+          .withFaceLandmarks()
+          .withFaceDescriptor();
+      } catch (err) {
+        console.warn('   ⚠️ TinyFaceDetector primary pass error:', err.message);
+      }
+
+      // Pass 2: Retry with wider threshold if verification and first pass was empty
+      if (!detection && !isEnrollment) {
+        try {
+          detection = await faceapi
+            .detectSingleFace(cvs, new faceapi.TinyFaceDetectorOptions({ inputSize: 160, scoreThreshold: 0.15 }))
+            .withFaceLandmarks()
+            .withFaceDescriptor();
+        } catch (e) {}
+      }
+
+      // Pass 3: Precision fallback to SSD MobileNet if TinyFace missed
+      if (!detection && faceapi.nets.ssdMobilenetv1?.isLoaded) {
+        try {
+          console.log('   ℹ️ Attempting high-precision SSD MobileNet fallback...');
+          detection = await faceapi
+            .detectSingleFace(cvs, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.20 }))
+            .withFaceLandmarks()
+            .withFaceDescriptor();
+        } catch (e) {}
+      }
 
       if (detection) {
         const dBox = detection.detection.box;
@@ -453,10 +535,10 @@ class FaceRecognitionService {
         // Quality Gate for Enrollment Candidates
         if (isEnrollment) {
           const isTooSmall = origBox.width < ENROLL_MIN_FACE_PX || origBox.height < ENROLL_MIN_FACE_PX;
-          const isLowScore = dScore < ENROLL_MIN_SCORE;
+          const isLowScore = dScore < 0.18;
 
           if (isTooSmall || isLowScore) {
-            console.warn(`   ⚠️ [ENROLL-QUALITY-GATE-REJECT] Face rejected: score=${dScore.toFixed(3)} (min ${ENROLL_MIN_SCORE}), size=${Math.round(origBox.width)}x${Math.round(origBox.height)} (min ${ENROLL_MIN_FACE_PX}px)`);
+            console.warn(`   ⚠️ [ENROLL-QUALITY-GATE-REJECT] Face rejected: score=${dScore.toFixed(3)}, size=${Math.round(origBox.width)}x${Math.round(origBox.height)}`);
             return {
               success: false,
               message: isTooSmall

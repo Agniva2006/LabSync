@@ -234,7 +234,9 @@ async function getSheetData(sheetName) {
       for (let i = 1; i < rows.length; i++) {
         const row = rows[i];
         if (!row || row.every(cell => !cell || cell.trim() === '')) continue;
-        const obj = {};
+        const obj = {
+          _rowNumber: i + 1 // Exact physical Google Sheet Row Number (1-indexed, header is row 1)
+        };
         headers.forEach((header, index) => {
           const key = header.toLowerCase();
           obj[key] = (row[index] || '').toString().trim();
@@ -247,8 +249,27 @@ async function getSheetData(sheetName) {
       sheetDataCache.set(cacheKey, { timestamp: Date.now(), data });
       console.log(`📊 [DATABASE-READ] (Sheets) Loaded ${data.length} row(s) from "${sheetName}" (${Date.now() - startTime}ms)`);
       
-      // Mirror to local DB for backup
-      localDb[cacheKey] = data;
+      // Mirror to local DB for backup — cleanly merge to preserve any local biometrics
+      const prevLocal = localDb[cacheKey] || [];
+      const merged = data.map(sheetItem => {
+        const id = (sheetItem.userid || sheetItem.userId || sheetItem.id || '').toLowerCase();
+        const localMatch = prevLocal.find(l => (l.userid || l.userId || l.id || '').toLowerCase() === id);
+        if (!localMatch) return sheetItem;
+        return {
+          ...sheetItem,
+          // Preserve local fingerprint if sheets is empty
+          fingerprintid: sheetItem.fingerprintid || localMatch.fingerprintid || localMatch.fingerprintId || '',
+          fingerprintId: sheetItem.fingerprintId || localMatch.fingerprintId || localMatch.fingerprintid || '',
+          // Preserve local faceDescriptor if sheets is empty
+          facedescriptor: sheetItem.facedescriptor || localMatch.facedescriptor || localMatch.faceDescriptor || '',
+          faceDescriptor: sheetItem.faceDescriptor || localMatch.faceDescriptor || localMatch.facedescriptor || '',
+          // Preserve local faceStatus if sheets is empty or NOT_ENROLLED but local has ENROLLED
+          facestatus: (sheetItem.facestatus && sheetItem.facestatus !== 'NOT_ENROLLED') ? sheetItem.facestatus : (localMatch.facestatus || localMatch.faceStatus || sheetItem.facestatus || 'NOT_ENROLLED'),
+          faceStatus: (sheetItem.faceStatus && sheetItem.faceStatus !== 'NOT_ENROLLED') ? sheetItem.faceStatus : (localMatch.faceStatus || localMatch.facestatus || sheetItem.faceStatus || 'NOT_ENROLLED'),
+        };
+      });
+
+      localDb[cacheKey] = merged;
       saveLocalDb();
       return data;
     } catch (sheetErr) {
@@ -338,9 +359,8 @@ async function updateRow(sheetName, rowIndex, rowData) {
   sheetDataCache.delete(cacheKey);
 
   // Update local DB
-  const arrayIndex = rowIndex - 2;
   const headers = SHEET_HEADERS[cacheKey] || [];
-  const rowObj = {};
+  const rowObj = { _rowNumber: rowIndex };
   headers.forEach((h, idx) => {
     const val = rowData[idx] !== undefined ? String(rowData[idx]) : '';
     rowObj[h.toLowerCase()] = val;
@@ -348,10 +368,21 @@ async function updateRow(sheetName, rowIndex, rowData) {
   });
 
   if (!localDb[cacheKey]) localDb[cacheKey] = [];
-  if (arrayIndex >= 0 && arrayIndex < localDb[cacheKey].length) {
-    localDb[cacheKey][arrayIndex] = { ...localDb[cacheKey][arrayIndex], ...rowObj };
+  
+  // Find matching row in localDb by ID or by _rowNumber
+  const primaryKey = headers[0] ? headers[0].toLowerCase() : 'id';
+  const targetId = String(rowObj[primaryKey] || '').toLowerCase();
+  
+  const existingIdx = localDb[cacheKey].findIndex(item => {
+    if (targetId && String(item[primaryKey] || item[headers[0]] || '').toLowerCase() === targetId) return true;
+    if (item._rowNumber && item._rowNumber === rowIndex) return true;
+    return false;
+  });
+
+  if (existingIdx !== -1) {
+    localDb[cacheKey][existingIdx] = { ...localDb[cacheKey][existingIdx], ...rowObj };
   } else {
-    localDb[cacheKey][arrayIndex] = rowObj;
+    localDb[cacheKey].push(rowObj);
   }
   saveLocalDb();
 
@@ -387,14 +418,14 @@ async function findRowIndex(sheetName, columnName, value) {
     const normSearch = String(value || '').trim().toLowerCase();
     const colLower = String(columnName).trim().toLowerCase();
 
-    const index = data.findIndex(row => {
+    const matchedRow = data.find(row => {
       const cellVal = String(row[colLower] || row[columnName] || '').trim().toLowerCase();
       return cellVal === normSearch;
     });
 
-    if (index === -1) return -1;
-    // Row 1 is headers, index 0 is row 2
-    return index + 2;
+    if (!matchedRow) return -1;
+    // Always use true Google Sheets row number attached during read
+    return matchedRow._rowNumber || (data.indexOf(matchedRow) + 2);
   } catch (err) {
     console.error(`❌ [DATABASE-FIND] Error finding row in "${sheetName}":`, err.message);
     return -1;
@@ -539,8 +570,14 @@ async function logAccessEvent({ action, authMethod, status, userId, roomId, deta
   }
 }
 
+function getLocalDbData(sheetName) {
+  const cacheKey = sheetName.toUpperCase();
+  return localDb[cacheKey] || [];
+}
+
 module.exports = {
   getSheetData,
+  getLocalDbData,
   appendRow,
   appendRows,
   updateRow,
