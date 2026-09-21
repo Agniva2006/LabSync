@@ -71,8 +71,8 @@ router.get('/pending-face-auth/:roomId', (req, res) => {
   const { roomId } = req.params;
   const pending = pendingFaceAuth.get(roomId);
 
-  // Expire after 40 seconds (matches ESP32's 25s face window + 15s grace)
-  if (pending && Date.now() - pending.timestamp > 40000) {
+  // Expire after 50 seconds (matches ESP32's 35s face window + 15s grace)
+  if (pending && Date.now() - pending.timestamp > 50000) {
     console.log(`⏰ Face auth timeout for room ${roomId}`);
     pendingFaceAuth.delete(roomId);
 

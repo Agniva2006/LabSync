@@ -128,7 +128,7 @@ router.post('/enroll-hardware', upload.single('faceImage'), handleMulterError, a
       box: result.box || null,
       confidence: result.confidence || 0,
       samplesAccepted: result.samplesAccepted || 0,
-      samplesNeeded: result.samplesNeeded || 3,
+      samplesNeeded: result.samplesNeeded || 1,
       finalized: result.finalized || false,
     });
 

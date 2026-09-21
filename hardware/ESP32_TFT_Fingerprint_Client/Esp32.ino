@@ -97,9 +97,9 @@ constexpr unsigned long RELAY_OPEN_MS = 5000;
 // TIMING
 // ============================================================
 
-constexpr uint32_t LIVE_VIEW_TIME_MS = 25000;
+constexpr uint32_t LIVE_VIEW_TIME_MS = 35000;
 constexpr uint32_t FACE_REQUEST_INTERVAL_MS = 900;
-constexpr uint32_t FACE_UPLOAD_TIMEOUT_MS = 25000;
+constexpr uint32_t FACE_UPLOAD_TIMEOUT_MS = 30000;
 constexpr uint32_t COMMAND_POLL_INTERVAL_MS = 3000;
 constexpr uint32_t HEARTBEAT_INTERVAL_MS = 30000;
 constexpr uint32_t FP_RETRY_INTERVAL_MS = 5000;
@@ -115,7 +115,7 @@ constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 5000;
 constexpr size_t JPEG_BUFFER_PRIMARY_BYTES = 45000;
 constexpr size_t JPEG_BUFFER_FALLBACK_1_BYTES = 38000;
 constexpr size_t JPEG_BUFFER_FALLBACK_2_BYTES = 32000;
-constexpr size_t MIN_FACE_JPEG_BYTES = 5000;
+constexpr size_t MIN_FACE_JPEG_BYTES = 1500;
 
 // ============================================================
 // TFT LAYOUT
@@ -1723,9 +1723,14 @@ bool postMultipartStreaming( const String &path, const String &part1, uint8_t *j
     client.setHandshakeTimeout(15);
     client.setTimeout(FACE_UPLOAD_TIMEOUT_MS);
 
+    Serial.printf("[HTTPS] Connecting to %s:%d...\n", host.c_str(), port);
+
     if (!client.connect( host.c_str(), port)) {
+      Serial.printf("[HTTPS] Connection to %s failed!\n", host.c_str());
       return false;
     }
+
+    Serial.printf("[HTTPS] Uploading %s (%u bytes)...\n", path.c_str(), (unsigned int)totalLength);
 
     client.printf( "POST %s HTTP/1.1\r\n", path.c_str() );
 
@@ -1780,6 +1785,8 @@ bool postMultipartStreaming( const String &path, const String &part1, uint8_t *j
     }
 
     client.stop();
+
+    Serial.printf("[HTTPS] Response (%d bytes): %s\n", response.length(), response.substring(0, 100).c_str());
 
   }
   else {
@@ -1950,7 +1957,10 @@ bool postFaceEnroll( const String &userId, uint8_t *jpegBuf, size_t jpegLen, Fac
 
   bool ok = postMultipartStreaming( "/api/face/enroll-hardware", part1, jpegBuf, jpegLen, part3, response );
 
-  if (!ok && response.indexOf("\"success\"") < 0) return false;
+  if (!ok && response.indexOf("\"success\"") < 0) {
+    Serial.printf("[FACE-ENROLL] Network/HTTP error. Response len: %d\n", response.length());
+    return false;
+  }
 
   int jsonStart = response.indexOf('{');
   int jsonEnd = response.lastIndexOf('}');
@@ -1959,10 +1969,16 @@ bool postFaceEnroll( const String &userId, uint8_t *jpegBuf, size_t jpegLen, Fac
   DynamicJsonDocument doc(1024);
 
   if ( deserializeJson( doc, jsonBody ) != DeserializationError::Ok) {
+    Serial.printf("[FACE-ENROLL] JSON parse error: %s\n", jsonBody.substring(0, 100).c_str());
     return false;
   }
 
-  bool success = doc["success"] | false;
+  bool success = (doc["success"] | false) || (doc["finalized"] | false);
+  const char* serverMsg = doc["message"] | "";
+  Serial.printf("[FACE-ENROLL] Server Result: success=%s, finalized=%s, msg=\"%s\"\n", 
+    (doc["success"] | false) ? "true" : "false",
+    (doc["finalized"] | false) ? "true" : "false",
+    serverMsg);
 
   if (outBox != nullptr) {
     if (doc.containsKey("box") && !doc["box"].isNull()) {
@@ -2150,7 +2166,7 @@ bool startFaceRequestAsync(
       xTaskCreate(
           faceRequestWorker,
           "faceHttp",
-          8192,
+          16384,
           nullptr,
           1,
           &faceRequestTaskHandle);
