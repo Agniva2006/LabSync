@@ -1,13 +1,47 @@
 const faceapi = require('@vladmandic/face-api');
-const canvas = require('canvas');
-const { Canvas, Image, ImageData, createCanvas, loadImage } = canvas;
 const path = require('path');
 const sharp = require('sharp');
 
-// Monkey patch faceapi to use canvas in Node
-faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
+// ==================== CANVAS INITIALIZATION FOR NODE ====================
 
-// Import sheets service for persistent storage
+let canvasModule;
+try {
+  canvasModule = require('@napi-rs/canvas');
+  console.log('🎨 [CANVAS-INIT] Using high-performance @napi-rs/canvas native binding');
+} catch (e1) {
+  try {
+    canvasModule = require('canvas');
+    console.log('🎨 [CANVAS-INIT] Using node-canvas binding');
+  } catch (e2) {
+    console.error('❌ [CANVAS-INIT] Neither @napi-rs/canvas nor canvas could be loaded:', e1.message);
+  }
+}
+
+const { Image, ImageData, loadImage } = canvasModule || {};
+
+// Safe wrapper around Canvas to ensure width/height are never undefined when called by face-api.js
+class SafeCanvas extends (canvasModule?.Canvas || Object) {
+  constructor(width = 0, height = 0) {
+    super(Math.max(0, width || 0), Math.max(0, height || 0));
+  }
+}
+
+function safeCreateCanvas(width = 0, height = 0) {
+  if (!canvasModule?.createCanvas) throw new Error('Canvas module not available');
+  return canvasModule.createCanvas(Math.max(0, width || 0), Math.max(0, height || 0));
+}
+
+// Monkey patch faceapi environment to use our safe canvas in Node
+if (canvasModule) {
+  faceapi.env.monkeyPatch({
+    Canvas: SafeCanvas,
+    Image,
+    ImageData,
+    createCanvas: safeCreateCanvas,
+  });
+}
+
+// Import sheets service for persistent storage (supports Google Sheets + local DB fallback)
 const {
   getSheetData,
   findRowIndex,
@@ -19,60 +53,65 @@ const { faceEnrollmentSessions } = require('./sharedState');
 
 // ==================== CONSTANTS ====================
 
-const ENROLL_MIN_CONFIDENCE = 0.40;  // SSD detection threshold for enrollment candidates
-const ENROLL_MIN_SCORE = 0.45;       // Detection score threshold for enrollment quality gate
-const ENROLL_MIN_FACE_PX = 65;       // Minimum face box dimension (px) for enrollment
-const VERIFY_CONFIDENCE_PRIMARY = 0.25; // Primary detection threshold for verification
-const VERIFY_CONFIDENCE_FALLBACK = 0.15; // Fallback for low-light verification
-const VERIFY_DISTANCE_THRESHOLD = 0.65; // Euclidean distance threshold for match
-const SAMPLES_NEEDED_FOR_ENROLLMENT = 3; // Number of good samples before averaging and saving
-const HIGH_QUALITY_SINGLE_SCORE = 0.85;  // If a single sample scores this high, enroll immediately
+const ENROLL_MIN_CONFIDENCE = 0.30;     // SSD detection threshold for enrollment candidates
+const ENROLL_MIN_SCORE = 0.35;          // Detection score threshold for enrollment quality gate
+const ENROLL_MIN_FACE_PX = 45;          // Minimum face box dimension (px) for enrollment
+const VERIFY_CONFIDENCE_PRIMARY = 0.20; // Primary detection threshold for verification
+const VERIFY_CONFIDENCE_FALLBACK = 0.12;// Fallback for low-light verification
+const VERIFY_DISTANCE_THRESHOLD = 0.65; // Euclidean distance threshold for match (<= 0.65 is standard for SSD MobileNet)
+const SAMPLES_NEEDED_FOR_ENROLLMENT = 3;// Number of good samples before averaging and saving
+const HIGH_QUALITY_SINGLE_SCORE = 0.80; // If a single sample scores >= 0.80, can enroll immediately
 
 class FaceRecognitionService {
   constructor() {
     this.modelsLoaded = false;
-    this.faceDatabase = new Map(); // userId → { descriptor, enrolledAt, score }
+    this.faceDatabase = new Map(); // userId → { rawUserId, descriptor, enrolledAt, score, samplesUsed }
     this.modelUrl = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
-    console.log('🔧 FaceRecognitionService initialized (Sheets-backed persistence + sharp preprocessing)');
+    console.log('🔧 [FACE-SERVICE] FaceRecognitionService initialized (dual-mode persistence + sharp preprocessing)');
   }
 
   // ==================== INITIALIZATION ====================
 
   async initialize() {
     if (this.modelsLoaded) {
-      console.log('✅ Models already loaded');
       return;
     }
 
+    const startTime = Date.now();
     const localModelPath = path.resolve(__dirname, '../models');
-    console.log(`📦 Loading face recognition models from local disk (${localModelPath})...`);
+    console.log(`\n========================================`);
+    console.log(`📦 [FACE-INIT-START] Loading face recognition models...`);
+    console.log(`   Path: ${localModelPath}`);
 
     try {
-      console.log('⏳ Loading SSD MobileNet v1...');
+      console.log('   ⏳ Step 1/3: Loading SSD MobileNet v1 (Face Detection)...');
       await faceapi.nets.ssdMobilenetv1.loadFromDisk(localModelPath);
 
-      console.log('⏳ Loading Face Landmark 68...');
+      console.log('   ⏳ Step 2/3: Loading Face Landmark 68 Net (Alignment)...');
       await faceapi.nets.faceLandmark68Net.loadFromDisk(localModelPath);
 
-      console.log('⏳ Loading Face Recognition Net...');
+      console.log('   ⏳ Step 3/3: Loading Face Recognition Net (128-d Embeddings)...');
       await faceapi.nets.faceRecognitionNet.loadFromDisk(localModelPath);
 
       this.modelsLoaded = true;
-      console.log('✅ All face recognition models loaded from local disk instantly!');
+      const elapsed = Date.now() - startTime;
+      console.log(`✅ [FACE-INIT-SUCCESS] All neural weights loaded from local disk in ${elapsed}ms!`);
 
-      // Load face descriptors from Google Sheets
+      // Load enrolled face descriptors from persistent storage
       await this.loadFacesFromSheet();
+      console.log(`========================================\n`);
     } catch (error) {
-      console.warn('⚠️ Local model load failed, falling back to CDN:', error.message);
+      console.warn(`⚠️ [FACE-INIT-WARN] Local disk model load failed (${error.message}). Attempting CDN fallback...`);
       try {
         await faceapi.nets.ssdMobilenetv1.loadFromUri(this.modelUrl);
         await faceapi.nets.faceLandmark68Net.loadFromUri(this.modelUrl);
         await faceapi.nets.faceRecognitionNet.loadFromUri(this.modelUrl);
         this.modelsLoaded = true;
-        console.log('✅ All face recognition models loaded from CDN');
+        console.log(`✅ [FACE-INIT-SUCCESS] All face recognition models loaded from CDN (${Date.now() - startTime}ms)`);
         await this.loadFacesFromSheet();
+        console.log(`========================================\n`);
       } catch (cdnError) {
-        console.error('❌ Error loading models from CDN:', cdnError.message);
+        console.error('❌ [FACE-INIT-ERROR] Failed to load models from both local disk and CDN:', cdnError.message);
         throw cdnError;
       }
     }
@@ -81,64 +120,57 @@ class FaceRecognitionService {
   // ==================== IMAGE PRE-PROCESSING ====================
 
   /**
-   * Pre-process ESP32-CAM JPEG for optimal face detection.
-   * The OV2640 at 320x240 in low-light/variable-exposure conditions produces
-   * images that benefit from normalization before face-api.js processes them.
-   *
-   * Steps:
-   *   1. Decode JPEG
-   *   2. Normalize brightness/contrast (linear stretch)
-   *   3. Sharpen slightly (ESP32-CAM JPEGs can be soft)
-   *   4. Re-encode as JPEG at quality 95
-   *
-   * @param {Buffer} imageBuffer - Raw JPEG from ESP32-CAM
-   * @returns {Promise<Buffer>} - Normalized JPEG buffer
+   * Pre-process ESP32-CAM / client JPEG for optimal face detection.
+   * Handles low-light, softness, and variable contrast.
    */
   async preprocessImage(imageBuffer) {
+    const startTime = Date.now();
     try {
+      if (!imageBuffer || !Buffer.isBuffer(imageBuffer)) {
+        throw new Error('Invalid image buffer passed to preprocessor');
+      }
+
+      const meta = await sharp(imageBuffer).metadata();
+      const origSize = imageBuffer.length;
+
       const processed = await sharp(imageBuffer)
         .normalise()            // Auto-stretch histogram for consistent brightness/contrast
-        .sharpen({              // Gentle sharpen for OV2640 softness
+        .sharpen({              // Gentle sharpen for OV2640 lens softness
           sigma: 1.0,
           m1: 1.0,
           m2: 0.5,
         })
-        .jpeg({ quality: 95 })  // Re-encode without excessive compression
+        .jpeg({ quality: 95 })  // Re-encode at high quality
         .toBuffer();
 
-      console.log(`   🔧 Preprocessed: ${imageBuffer.length} → ${processed.length} bytes`);
+      const elapsed = Date.now() - startTime;
+      console.log(`   🔧 [PREPROCESS] ${origSize} bytes (${meta.width}x${meta.height} ${meta.format}) → ${processed.length} bytes in ${elapsed}ms`);
       return processed;
     } catch (err) {
-      // If sharp fails (corrupt JPEG, etc.), fall back to original buffer
-      console.warn(`   ⚠️ sharp preprocessing failed (${err.message}), using raw image`);
+      console.warn(`   ⚠️ [PREPROCESS-WARN] sharp preprocessing failed (${err.message}), using raw buffer`);
       return imageBuffer;
     }
   }
 
-  // ==================== SHEETS PERSISTENCE ====================
+  // ==================== SHEETS / LOCAL DB PERSISTENCE ====================
 
-  /**
-   * Helper: Normalize user ID for resilient map key lookup
-   */
   _normalizeKey(id) {
     return String(id || '').trim().toLowerCase();
   }
 
   /**
-   * Load all enrolled face descriptors from USERS Google Sheet
-   * Called once on server start — populates in-memory faceDatabase Map
+   * Load all enrolled face descriptors from Database into memory
    */
   async loadFacesFromSheet() {
     try {
-      console.log('📊 Loading face descriptors from Google Sheets...');
+      console.log('📊 [DATABASE] Loading enrolled face descriptors from USERS table...');
       const users = await getSheetData('USERS');
       let loaded = 0;
 
       for (const user of users) {
-        // Support all casing permutations for userId
         const userId = user.userid || user.userId || user.USERID || user.id || '';
-        // Column I: faceDescriptor (JSON string of 128 floats)
         const descriptorStr = user.facedescriptor || user.faceDescriptor || user.FACEDESCRIPTOR || '';
+        const userName = user.username || user.name || userId;
 
         if (userId && descriptorStr && descriptorStr.trim() !== '') {
           try {
@@ -146,56 +178,55 @@ class FaceRecognitionService {
             if (Array.isArray(parsed) && parsed.length === 128) {
               const faceEntry = {
                 rawUserId: userId,
+                userName: userName,
                 descriptor: parsed,
                 enrolledAt: user.faceenrolledat || user.faceEnrolledAt || new Date().toISOString(),
                 score: parseFloat(user.facescore || user.faceScore || '0.9'),
+                samplesUsed: parseInt(user.facesamplesused || user.faceSamplesUsed || '1', 10),
               };
 
-              // Store both exact ID and normalized lowercase ID
+              // Store under both exact ID and normalized lowercase ID
               this.faceDatabase.set(userId, faceEntry);
               this.faceDatabase.set(this._normalizeKey(userId), faceEntry);
               loaded++;
+              console.log(`   👤 Loaded enrolled face for ${userName} (${userId}) [128-d vector]`);
             } else {
-              console.warn(`⚠️ Invalid descriptor format for ${userId} (length: ${parsed?.length})`);
+              console.warn(`   ⚠️ Invalid descriptor format for ${userId} (length: ${parsed?.length})`);
             }
           } catch (parseErr) {
-            console.warn(`⚠️ Could not parse face descriptor for ${userId}: ${parseErr.message}`);
+            console.warn(`   ⚠️ Could not parse face descriptor for ${userId}: ${parseErr.message}`);
           }
         }
       }
 
-      console.log(`✅ Loaded ${loaded} face descriptor(s) from Google Sheets`);
+      console.log(`✅ [DATABASE] Successfully loaded ${loaded} enrolled face descriptor(s) into memory!`);
     } catch (error) {
-      console.error('❌ Error loading faces from Sheets:', error.message);
+      console.error('❌ [DATABASE] Error loading faces from database:', error.message);
     }
   }
 
   /**
-   * Save a face descriptor to the USERS Google Sheet (column I: faceDescriptor)
-   * Also sets faceStatus = ENROLLED
+   * Save a face descriptor to persistent storage (Column I: faceDescriptor, Column J: faceStatus)
    */
   async saveFaceToSheet(userId, descriptor, score) {
     try {
-      console.log(`💾 Saving face descriptor to Sheets for user: ${userId}`);
+      console.log(`💾 [DATABASE-SAVE] Saving face descriptor for user: ${userId}`);
       const users = await getSheetData('USERS');
 
-      // Case-insensitive row search — try both column header casings
       let rowIndex = await findRowIndex('USERS', 'userid', userId);
       if (rowIndex === -1) {
         rowIndex = await findRowIndex('USERS', 'userId', userId);
       }
 
       if (rowIndex === -1) {
-        console.error(`❌ User ${userId} not found in USERS sheet`);
+        console.error(`❌ [DATABASE-SAVE] User ${userId} not found in USERS table`);
         return false;
       }
 
-      // Find user data
       const normTarget = this._normalizeKey(userId);
       const user = users.find(u => this._normalizeKey(u.userid || u.userId) === normTarget);
       if (!user) return false;
 
-      // Write full row with updated faceDescriptor + faceStatus
       await updateRow('USERS', rowIndex, [
         user.userid || user.userId || userId,
         user.username || user.name || '',
@@ -205,30 +236,26 @@ class FaceRecognitionService {
         user.department || '',
         user.authorized_rooms || '',
         user.fingerprintid || user.fingerprintId || '',
-        JSON.stringify(descriptor),   // Column I: faceDescriptor
-        'ENROLLED',                   // Column J: faceStatus
+        JSON.stringify(descriptor), // Column I: faceDescriptor (128 floats)
+        'ENROLLED',                 // Column J: faceStatus
       ]);
 
-      console.log(`✅ Face descriptor saved to Sheets for ${userId}`);
+      console.log(`✅ [DATABASE-SAVE] Face descriptor persisted for ${userId} (Row ${rowIndex})`);
       return true;
     } catch (error) {
-      console.error(`❌ Error saving face to Sheets for ${userId}:`, error.message);
+      console.error(`❌ [DATABASE-SAVE] Error saving face descriptor for ${userId}:`, error.message);
       return false;
     }
   }
 
   /**
-   * Clear face descriptor from USERS sheet (on delete)
+   * Clear face descriptor from storage (on face deletion)
    */
   async clearFaceFromSheet(userId) {
     try {
       const users = await getSheetData('USERS');
-
       let rowIndex = await findRowIndex('USERS', 'userid', userId);
-      if (rowIndex === -1) {
-        rowIndex = await findRowIndex('USERS', 'userId', userId);
-      }
-
+      if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', userId);
       if (rowIndex === -1) return false;
 
       const normTarget = this._normalizeKey(userId);
@@ -248,19 +275,19 @@ class FaceRecognitionService {
         'NOT_ENROLLED', // Reset faceStatus
       ]);
 
-      console.log(`✅ Face descriptor cleared from Sheets for ${userId}`);
+      console.log(`✅ [DATABASE-DELETE] Face descriptor cleared from storage for ${userId}`);
       return true;
     } catch (error) {
-      console.error(`❌ Error clearing face from Sheets:`, error.message);
+      console.error(`❌ [DATABASE-DELETE] Error clearing face descriptor:`, error.message);
       return false;
     }
   }
 
-  // ==================== FACE DETECTION ====================
+  // ==================== FACE DETECTION & 4-ANGLE ROTATION ====================
 
   rotateImageCanvas(img, angle) {
     if (angle === 0) {
-      const cvs = createCanvas(img.width, img.height);
+      const cvs = safeCreateCanvas(img.width, img.height);
       const ctx = cvs.getContext('2d');
       ctx.drawImage(img, 0, 0);
       return cvs;
@@ -270,7 +297,7 @@ class FaceRecognitionService {
     const width = is90or270 ? img.height : img.width;
     const height = is90or270 ? img.width : img.height;
 
-    const cvs = createCanvas(width, height);
+    const cvs = safeCreateCanvas(width, height);
     const ctx = cvs.getContext('2d');
 
     ctx.translate(width / 2, height / 2);
@@ -280,29 +307,33 @@ class FaceRecognitionService {
     return cvs;
   }
 
+  /**
+   * Detect face in buffer with automatic 4-way rotation matrix (0°, 180°, 90°, 270°)
+   */
   async detectFace(imageBuffer, isEnrollment = false) {
     if (!this.modelsLoaded) {
-      console.log('⚠️ Models not yet loaded — initializing now...');
+      console.log('⚠️ [FACE-DETECT] Models not yet loaded — initializing now...');
       await this.initialize();
     }
 
+    const detectStartTime = Date.now();
+
     try {
       if (!imageBuffer || !Buffer.isBuffer(imageBuffer)) {
-        throw new Error('Invalid image buffer');
+        throw new Error('Invalid image buffer provided for face detection');
       }
 
-      // Pre-process ESP32-CAM image for consistent detection quality
+      // Preprocess image (brightness normalization & gentle sharpen)
       const processedBuffer = await this.preprocessImage(imageBuffer);
-
-      console.log(`📷 Detecting face in ${processedBuffer.length} byte image (mode: ${isEnrollment ? 'ENROLLMENT-QUALITY' : 'VERIFICATION'})...`);
       const rawImg = await loadImage(processedBuffer);
 
-      // Try 4 cardinal orientations: 0°, 180° (upside down), 90°, 270° (sideways)
-      const angles = [0, 180, 90, 270];
+      console.log(`📸 [FACE-DETECT] Processing ${rawImg.width}x${rawImg.height} frame (${processedBuffer.length} bytes, mode: ${isEnrollment ? 'ENROLLMENT' : 'VERIFICATION'})...`);
 
-      // For enrollment: require clean, high-confidence frame.
-      // For verification: standard confidence + fallback for low-light.
-      const confidenceLevels = isEnrollment ? [ENROLL_MIN_CONFIDENCE] : [VERIFY_CONFIDENCE_PRIMARY, VERIFY_CONFIDENCE_FALLBACK];
+      // 4 cardinal orientations
+      const angles = [0, 180, 90, 270];
+      const confidenceLevels = isEnrollment
+        ? [ENROLL_MIN_CONFIDENCE]
+        : [VERIFY_CONFIDENCE_PRIMARY, VERIFY_CONFIDENCE_FALLBACK];
 
       for (const minConf of confidenceLevels) {
         const options = new faceapi.SsdMobilenetv1Options({ minConfidence: minConf });
@@ -316,10 +347,11 @@ class FaceRecognitionService {
             .withFaceDescriptor();
 
           if (detection) {
-            console.log(`   ✅ Face detected at angle ${angle}° (conf: ${minConf}) — score: ${detection.detection.score.toFixed(4)}`);
             const dBox = detection.detection.box;
+            const dScore = detection.detection.score;
             let origBox = { x: dBox.x, y: dBox.y, width: dBox.width, height: dBox.height };
 
+            // Transform bounding box back to original orientation
             if (angle === 180) {
               origBox = {
                 x: rawImg.width - dBox.x - dBox.width,
@@ -343,14 +375,15 @@ class FaceRecognitionService {
               };
             }
 
-            // Quality Gate for Enrollment: Reject blurry, far-away, or low-scoring faces
+            console.log(`   🎯 [FACE-DETECTED] Angle: ${angle}° | Score: ${dScore.toFixed(4)} | Box: [x:${Math.round(origBox.x)}, y:${Math.round(origBox.y)}, w:${Math.round(origBox.width)}, h:${Math.round(origBox.height)}] in ${Date.now() - detectStartTime}ms`);
+
+            // Quality Gate for Enrollment Candidates
             if (isEnrollment) {
-              const dScore = detection.detection.score;
               const isTooSmall = origBox.width < ENROLL_MIN_FACE_PX || origBox.height < ENROLL_MIN_FACE_PX;
               const isLowScore = dScore < ENROLL_MIN_SCORE;
 
               if (isTooSmall || isLowScore) {
-                console.warn(`   ⚠️ Enrollment rejected low quality frame: score=${dScore.toFixed(3)}, size=${Math.round(origBox.width)}x${Math.round(origBox.height)}`);
+                console.warn(`   ⚠️ [ENROLL-QUALITY-GATE-REJECT] Face rejected: score=${dScore.toFixed(3)} (min ${ENROLL_MIN_SCORE}), size=${Math.round(origBox.width)}x${Math.round(origBox.height)} (min ${ENROLL_MIN_FACE_PX}px)`);
                 return {
                   success: false,
                   message: isTooSmall
@@ -368,27 +401,29 @@ class FaceRecognitionService {
 
             return {
               success: true,
-              descriptor: Array.from(detection.descriptor), // 128 floats
+              descriptor: Array.from(detection.descriptor), // 128 float vector
               landmarks: detection.landmarks,
               box: origBox,
-              score: detection.detection.score,
+              score: dScore,
               rotationAngle: angle,
+              timeMs: Date.now() - detectStartTime,
             };
           }
         }
       }
 
+      console.warn(`   ❌ [NO-FACE] No face detected across all 4 angles in ${Date.now() - detectStartTime}ms`);
       return {
         success: false,
-        message: 'No face detected. Ensure face is clearly visible, well-lit, and centered.',
+        message: 'No face detected. Ensure face is clearly visible, well-lit, and facing the camera.',
       };
     } catch (error) {
-      console.error('❌ Face detection error:', error.message);
+      console.error('❌ [FACE-DETECT-ERROR]:', error.message);
       return { success: false, message: `Face detection failed: ${error.message}` };
     }
   }
 
-  // ==================== MULTI-SAMPLE DESCRIPTOR COMPUTATION ====================
+  // ==================== VECTOR OPERATIONS ====================
 
   computeAverageDescriptor(descriptors) {
     if (!descriptors || descriptors.length === 0) return null;
@@ -407,7 +442,7 @@ class FaceRecognitionService {
       avg[i] /= descriptors.length;
     }
 
-    // Normalize to unit length
+    // Normalize vector to unit length
     let norm = 0;
     for (let i = 0; i < len; i++) {
       norm += avg[i] * avg[i];
@@ -422,125 +457,148 @@ class FaceRecognitionService {
     return avg;
   }
 
-  // ==================== FACE ENROLLMENT (MULTI-SAMPLE) ====================
+  euclideanDistance(desc1, desc2) {
+    if (!desc1 || !desc2 || desc1.length !== desc2.length) {
+      throw new Error(`Descriptor length mismatch (${desc1?.length} vs ${desc2?.length})`);
+    }
+    let sum = 0;
+    for (let i = 0; i < desc1.length; i++) {
+      const diff = desc1[i] - desc2[i];
+      sum += diff * diff;
+    }
+    return Math.sqrt(sum);
+  }
 
-  async enrollFaceMultiSample(userId, imageBuffers) {
-    console.log(`\n📝 ENROLLING FACE (MULTI-SAMPLE): ${userId} (${imageBuffers.length} sample(s))`);
+  // ==================== FACE VERIFICATION PIPELINE ====================
+
+  async getFaceEntry(userId) {
+    if (!userId) return null;
+    const normKey = this._normalizeKey(userId);
+
+    let entry = this.faceDatabase.get(userId) || this.faceDatabase.get(normKey);
+
+    // If not in cache, reload from storage
+    if (!entry) {
+      console.log(`ℹ️ [FACE-CACHE] User "${userId}" not in memory cache. Reloading from database...`);
+      await this.loadFacesFromSheet();
+      entry = this.faceDatabase.get(userId) || this.faceDatabase.get(normKey);
+    }
+
+    return entry;
+  }
+
+  /**
+   * Primary Face Verification Method
+   * Compares incoming camera image against stored 128-d master embedding
+   */
+  async verifyFace(userId, imageBuffer, threshold = VERIFY_DISTANCE_THRESHOLD) {
+    const startTime = Date.now();
+    const timestamp = new Date().toISOString();
+
+    console.log(`\n============================================================`);
+    console.log(`🔍 [FACE-VERIFY-START] User ID: ${userId} | Time: ${timestamp}`);
+    console.log(`   Threshold: <= ${threshold} | Frame Buffer: ${imageBuffer?.length || 0} bytes`);
 
     try {
+      // Step 1: Validate payload
       if (!userId || typeof userId !== 'string') {
+        console.warn(`❌ [FACE-VERIFY-STEP 1/5] Invalid userId: "${userId}"`);
         return { success: false, message: 'Invalid user ID' };
       }
-      if (!Array.isArray(imageBuffers) || imageBuffers.length === 0) {
-        return { success: false, message: 'No image buffers provided for enrollment' };
+      if (!imageBuffer || !Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) {
+        console.warn(`❌ [FACE-VERIFY-STEP 1/5] Missing or empty image buffer`);
+        return { success: false, message: 'No face image provided' };
       }
+      console.log(`✅ [FACE-VERIFY-STEP 1/5] Payload validated: ${imageBuffer.length} bytes`);
 
-      const validDescriptors = [];
-      const scores = [];
-      let lastAngle = 0;
-      let lastBox = null;
-
-      for (let i = 0; i < imageBuffers.length; i++) {
-        console.log(`   Processing sample ${i + 1}/${imageBuffers.length}...`);
-        const result = await this.detectFace(imageBuffers[i], true);
-        if (result.box) lastBox = result.box;
-
-        if (result.success) {
-          validDescriptors.push(result.descriptor);
-          scores.push(result.score);
-          lastAngle = result.rotationAngle || 0;
-        } else {
-          console.warn(`   ⚠️ Sample ${i + 1} face detection rejected: ${result.message}`);
-        }
-      }
-
-      if (validDescriptors.length === 0) {
+      // Step 2: Retrieve enrolled face descriptor
+      const storedFace = await this.getFaceEntry(userId);
+      if (!storedFace || !storedFace.descriptor) {
+        console.warn(`❌ [FACE-VERIFY-STEP 2/5] No face enrolled for user "${userId}" in database!`);
+        const availableUsers = this.getEnrolledUsers();
+        console.log(`   ℹ️ Currently enrolled users (${availableUsers.length}):`, availableUsers.join(', ') || 'None');
         return {
           success: false,
-          message: 'No clean face detected. Please ensure face is well-lit, centered, and looking directly at camera.',
-          box: lastBox ? {
-            x: Math.round(lastBox.x),
-            y: Math.round(lastBox.y),
-            w: Math.round(lastBox.w || lastBox.width),
-            h: Math.round(lastBox.h || lastBox.height),
-          } : null,
+          noFaceEnrolled: true,
+          message: `No face enrolled for user ${userId}. Please complete hardware face enrollment first.`,
+        };
+      }
+      console.log(`✅ [FACE-VERIFY-STEP 2/5] Enrolled face descriptor located for "${userId}" (${storedFace.userName || 'User'})`);
+      console.log(`   Enrolled at: ${storedFace.enrolledAt} | Baseline score: ${storedFace.score?.toFixed(3) || 'N/A'}`);
+
+      // Step 3: Face detection & landmark extraction on camera frame
+      console.log(`⏳ [FACE-VERIFY-STEP 3/5] Detecting face in frame across 4 cardinal angles...`);
+      const detectionResult = await this.detectFace(imageBuffer, false);
+
+      if (!detectionResult.success) {
+        console.warn(`⚠️ [FACE-VERIFY-STEP 3/5] Camera frame detection failed: ${detectionResult.message}`);
+        return {
+          success: false,
+          faceDetected: false,
+          message: detectionResult.message,
         };
       }
 
-      // Compute normalized average 128-d descriptor
-      const masterDescriptor = this.computeAverageDescriptor(validDescriptors);
-      const avgScore = scores.reduce((a, b) => a + b, 0) / scores.length;
+      console.log(`✅ [FACE-VERIFY-STEP 3/5] Face detected at ${detectionResult.rotationAngle}° (score: ${detectionResult.score?.toFixed(4)})`);
 
-      // Store in memory Map with both exact and normalized keys
-      const faceData = {
-        rawUserId: userId,
-        descriptor: masterDescriptor,
-        enrolledAt: new Date().toISOString(),
-        score: avgScore,
-        samplesUsed: validDescriptors.length,
-      };
-      this.faceDatabase.set(userId, faceData);
-      this.faceDatabase.set(this._normalizeKey(userId), faceData);
+      // Step 4: Euclidean distance vector calculation
+      console.log(`⏳ [FACE-VERIFY-STEP 4/5] Calculating 128-d Euclidean distance against master template...`);
+      const distance = this.euclideanDistance(storedFace.descriptor, detectionResult.descriptor);
+      const isMatch = distance <= threshold;
 
-      // Persist to Google Sheets
-      const saved = await this.saveFaceToSheet(userId, masterDescriptor, avgScore);
-      if (!saved) {
-        console.warn('⚠️ Face saved in memory but Sheets save failed');
-      }
+      // Confidence & similarity formulas
+      const confidence = Math.max(0, Math.min(1, 1 - (distance / (threshold * 2))));
+      const similarityPercent = Math.max(0, Math.min(100, (1 - (distance / (threshold * 1.5))) * 100)).toFixed(1);
 
-      console.log(`✅ Multi-sample face enrolled for ${userId} using ${validDescriptors.length}/${imageBuffers.length} samples!`);
+      console.log(`📐 [FACE-VERIFY-STEP 4/5] Distance Calculation:`);
+      console.log(`   Euclidean Distance : ${distance.toFixed(4)} (Threshold: <= ${threshold})`);
+      console.log(`   Calculated Match   : ${isMatch ? 'TRUE' : 'FALSE'}`);
+      console.log(`   Similarity Score   : ${similarityPercent}%`);
+      console.log(`   Confidence Score   : ${(confidence * 100).toFixed(1)}%`);
+
+      // Step 5: Decision & Result
+      const totalElapsed = Date.now() - startTime;
+      console.log(`🎯 [FACE-VERIFY-STEP 5/5] Final Access Decision in ${totalElapsed}ms:`);
+      console.log(`   Outcome: ${isMatch ? '✅ MATCH GRANTED' : '❌ MISMATCH DENIED'}`);
+      console.log(`============================================================\n`);
 
       return {
-        success: true,
-        message: `Face enrolled successfully using ${validDescriptors.length} sample(s)`,
-        confidence: avgScore,
-        samplesUsed: validDescriptors.length,
-        rotationAngle: lastAngle,
-        box: lastBox ? {
-          x: Math.round(lastBox.x),
-          y: Math.round(lastBox.y),
-          w: Math.round(lastBox.width),
-          h: Math.round(lastBox.height),
+        success: isMatch,
+        message: isMatch
+          ? `Face verified successfully (${similarityPercent}% similarity)`
+          : `Face does not match enrolled template (${similarityPercent}% similarity, distance: ${distance.toFixed(3)})`,
+        confidence,
+        similarityPercent: parseFloat(similarityPercent),
+        distance,
+        threshold,
+        rotationAngle: detectionResult.rotationAngle,
+        score: detectionResult.score,
+        timeMs: totalElapsed,
+        box: detectionResult.box ? {
+          x: Math.round(detectionResult.box.x),
+          y: Math.round(detectionResult.box.y),
+          w: Math.round(detectionResult.box.width),
+          h: Math.round(detectionResult.box.height),
         } : null,
       };
+
     } catch (error) {
-      console.error('❌ Multi-sample enrollment error:', error.message);
-      return { success: false, message: `Enrollment failed: ${error.message}` };
+      console.error(`❌ [FACE-VERIFY-EXCEPTION]:`, error.message);
+      return { success: false, message: `Verification error: ${error.message}` };
     }
   }
 
-  /**
-   * Single-buffer enrollment (called by /api/face/enroll when a single image is provided).
-   * Delegates to multi-sample with a single buffer.
-   */
-  async enrollFace(userId, imageBuffer) {
-    if (!imageBuffer) return { success: false, message: 'No image provided' };
-    return this.enrollFaceMultiSample(userId, [imageBuffer]);
-  }
-
-  // ==================== HARDWARE FACE ENROLLMENT (SESSION-BASED) ====================
+  // ==================== HARDWARE ENROLLMENT (SESSION-BASED) ====================
 
   /**
-   * Enroll a face from hardware (ESP32-CAM) with multi-sample accumulation.
-   *
-   * The ESP32 sends multiple JPEG frames asynchronously during the enrollment window.
-   * Instead of overwriting the descriptor each time (last-write-wins bug), this method:
-   *   1. Creates or retrieves an enrollment session for the userId
-   *   2. Detects the face and accumulates the descriptor if quality passes
-   *   3. Once SAMPLES_NEEDED_FOR_ENROLLMENT good samples are collected (or a single
-   *      high-quality sample with score >= HIGH_QUALITY_SINGLE_SCORE), computes the
-   *      averaged descriptor and saves to Sheets
-   *
-   * @param {string} userId
-   * @param {Buffer} imageBuffer - Single JPEG from ESP32-CAM /capture
-   * @returns {Object} - { success, message, box, confidence, samplesAccepted, samplesNeeded, finalized }
+   * Enroll face from ESP32-CAM multi-sample stream
    */
   async enrollFaceFromHardware(userId, imageBuffer) {
     if (!userId || typeof userId !== 'string') {
       return { success: false, message: 'Invalid user ID' };
     }
     if (!imageBuffer) {
-      return { success: false, message: 'No image provided' };
+      return { success: false, message: 'No image buffer provided' };
     }
 
     const now = Date.now();
@@ -556,16 +614,15 @@ class FaceRecognitionService {
         finalized: false,
       };
       faceEnrollmentSessions.set(userId, session);
-      console.log(`\n📝 HARDWARE ENROLLMENT SESSION STARTED for ${userId}`);
+      console.log(`\n📝 [HARDWARE-ENROLL-SESSION] Started new enrollment session for ${userId}`);
     }
 
     session.lastFrameAt = now;
 
-    // Detect face with enrollment-quality gating
+    // Detect face with quality gating
     const result = await this.detectFace(imageBuffer, true);
 
     if (!result.success) {
-      // Face detected but rejected quality gate, or no face at all
       return {
         success: false,
         message: result.message,
@@ -577,7 +634,7 @@ class FaceRecognitionService {
       };
     }
 
-    // Good sample — accumulate
+    // Accumulate good sample
     session.descriptors.push(result.descriptor);
     session.scores.push(result.score);
 
@@ -585,15 +642,13 @@ class FaceRecognitionService {
     const isHighQuality = result.score >= HIGH_QUALITY_SINGLE_SCORE;
     const hasEnoughSamples = samplesAccepted >= SAMPLES_NEEDED_FOR_ENROLLMENT;
 
-    console.log(`   📊 Sample ${samplesAccepted}/${SAMPLES_NEEDED_FOR_ENROLLMENT} accepted (score: ${result.score.toFixed(3)}, highQ: ${isHighQuality})`);
+    console.log(`   📊 [HARDWARE-ENROLL-PROGRESS] Sample ${samplesAccepted}/${SAMPLES_NEEDED_FOR_ENROLLMENT} accepted (score: ${result.score.toFixed(3)}, highQ: ${isHighQuality})`);
 
-    // Check if we should finalize
+    // Check if ready to finalize
     if (hasEnoughSamples || isHighQuality) {
-      // Compute averaged descriptor from all good samples
       const masterDescriptor = this.computeAverageDescriptor(session.descriptors);
       const avgScore = session.scores.reduce((a, b) => a + b, 0) / session.scores.length;
 
-      // Store in memory
       const faceData = {
         rawUserId: userId,
         descriptor: masterDescriptor,
@@ -601,19 +656,15 @@ class FaceRecognitionService {
         score: avgScore,
         samplesUsed: samplesAccepted,
       };
+
       this.faceDatabase.set(userId, faceData);
       this.faceDatabase.set(this._normalizeKey(userId), faceData);
 
-      // Persist to Google Sheets
-      const saved = await this.saveFaceToSheet(userId, masterDescriptor, avgScore);
-      if (!saved) {
-        console.warn('⚠️ Face saved in memory but Sheets save failed');
-      }
-
-      // Mark session as finalized
+      // Persist to storage
+      await this.saveFaceToSheet(userId, masterDescriptor, avgScore);
       session.finalized = true;
 
-      console.log(`✅ HARDWARE ENROLLMENT FINALIZED for ${userId} — ${samplesAccepted} samples, avg score: ${avgScore.toFixed(3)}`);
+      console.log(`✅ [HARDWARE-ENROLL-FINALIZED] User ${userId} face enrolled using ${samplesAccepted} sample(s), avg score: ${avgScore.toFixed(3)}`);
 
       return {
         success: true,
@@ -631,10 +682,9 @@ class FaceRecognitionService {
       };
     }
 
-    // Not enough samples yet — report progress
     return {
       success: false,
-      message: `Sample accepted (${samplesAccepted}/${SAMPLES_NEEDED_FOR_ENROLLMENT}). Keep looking at camera.`,
+      message: `Sample ${samplesAccepted}/${SAMPLES_NEEDED_FOR_ENROLLMENT} accepted. Please continue looking at camera.`,
       confidence: result.score,
       samplesAccepted,
       samplesNeeded: SAMPLES_NEEDED_FOR_ENROLLMENT,
@@ -648,125 +698,95 @@ class FaceRecognitionService {
     };
   }
 
-  // ==================== FACE VERIFICATION ====================
-
-  /**
-   * Look up face entry with case-insensitivity and automatic Sheets fallback
-   */
-  async getFaceEntry(userId) {
-    if (!userId) return null;
-    const normKey = this._normalizeKey(userId);
-
-    let entry = this.faceDatabase.get(userId) || this.faceDatabase.get(normKey);
-
-    if (!entry) {
-      console.log(`⚠️ User "${userId}" not in memory cache — reloading from Sheets...`);
-      await this.loadFacesFromSheet();
-      entry = this.faceDatabase.get(userId) || this.faceDatabase.get(normKey);
-    }
-
-    return entry;
+  // Single-buffer enrollment
+  async enrollFace(userId, imageBuffer) {
+    if (!imageBuffer) return { success: false, message: 'No image provided' };
+    return this.enrollFaceMultiSample(userId, [imageBuffer]);
   }
 
-  async verifyFace(userId, imageBuffer, threshold = VERIFY_DISTANCE_THRESHOLD) {
-    console.log(`\n🔍 VERIFYING FACE: ${userId} (threshold: ${threshold})`);
-
+  async enrollFaceMultiSample(userId, imageBuffers) {
+    console.log(`\n📝 [ENROLL-MULTI-SAMPLE] User: ${userId} (${imageBuffers.length} sample(s))`);
     try {
-      if (!userId || typeof userId !== 'string') {
-        return { success: false, message: 'Invalid user ID' };
+      const validDescriptors = [];
+      const scores = [];
+      let lastAngle = 0;
+      let lastBox = null;
+
+      for (let i = 0; i < imageBuffers.length; i++) {
+        const result = await this.detectFace(imageBuffers[i], true);
+        if (result.box) lastBox = result.box;
+        if (result.success) {
+          validDescriptors.push(result.descriptor);
+          scores.push(result.score);
+          lastAngle = result.rotationAngle || 0;
+        }
       }
 
-      const storedFace = await this.getFaceEntry(userId);
-      if (!storedFace) {
-        return {
-          success: false,
-          message: 'No face enrolled for this user. Please enroll face first.',
-        };
+      if (validDescriptors.length === 0) {
+        return { success: false, message: 'No clean face detected' };
       }
 
-      const result = await this.detectFace(imageBuffer);
-      if (!result.success) return result;
+      const masterDescriptor = this.computeAverageDescriptor(validDescriptors);
+      const avgScore = scores.reduce((a, b) => a + b, 0) / scores.length;
 
-      // Distance between stored master descriptor and current frame
-      const distance = this.euclideanDistance(storedFace.descriptor, result.descriptor);
-      const isMatch = distance < threshold;
+      const faceData = {
+        rawUserId: userId,
+        descriptor: masterDescriptor,
+        enrolledAt: new Date().toISOString(),
+        score: avgScore,
+        samplesUsed: validDescriptors.length,
+      };
 
-      // Improved confidence formula:
-      // At distance=0, confidence=1.0 (100%)
-      // At distance=threshold, confidence≈0.5 (50%)
-      // At distance=threshold*2, confidence=0.0 (0%)
-      // This gives more intuitive numbers than the old formula.
-      const confidence = Math.max(0, Math.min(1, 1 - (distance / (threshold * 2))));
-      const similarityPercent = Math.max(0, Math.min(100, confidence * 100)).toFixed(1);
-
-      console.log(`   Distance: ${distance.toFixed(4)} | Match: ${isMatch} | Confidence: ${confidence.toFixed(4)} (${similarityPercent}%) | Angle: ${result.rotationAngle}°`);
+      this.faceDatabase.set(userId, faceData);
+      this.faceDatabase.set(this._normalizeKey(userId), faceData);
+      await this.saveFaceToSheet(userId, masterDescriptor, avgScore);
 
       return {
-        success: isMatch,
-        message: isMatch ? `Face verified successfully (${similarityPercent}% match)` : `Face does not match enrolled face (${similarityPercent}% match)`,
-        confidence,
-        similarityPercent: parseFloat(similarityPercent),
-        distance,
-        threshold,
-        rotationAngle: result.rotationAngle,
-        score: result.score,
-        box: result.box ? {
-          x: Math.round(result.box.x),
-          y: Math.round(result.box.y),
-          w: Math.round(result.box.width),
-          h: Math.round(result.box.height),
-        } : null,
+        success: true,
+        message: `Face enrolled successfully using ${validDescriptors.length} sample(s)`,
+        confidence: avgScore,
+        samplesUsed: validDescriptors.length,
+        rotationAngle: lastAngle,
+        box: lastBox,
       };
-    } catch (error) {
-      console.error('❌ Verification error:', error.message);
-      return { success: false, message: `Verification failed: ${error.message}` };
+    } catch (err) {
+      return { success: false, message: `Enrollment error: ${err.message}` };
     }
   }
 
   // ==================== UTILITIES ====================
 
-  euclideanDistance(desc1, desc2) {
-    if (!desc1 || !desc2 || desc1.length !== desc2.length) {
-      throw new Error('Descriptor length mismatch');
-    }
-    let sum = 0;
-    for (let i = 0; i < desc1.length; i++) {
-      const diff = desc1[i] - desc2[i];
-      sum += diff * diff;
-    }
-    return Math.sqrt(sum);
-  }
-
   async deleteFace(userId) {
-    console.log(`🗑️ Deleting face for user: ${userId}`);
+    console.log(`🗑️ [FACE-DELETE] Deleting face for user: ${userId}`);
     const normKey = this._normalizeKey(userId);
     this.faceDatabase.delete(userId);
     this.faceDatabase.delete(normKey);
-
-    // Also clean up any active enrollment session
     faceEnrollmentSessions.delete(userId);
-
     await this.clearFaceFromSheet(userId);
-    console.log(`✅ Face deleted for ${userId}`);
     return { success: true, message: 'Face deleted successfully' };
   }
 
-  getEnrolledCount() { return Math.floor(this.faceDatabase.size / 2); }
+  getEnrolledCount() {
+    const unique = new Set();
+    for (const [k, v] of this.faceDatabase.entries()) {
+      if (v?.rawUserId) unique.add(v.rawUserId);
+    }
+    return unique.size;
+  }
+
   isUserEnrolled(userId) {
     const normKey = this._normalizeKey(userId);
     return this.faceDatabase.has(userId) || this.faceDatabase.has(normKey);
   }
+
   getEnrolledUsers() {
-    const set = new Set();
-    for (const [key, val] of this.faceDatabase.entries()) {
-      if (val && val.rawUserId) set.add(val.rawUserId);
+    const unique = new Set();
+    for (const [k, v] of this.faceDatabase.entries()) {
+      if (v?.rawUserId) unique.add(v.rawUserId);
     }
-    return Array.from(set);
+    return Array.from(unique);
   }
 
-  /**
-   * Get the current face descriptor for a user (used by enrollment-complete to preserve data)
-   */
   getDescriptorForUser(userId) {
     const entry = this.faceDatabase.get(userId) || this.faceDatabase.get(this._normalizeKey(userId));
     if (entry && entry.descriptor) {

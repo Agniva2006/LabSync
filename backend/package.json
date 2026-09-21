@@ -6,13 +6,13 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "postinstall": "node -e \"const fs = require('fs'); fs.mkdirSync('node_modules/@tensorflow/tfjs-node', { recursive: true }); fs.writeFileSync('node_modules/@tensorflow/tfjs-node/index.js', 'module.exports = require(\\\"@tensorflow/tfjs\\\");');\""
+    "postinstall": "node -e \"const fs = require('fs'); fs.mkdirSync('node_modules/@tensorflow/tfjs-node', { recursive: true }); fs.writeFileSync('node_modules/@tensorflow/tfjs-node/index.js', 'module.exports = require(\\\"@tensorflow/tfjs\\\");\\n');\""
   },
   "dependencies": {
+    "@napi-rs/canvas": "^1.0.9",
     "@tensorflow/tfjs": "^4.11.0",
     "@vladmandic/face-api": "^1.7.13",
     "bcryptjs": "^2.4.3",
-    "canvas": "^2.11.2",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
@@ -20,13 +20,13 @@
     "googleapis": "^128.0.0",
     "jsonwebtoken": "^9.0.2",
     "multer": "^1.4.5-lts.1",
-    "sharp": "^0.32.6",
+    "sharp": "^0.33.5",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": "20.x"
+    "node": ">=20.0.0"
   }
 }

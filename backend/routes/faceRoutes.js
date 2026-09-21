@@ -5,7 +5,7 @@ const faceService = require('../services/faceService');
 const { getSheetData, findRowIndex, updateRow, appendRow, logAccessEvent } = require('../services/sheetsService');
 const { verifyToken } = require('../middleware/authMiddleware');
 const { checkNightLockout, trackFailedAttempt, clearFailedAttempts } = require('../services/securityService');
-const { enrollmentStatus } = require('../services/sharedState');
+const { enrollmentStatus, pendingCommands } = require('../services/sharedState');
 
 // ==================== MULTER CONFIGURATION ====================
 
@@ -16,11 +16,11 @@ const upload = multer({
     files: 1,
   },
   fileFilter: (req, file, cb) => {
-    console.log(`📁 Received file: ${file.originalname}, Type: ${file.mimetype}, Size: ${file.size} bytes`);
+    console.log(`📁 [UPLOAD] Received file: ${file.originalname}, Type: ${file.mimetype}`);
     
-    // Accept only JPEG and PNG image types
-    const allowedMimes = ['image/jpeg', 'image/jpg', 'image/png'];
-    if (allowedMimes.includes(file.mimetype)) {
+    // Accept standard image types
+    const allowedMimes = ['image/jpeg', 'image/jpg', 'image/png', 'application/octet-stream'];
+    if (allowedMimes.includes(file.mimetype) || file.mimetype.startsWith('image/')) {
       cb(null, true);
     } else {
       cb(new Error(`Only JPEG and PNG images are allowed (received: ${file.mimetype})`), false);
@@ -52,50 +52,57 @@ const handleMulterError = (err, req, res, next) => {
   next();
 };
 
-// ==================== APP/WEB FACE ENROLLMENT (DECOMMISSIONED) ====================
-// Face enrollment via Flutter App / Web is disabled.
-// All biometric enrollments (fingerprint & face) are performed strictly via the ESP32 + ESP32-CAM terminal.
+// Helper to extract buffer from either multipart (req.file) or json base64 (req.body.faceImage)
+function extractImageBuffer(req) {
+  if (req.file && req.file.buffer && req.file.buffer.length > 0) {
+    return { buffer: req.file.buffer, source: 'MULTIPART_FILE' };
+  }
+
+  const base64Candidate = req.body?.faceImage || req.body?.image || req.body?.photo;
+  if (base64Candidate && typeof base64Candidate === 'string') {
+    const cleanBase64 = base64Candidate.replace(/^data:image\/\w+;base64,/, '').trim();
+    const buffer = Buffer.from(cleanBase64, 'base64');
+    return { buffer, source: 'BASE64_BODY' };
+  }
+
+  return { buffer: null, source: 'NONE' };
+}
+
+// ==================== APP/WEB FACE ENROLLMENT ====================
 router.post('/enroll', (req, res) => {
-  console.warn('⚠️ Rejected attempt to enroll face via App/Web. Biometrics are hardware-only.');
+  console.warn('⚠️ [ENROLL-REJECTED] In-app camera enrollment is disabled. Biometrics are hardware-only at ESP32 terminal.');
   return res.status(403).json({
     success: false,
     message: 'App/Web face enrollment is disabled. All biometric enrollments must be conducted at the physical ESP32 door terminal.',
   });
 });
 
-// ==================== HARDWARE FACE ENROLLMENT (MULTI-SAMPLE SESSION) ====================
+// ==================== HARDWARE FACE ENROLLMENT (ESP32-CAM MULTI-SAMPLE) ====================
 
-// Endpoint for ESP32 to enroll a face during the enrollment window.
-// ESP32 sends multiple JPEG frames asynchronously via FreeRTOS.
-// Each call accumulates a good descriptor into a session.
-// Once enough samples are collected, the averaged descriptor is saved.
 router.post('/enroll-hardware', upload.single('faceImage'), handleMulterError, async (req, res) => {
   try {
     const { userId } = req.body;
+    const { buffer: imageBuffer, source } = extractImageBuffer(req);
 
-    console.log(`\n========================================`);
-    console.log(`🤖 HARDWARE FACE ENROLLMENT REQUEST`);
-    console.log(`User ID: ${userId}`);
-    console.log(`========================================\n`);
+    console.log(`\n============================================================`);
+    console.log(`🤖 [HARDWARE-FACE-ENROLL] Request from User ID: ${userId || 'N/A'}`);
+    console.log(`   Source: ${source} | Buffer: ${imageBuffer?.length || 0} bytes`);
 
     if (!userId) {
       return res.status(400).json({ success: false, message: 'userId is required' });
     }
 
-    if (!req.file) {
-      return res.status(400).json({ success: false, message: 'No image file provided.' });
+    if (!imageBuffer || imageBuffer.length === 0) {
+      return res.status(400).json({ success: false, message: 'No image file or base64 faceImage provided.' });
     }
 
-    console.log(`📦 Image received: ${req.file.size} bytes (${req.file.mimetype})`);
-    console.log('⏳ Processing hardware face enrollment (session-based multi-sample)...');
-
-    // Use the session-based enrollment that accumulates descriptors
-    const result = await faceService.enrollFaceFromHardware(userId, req.file.buffer);
+    // Process hardware face sample
+    const result = await faceService.enrollFaceFromHardware(userId, imageBuffer);
 
     if (result.finalized) {
-      console.log(`✅ Hardware enrollment FINALIZED for ${userId}`);
+      console.log(`🎉 [HARDWARE-FACE-ENROLL] Enrollment successfully FINALIZED for ${userId}`);
 
-      // Update enrollment status so Flutter can see face completion
+      // Update shared state so UI / ESP32 polls detect completion
       const existingStatus = enrollmentStatus.get(userId);
       if (existingStatus) {
         existingStatus.faceEnrolled = true;
@@ -109,14 +116,15 @@ router.post('/enroll-hardware', upload.single('faceImage'), handleMulterError, a
           faceSamplesUsed: result.samplesAccepted,
         });
       }
-    } else if (!result.success) {
-      console.log(`⏳ Enrollment in progress for ${userId}: ${result.message}`);
+    } else {
+      console.log(`⏳ [HARDWARE-FACE-ENROLL] Progress for ${userId}: ${result.message}`);
     }
 
-    // Always return the result — ESP32 checks `success` field
+    console.log(`============================================================\n`);
+
     res.json({
-      success: result.finalized || false, // ESP32 expects `success: true` only when fully enrolled
-      message: result.message || 'Processing...',
+      success: result.finalized || false,
+      message: result.message || 'Processing sample...',
       box: result.box || null,
       confidence: result.confidence || 0,
       samplesAccepted: result.samplesAccepted || 0,
@@ -125,11 +133,10 @@ router.post('/enroll-hardware', upload.single('faceImage'), handleMulterError, a
     });
 
   } catch (error) {
-    console.error(`\n❌ HARDWARE ENROLLMENT ERROR:`);
-    console.error(error);
+    console.error(`❌ [HARDWARE-FACE-ENROLL-ERROR]:`, error);
     res.status(500).json({
       success: false,
-      message: 'Server error during hardware enrollment',
+      message: 'Server error during hardware face enrollment',
       error: error.message,
     });
   }
@@ -137,74 +144,84 @@ router.post('/enroll-hardware', upload.single('faceImage'), handleMulterError, a
 
 // ==================== FACE VERIFICATION ====================
 
-// Face verify accepts optional roomId.
-// ESP32 reads the HTTP response directly — it does NOT poll get-commands for face results.
-// Therefore we do NOT set pendingCommands here (that was causing a memory leak).
 router.post('/verify', upload.single('faceImage'), handleMulterError, async (req, res) => {
+  const reqStart = Date.now();
   try {
     const { userId, roomId } = req.body;
+    const { buffer: imageBuffer, source } = extractImageBuffer(req);
 
-    console.log(`\n========================================`);
-    console.log(`🔍 FACE VERIFICATION REQUEST`);
-    console.log(`User ID: ${userId} | Room: ${roomId || 'N/A'}`);
-    console.log(`========================================\n`);
+    console.log(`\n============================================================`);
+    console.log(`🔍 [FACE-VERIFY-ROUTE] Received verification request`);
+    console.log(`   User ID: ${userId || 'MISSING'} | Room ID: ${roomId || 'N/A'}`);
+    console.log(`   Payload Source: ${source} | Payload Size: ${imageBuffer?.length || 0} bytes`);
 
     if (!userId) {
       return res.status(400).json({ success: false, message: 'userId is required' });
     }
-    if (!req.file) {
-      return res.status(400).json({ success: false, message: 'No image file provided.' });
+    if (!imageBuffer || imageBuffer.length === 0) {
+      return res.status(400).json({ success: false, message: 'No face image provided (must provide multipart file or base64 faceImage).' });
     }
-
-    console.log(`📦 Image received: ${req.file.size} bytes`);
 
     await faceService.initialize();
 
-    console.log('⏳ Processing face verification (SSD MobileNet → FaceLandmark68 → FaceRecognitionNet)...');
-    const result = await faceService.verifyFace(userId, req.file.buffer);
+    // Call face verification engine
+    const result = await faceService.verifyFace(userId, imageBuffer);
 
-    // [NIGHT LOCKOUT CHECK]
+    // [NIGHT LOCKOUT ENFORCEMENT]
     if (result.success) {
       const { lockedOut, message } = await checkNightLockout(userId);
       if (lockedOut) {
+        console.warn(`🌙 [NIGHT-LOCKOUT] Access blocked for ${userId}: ${message}`);
         result.success = false;
         result.message = message;
       }
     }
 
-    // [IDS TRACKING]
+    // [INTRUSION DETECTION SYSTEM TRACKING]
     if (!result.success && roomId) {
       await trackFailedAttempt(roomId, 'FACE');
     } else if (result.success && roomId) {
       clearFailedAttempts(roomId);
     }
 
-    // Log to ROOM_ACCESS sheet robustly
+    // Audit log to ROOM_ACCESS table
     await logAccessEvent({
       action: 'ENTRY',
       authMethod: 'FACE',
       status: result.success ? 'GRANTED' : 'DENIED',
       userId: userId,
-      roomId: roomId,
-      details: `Distance: ${result.distance?.toFixed(4) || 'N/A'} | Confidence: ${result.confidence?.toFixed(4) || 'N/A'} | Similarity: ${result.similarityPercent || 'N/A'}%`
+      roomId: roomId || 'ROOM-001',
+      details: `Distance: ${result.distance?.toFixed(4) || 'N/A'} | Similarity: ${result.similarityPercent || 0}% | Time: ${Date.now() - reqStart}ms`
     });
 
     if (!result.success) {
-      console.log(`❌ Verification failed: ${result.message}\n`);
+      console.log(`❌ [FACE-VERIFY-ROUTE] Verification FAILED for ${userId}: ${result.message} (${Date.now() - reqStart}ms)\n`);
       return res.status(401).json(result);
     }
 
-    console.log(`✅ Verification successful for ${userId} | distance: ${result.distance?.toFixed(4)}\n`);
+    console.log(`✅ [FACE-VERIFY-ROUTE] Verification SUCCEEDED for ${userId} in ${Date.now() - reqStart}ms\n`);
 
-    // Look up userName from Sheets for richer response
+    // Look up user name for richer response
     let userName = userId;
     try {
       const users = await getSheetData('USERS');
-      const user = users.find(u => (u.userid || u.userId) === userId);
+      const normUser = String(userId).toLowerCase();
+      const user = users.find(u => String(u.userid || u.userId || '').toLowerCase() === normUser);
       if (user) {
         userName = user.username || user.name || userId;
       }
     } catch (e) { /* non-critical */ }
+
+    // If roomId is provided and match is valid, queue door unlock command for ESP32
+    if (roomId) {
+      pendingCommands.set(roomId, {
+        command: 'face_unlock',
+        userName: userName,
+        adminId: userId,
+        timestamp: new Date().toISOString(),
+      });
+      console.log(`🔓 [DOOR-UNLOCK-QUEUED] Command 'face_unlock' queued for Room ${roomId}`);
+    }
 
     res.json({
       success: true,
@@ -214,11 +231,12 @@ router.post('/verify', upload.single('faceImage'), handleMulterError, async (req
       distance: result.distance,
       userId,
       userName,
-      box: result.box || null,  // {x,y,w,h} for TFT bounding box overlay
+      box: result.box || null, // {x, y, w, h} for TFT bounding box overlay
+      timeMs: Date.now() - reqStart,
     });
 
   } catch (error) {
-    console.error(`\n❌ VERIFICATION ERROR:`, error.message);
+    console.error(`❌ [FACE-VERIFY-ROUTE-ERROR]:`, error.message);
     res.status(500).json({ success: false, message: 'Failed to verify face: ' + error.message });
   }
 });
@@ -228,19 +246,12 @@ router.post('/verify', upload.single('faceImage'), handleMulterError, async (req
 router.get('/status/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-
-    console.log(`🔍 Checking face status for user: ${userId}`);
-
     if (!userId) {
-      return res.status(400).json({
-        success: false,
-        message: 'userId is required',
-      });
+      return res.status(400).json({ success: false, message: 'userId is required' });
     }
 
     const isEnrolled = faceService.isUserEnrolled(userId);
-
-    console.log(`✅ Status: ${isEnrolled ? 'ENROLLED' : 'NOT ENROLLED'}`);
+    console.log(`🔍 [FACE-STATUS] Check for ${userId} → ${isEnrolled ? 'ENROLLED' : 'NOT ENROLLED'}`);
 
     res.json({
       success: true,
@@ -248,11 +259,8 @@ router.get('/status/:userId', async (req, res) => {
       userId: userId,
     });
   } catch (error) {
-    console.error('❌ Error checking face status:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    console.error('❌ [FACE-STATUS-ERROR]:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -261,64 +269,16 @@ router.get('/status/:userId', async (req, res) => {
 router.delete('/:userId', verifyToken, async (req, res) => {
   try {
     const { userId } = req.params;
-
-    console.log(`\n========================================`);
-    console.log(`🗑️ DELETE FACE REQUEST`);
-    console.log(`User ID: ${userId}`);
-    console.log(`========================================\n`);
-
     if (!userId) {
-      return res.status(400).json({
-        success: false,
-        message: 'userId is required',
-      });
+      return res.status(400).json({ success: false, message: 'userId is required' });
     }
 
+    console.log(`🗑️ [FACE-DELETE-ROUTE] Deleting face for user: ${userId}`);
     const result = await faceService.deleteFace(userId);
-
-    if (result.success) {
-      // Update user's face status in database
-      try {
-        const users = await getSheetData('USERS');
-        // Try both header casings for robust lookup
-        let userIndex = await findRowIndex('USERS', 'userid', userId);
-        if (userIndex === -1) {
-          userIndex = await findRowIndex('USERS', 'userId', userId);
-        }
-        
-        if (userIndex !== -1) {
-          // Find user from data array (findRowIndex returns Sheets row, not array index)
-          const user = users.find(u => (u.userid || u.userId) === userId);
-          if (user) {
-            await updateRow('USERS', userIndex, [
-              user.userid || user.userId,
-              user.username || user.name || '',
-              user.email || '',
-              user.password || '',
-              user.role || 'user',
-              user.department || '',
-              user.authorized_rooms || '',
-              user.fingerprintid || user.fingerprintId || '',
-              '',             // Clear faceDescriptor
-              'NOT_ENROLLED', // Reset faceStatus
-            ]);
-            console.log('✅ User record updated in database');
-          }
-        }
-      } catch (dbError) {
-        console.error('⚠️ Database update failed:', dbError.message);
-      }
-    }
-
-    console.log(`✅ Delete result: ${result.success ? 'SUCCESS' : 'FAILED'}\n`);
-    
     res.json(result);
   } catch (error) {
-    console.error('❌ Error deleting face:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    console.error('❌ [FACE-DELETE-ROUTE-ERROR]:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -329,9 +289,7 @@ router.get('/stats', async (req, res) => {
     const enrolledCount = faceService.getEnrolledCount();
     const modelsLoaded = faceService.modelsLoaded;
 
-    console.log(`📊 Face recognition stats requested`);
-    console.log(`   Models loaded: ${modelsLoaded}`);
-    console.log(`   Enrolled faces: ${enrolledCount}`);
+    console.log(`📊 [FACE-STATS] Models loaded: ${modelsLoaded} | Enrolled count: ${enrolledCount}`);
 
     res.json({
       success: true,
@@ -339,11 +297,8 @@ router.get('/stats', async (req, res) => {
       modelsLoaded: modelsLoaded,
     });
   } catch (error) {
-    console.error('❌ Error getting stats:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    console.error('❌ [FACE-STATS-ERROR]:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -352,8 +307,7 @@ router.get('/stats', async (req, res) => {
 router.get('/enrolled-users', async (req, res) => {
   try {
     const enrolledUsers = faceService.getEnrolledUsers();
-
-    console.log(`📋 Listing enrolled users: ${enrolledUsers.length} users`);
+    console.log(`📋 [FACE-ENROLLED-USERS] Total: ${enrolledUsers.length}`);
 
     res.json({
       success: true,
@@ -361,11 +315,8 @@ router.get('/enrolled-users', async (req, res) => {
       users: enrolledUsers,
     });
   } catch (error) {
-    console.error('❌ Error listing enrolled users:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    console.error('❌ [FACE-ENROLLED-USERS-ERROR]:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 

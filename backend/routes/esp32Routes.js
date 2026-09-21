@@ -17,12 +17,14 @@ router.post('/fingerprint-verified', async (req, res) => {
       return res.status(400).json({ success: false, message: 'roomId, userId, fingerId required' });
     }
 
-    console.log(`\n🟢 FINGERPRINT VERIFIED`);
-    console.log(`   Room: ${roomId} | User: ${userId} | Finger: ${fingerId}`);
+    console.log(`\n============================================================`);
+    console.log(`🖐️ [BIOMETRIC-STEP 1] FINGERPRINT SCAN MATCHED`);
+    console.log(`   Room ID: ${roomId} | User ID: ${userId} | DSP Slot: ${fingerId}`);
 
     // [NIGHT LOCKOUT CHECK]
     const { lockedOut, message } = await checkNightLockout(userId);
     if (lockedOut) {
+      console.warn(`🌙 [NIGHT-LOCKOUT] Blocked access for ${userId}: ${message}`);
       await logAccessEvent({
         action: 'ENTRY',
         authMethod: 'FINGERPRINT',
@@ -45,19 +47,21 @@ router.post('/fingerprint-verified', async (req, res) => {
       status: 'PENDING_FACE',
     });
 
-    // Log to ROOM_ACCESS sheet
+    console.log(`⏳ [BIOMETRIC-STEP 1] Pending face window opened (30s TTL) for ${userId} in Room ${roomId}`);
+
+    // Log to ROOM_ACCESS table
     await logAccessEvent({
       action: 'ENTRY',
       authMethod: 'FINGERPRINT',
       status: 'PENDING_FACE',
       userId: userId,
       roomId: roomId,
-      details: `Fingerprint ID ${fingerId} verified — awaiting face auth`
+      details: `Fingerprint ID ${fingerId} verified — awaiting facial verification`
     });
 
     res.json({ success: true, message: 'Fingerprint verified — face verification pending' });
   } catch (error) {
-    console.error('❌ fingerprint-verified error:', error);
+    console.error('❌ [BIOMETRIC-STEP 1-ERROR]:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
