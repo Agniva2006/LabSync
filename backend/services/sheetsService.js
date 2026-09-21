@@ -511,8 +511,48 @@ async function updatePartialRow(sheetName, rowIndex, updates) {
   }
 }
 
+// ==================== ASYNC WRITE-BEHIND ACCESS LOG QUEUE ====================
+let accessLogQueue = [];
+let logFlushTimer = null;
+
+async function flushAccessLogs() {
+  if (accessLogQueue.length === 0) return;
+  const batch = accessLogQueue.splice(0, accessLogQueue.length);
+
+  if (isSheetsConfigured && sheets) {
+    try {
+      await withRetry(() => sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: 'ROOM_ACCESS!A1',
+        valueInputOption: 'USER_ENTERED',
+        insertDataOption: 'INSERT_ROWS',
+        resource: { values: batch }
+      }));
+      console.log(`✅ [AUDIT-BATCH] Successfully flushed ${batch.length} access log(s) to Google Sheets`);
+    } catch (err) {
+      console.warn(`⚠️ [AUDIT-BATCH] Failed to flush logs to Google Sheets (${err.message}). Retained in local DB.`);
+    }
+  }
+}
+
+function queueAccessLog(rowData) {
+  accessLogQueue.push(rowData);
+  if (accessLogQueue.length >= 5) {
+    if (logFlushTimer) {
+      clearTimeout(logFlushTimer);
+      logFlushTimer = null;
+    }
+    flushAccessLogs();
+  } else if (!logFlushTimer) {
+    logFlushTimer = setTimeout(() => {
+      logFlushTimer = null;
+      flushAccessLogs();
+    }, 4000); // Flush every 4 seconds
+  }
+}
+
 /**
- * Robustly log an access event to ROOM_ACCESS
+ * Robustly log an access event to ROOM_ACCESS (Immediate Local DB + Batched Sheets)
  */
 async function logAccessEvent({ action, authMethod, status, userId, roomId, details, durationMinutes }) {
   try {
@@ -566,7 +606,21 @@ async function logAccessEvent({ action, authMethod, status, userId, roomId, deta
       durationMinutes ? String(durationMinutes) : ''
     ];
 
-    await appendRow('ROOM_ACCESS', rowData);
+    // 1. Immediately record in localDb (0ms latency, zero drop)
+    if (!localDb['ROOM_ACCESS']) localDb['ROOM_ACCESS'] = [];
+    const headers = SHEET_HEADERS['ROOM_ACCESS'] || [];
+    const rowObj = {};
+    headers.forEach((h, idx) => {
+      const val = rowData[idx] !== undefined ? String(rowData[idx]) : '';
+      rowObj[h.toLowerCase()] = val;
+      rowObj[h] = val;
+    });
+    localDb['ROOM_ACCESS'].push(rowObj);
+    saveLocalDb();
+
+    // 2. Queue for batched Google Sheets append (avoids 429 quota limits)
+    queueAccessLog(rowData);
+
     console.log(`📝 [AUDIT-LOG] [${action}] User: ${userName} (${userId}) | Room: ${roomName} (${roomId}) | Method: ${authMethod} | Status: ${status}`);
     return { success: true, accessId };
   } catch (error) {

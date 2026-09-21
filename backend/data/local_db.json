@@ -332,6 +332,27 @@
       "details": "Fingerprint ID 22 verified — awaiting facial verification",
       "durationminutes": "",
       "durationMinutes": ""
+    },
+    {
+      "logid": "LOG-1790032131858",
+      "logId": "LOG-1790032131858",
+      "timestamp": "2026-09-21T23:08:51.858Z",
+      "userid": "USR-001",
+      "userId": "USR-001",
+      "username": "Agniva Ghosh",
+      "userName": "Agniva Ghosh",
+      "department": "Computer Science",
+      "roomid": "ROOM-001",
+      "roomId": "ROOM-001",
+      "roomname": "Advanced IoT & Robotics Lab",
+      "roomName": "Advanced IoT & Robotics Lab",
+      "action": "ENTRY",
+      "authmethod": "FACE",
+      "authMethod": "FACE",
+      "status": "GRANTED",
+      "details": "Testing asynchronous write-behind log batching",
+      "durationminutes": "",
+      "durationMinutes": ""
     }
   ],
   "NOTIFICATIONS": [

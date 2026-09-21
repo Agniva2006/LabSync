@@ -121,6 +121,8 @@ bool mdnsRunning = false;
 #define PWDN_GPIO_NUM 32
 #define RESET_GPIO_NUM -1
 
+#define FLASH_LED_PIN 4
+
 #define XCLK_GPIO_NUM 0
 
 #define SIOD_GPIO_NUM 26
@@ -153,6 +155,7 @@ httpd_uri_t startUri = {};
 httpd_uri_t stopUri = {};
 httpd_uri_t statusUri = {};
 httpd_uri_t captureUri = {};
+httpd_uri_t flashUri = {};
 
 // ============================================================
 // FUNCTION PROTOTYPES
@@ -168,6 +171,7 @@ esp_err_t startHandler(httpd_req_t *req);
 esp_err_t stopHandler(httpd_req_t *req);
 esp_err_t statusHandler(httpd_req_t *req);
 esp_err_t captureHandler(httpd_req_t *req);
+esp_err_t flashHandler(httpd_req_t *req);
 
 bool startHttpServer();
 
@@ -667,14 +671,38 @@ esp_err_t captureHandler(httpd_req_t *req)
       "Access-Control-Allow-Origin",
       "*");
 
-  esp_err_t result = httpd_resp_send(
+  esp_err_t res = httpd_resp_send(
       req,
       reinterpret_cast<const char *>(frame->buf),
       frame->len);
 
   esp_camera_fb_return(frame);
 
-  return result;
+  return res;
+}
+
+// ============================================================
+// FLASH LED HANDLER (GPIO 4)
+// ============================================================
+
+esp_err_t flashHandler(httpd_req_t *req)
+{
+  char buf[32];
+  size_t buf_len = sizeof(buf);
+  if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK)
+  {
+    char val[8];
+    if (httpd_query_key_value(buf, "val", val, sizeof(val)) == ESP_OK)
+    {
+      int state = atoi(val);
+      digitalWrite(FLASH_LED_PIN, state > 0 ? HIGH : LOW);
+      return sendText(req, state > 0 ? "FLASH_ON" : "FLASH_OFF");
+    }
+  }
+  // Toggle if no query param
+  int currentState = digitalRead(FLASH_LED_PIN);
+  digitalWrite(FLASH_LED_PIN, currentState ? LOW : HIGH);
+  return sendText(req, currentState ? "FLASH_OFF" : "FLASH_ON");
 }
 
 // ============================================================
@@ -747,6 +775,15 @@ bool startHttpServer()
   httpd_register_uri_handler(
       cameraServer,
       &captureUri);
+
+  flashUri.uri = "/flash";
+  flashUri.method = HTTP_GET;
+  flashUri.handler = flashHandler;
+  flashUri.user_ctx = nullptr;
+
+  httpd_register_uri_handler(
+      cameraServer,
+      &flashUri);
 
   Serial.println("HTTP server started");
 
@@ -967,6 +1004,9 @@ void setup()
 
   pinMode(PWDN_GPIO_NUM, OUTPUT);
   digitalWrite(PWDN_GPIO_NUM, HIGH);
+
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, LOW);
 
   cameraEnabled = false;
   cameraInitialized = false;
