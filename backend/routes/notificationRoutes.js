@@ -5,7 +5,7 @@ const { getUserNotifications, markAsRead, markAllAsRead, deleteNotification } = 
 // GET /api/notifications - Get all notifications for user
 router.get('/', async (req, res) => {
   try {
-    const userId = req.query.userId || req.headers['x-user-id'];
+    const userId = req.query.userId || req.headers['x-user-id'] || req.user?.userId;
     
     if (!userId) {
       return res.status(400).json({
@@ -48,7 +48,7 @@ router.put('/:notifId/read', async (req, res) => {
 // PUT /api/notifications/read-all - Mark all as read
 router.put('/read-all', async (req, res) => {
   try {
-    const userId = req.query.userId || req.headers['x-user-id'];
+    const userId = req.query.userId || req.headers['x-user-id'] || req.user?.userId;
     
     if (!userId) {
       return res.status(400).json({

@@ -9,7 +9,7 @@ const SHEET_HEADERS = {
   USERS: ['userId', 'username', 'email', 'password', 'role', 'department', 'authorized_rooms', 'fingerprintId', 'faceDescriptor', 'faceStatus'],
   ROOMS: ['roomId', 'roomName', 'securityLevel', 'status'],
   ROOM_ACCESS: ['logId', 'timestamp', 'userId', 'userName', 'department', 'roomId', 'roomName', 'action', 'authMethod', 'status', 'details', 'durationMinutes'],
-  NOTIFICATIONS: ['notificationId', 'userId', 'title', 'message', 'type', 'timestamp', 'isRead'],
+  NOTIFICATIONS: ['notificationId', 'userId', 'title', 'message', 'type', 'isRead', 'timestamp'],
   REQUESTS: ['requestId', 'userId', 'userName', 'type', 'itemOrRoomId', 'itemOrRoomName', 'purpose', 'status', 'requestDate', 'decisionDate', 'adminComment'],
   INVENTORY: ['itemId', 'name', 'category', 'status', 'location', 'assignedTo', 'lastUpdated'],
   SYSTEM_TELEMETRY: ['telemetryId', 'timestamp', 'deviceId', 'roomId', 'rssi', 'freeHeap', 'uptime']
@@ -284,6 +284,10 @@ async function appendRow(sheetName, rowData) {
   });
 
   if (!localDb[cacheKey]) localDb[cacheKey] = [];
+  if (cacheKey === 'NOTIFICATIONS') {
+    rowObj['read'] = rowObj['isread'] || rowObj['isRead'] || 'false';
+    rowObj['createdAt'] = rowObj['timestamp'] || new Date().toISOString();
+  }
   localDb[cacheKey].push(rowObj);
   saveLocalDb();
 
