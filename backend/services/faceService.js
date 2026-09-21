@@ -311,6 +311,21 @@ class FaceRecognitionService {
             ]);
             healedCount++;
           }
+        } else if (!sheetUser && localUser) {
+          console.log(`✨ [BIOMETRIC-HEAL] Appending missing user ${userName} (${userId}) to Google Sheets`);
+          await appendRow('USERS', [
+            userId,
+            userName,
+            localUser.email || '',
+            localUser.password || '$2a$10$qSbfQoa5HHuxXzaTM4BnzuZGfscQPGgSQHyHhgCeN2Vn9Wbr/DcHu',
+            role,
+            localUser.department || 'Laboratory',
+            localUser.authorized_rooms || 'ROOM-001',
+            fingerprintId,
+            faceDescStr,
+            (faceDescStr.length > 50) ? 'ENROLLED' : (localUser.facestatus || 'NOT_ENROLLED')
+          ]);
+          healedCount++;
         }
       }
 
