@@ -403,18 +403,6 @@ router.post('/enrollment-complete', async (req, res) => {
     console.log(`\n📝 ENROLLMENT COMPLETE (FINGERPRINT)`);
     console.log(`   Finger ID: ${fingerId} | User: ${userName} (${userId}) | Role: ${role || 'N/A'}`);
 
-    // Track in-memory for polling (preserve face status if already set)
-    const existingStatus = enrollmentStatus.get(userId);
-    enrollmentStatus.set(userId, {
-      completed: true,
-      fingerprintId: fingerId,
-      enrolledAt: new Date().toISOString(),
-      userName,
-      role: role || 'user',
-      faceEnrolled: existingStatus?.faceEnrolled || false,
-      faceEnrolledAt: existingStatus?.faceEnrolledAt || null,
-    });
-
     // Update USERS sheet fingerprintId column — PRESERVE face data
     const users = await getSheetData('USERS');
     const localUsers = getLocalDbData('USERS');
@@ -424,6 +412,22 @@ router.post('/enrollment-complete', async (req, res) => {
     const normId = String(userId).toLowerCase();
     const user = (users || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId) ||
                  (localUsers || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId) || {};
+
+    // Track in-memory for polling — accurately preserve face status from memory or database
+    const existingStatus = enrollmentStatus.get(userId);
+    const isFaceEnrolled = existingStatus?.faceEnrolled ||
+                           faceService.isUserEnrolled(userId) ||
+                           ((user.facestatus || user.faceStatus) === 'ENROLLED' && (user.facedescriptor || user.faceDescriptor)?.length > 50);
+
+    enrollmentStatus.set(userId, {
+      completed: true,
+      fingerprintId: fingerId,
+      enrolledAt: new Date().toISOString(),
+      userName,
+      role: role || 'user',
+      faceEnrolled: isFaceEnrolled,
+      faceEnrolledAt: isFaceEnrolled ? (existingStatus?.faceEnrolledAt || new Date().toISOString()) : null,
+    });
 
     let faceDescriptorStr = '';
     let faceStatus = 'NOT_ENROLLED';
@@ -612,6 +616,14 @@ router.get('/camera-ip/:roomId', (req, res) => {
 
 // ==================== DEBUG (remove in production) ====================
 router.get('/debug/pending', (req, res) => {
+  // Synchronize live face enrollment state for all tracked enrollment entries
+  for (const [uid, status] of enrollmentStatus.entries()) {
+    if (!status.faceEnrolled && faceService.isUserEnrolled(uid)) {
+      status.faceEnrolled = true;
+      status.faceEnrolledAt = status.faceEnrolledAt || status.enrolledAt;
+    }
+  }
+
   res.json({
     pendingCommands: Object.fromEntries(pendingCommands),
     pendingFaceAuth: Object.fromEntries(pendingFaceAuth),
