@@ -2593,21 +2593,40 @@ bool runEnrollmentSequence( const String &userId, const String &userName, const 
   tftShowStatus( "Place finger on sensor", "Scan 1 of 2", COLOR_YELLOW );
 
   int p = -1;
+  bool firstScanOk = false;
 
-  while ( p != FINGERPRINT_OK) {
-    p = finger.getImage();
+  for (int attempt = 1; attempt <= 4; attempt++) {
+    tftShowStatus( "Place finger on sensor", "Scan 1/2 (Att " + String(attempt) + "/4)", COLOR_YELLOW );
 
-    delay(100);
+    p = -1;
+    while ( p != FINGERPRINT_OK) {
+      p = finger.getImage();
+      delay(100);
+    }
 
+    delay(120); // allow finger contact pressure to stabilize on prism
+    finger.getImage(); // refresh image with firm contact pressure
+    p = finger.image2Tz(1);
+
+    if ( p == FINGERPRINT_OK) {
+      firstScanOk = true;
+      break;
+    }
+
+    Serial.printf("Enrollment Scan 1 attempt %d failed: %s (0x%02X)\n", attempt, getFingerprintErrorString(p).c_str(), p);
+    tftShowStatus( "Press firmly & hold", "Retrying...", COLOR_YELLOW );
+
+    while ( finger.getImage() != FINGERPRINT_NOFINGER) {
+      delay(100);
+    }
+    delay(400);
   }
 
-  p = finger.image2Tz(1);
-
-  if ( p != FINGERPRINT_OK) {
+  if (!firstScanOk) {
     reportEnrollmentFailure( userId, userName, p, "First image" );
-
+    tftShowFullScreen( "SCAN ERROR", getFingerprintErrorString(p), COLOR_RED );
+    delay(1500);
     return false;
-
   }
 
   tftShowStatus( "Lift finger...", "Done scan 1", COLOR_CYAN );
@@ -2631,9 +2650,13 @@ bool runEnrollmentSequence( const String &userId, const String &userName, const 
       delay(100);
     }
 
+    delay(120); // allow finger contact pressure to stabilize on prism
+    finger.getImage(); // refresh image with firm contact pressure
     p = finger.image2Tz(2);
 
     if ( p != FINGERPRINT_OK) {
+      Serial.printf("Enrollment Scan 2 attempt %d failed: %s (0x%02X)\n", attempt, getFingerprintErrorString(p).c_str(), p);
+      tftShowStatus( "Press firmly & hold", "Retrying...", COLOR_YELLOW );
       while ( finger.getImage() != FINGERPRINT_NOFINGER) {
         delay(100);
       }
@@ -3281,10 +3304,26 @@ bool processFingerprintIfPresent() {
 
   wakeToActive( "Finger detected" );
 
-  tftShowStatus( "Reading fingerprint...", "", COLOR_CYAN );
+  tftShowStatus( "Reading fingerprint...", "Hold finger steady", COLOR_CYAN );
 
-  if ( finger.image2Tz(1) != FINGERPRINT_OK) {
-    tftShowFullScreen( "SCAN ERROR", "Try again", COLOR_YELLOW );
+  // Stabilize finger contact pressure and retry image2Tz up to 3 times
+  int tzResult = -1;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    delay(100); // Allow finger pressure to stabilize on the glass prism
+    int imgStatus = finger.getImage();
+    if (imgStatus == FINGERPRINT_OK) {
+      tzResult = finger.image2Tz(1);
+      if (tzResult == FINGERPRINT_OK) {
+        break; // Successfully captured clear fingerprint template!
+      }
+      Serial.printf("image2Tz attempt %d failed: %s (0x%02X)\n", attempt, getFingerprintErrorString(tzResult).c_str(), tzResult);
+    }
+  }
+
+  if (tzResult != FINGERPRINT_OK) {
+    String errDesc = getFingerprintErrorString(tzResult);
+    Serial.printf("Fingerprint capture failed: %s (0x%02X)\n", errDesc.c_str(), tzResult);
+    tftShowFullScreen( "SCAN ERROR", errDesc.length() > 0 ? errDesc : "Press firmly", COLOR_YELLOW );
 
     while ( finger.getImage() != FINGERPRINT_NOFINGER) {
       delay(75);
@@ -3298,7 +3337,9 @@ bool processFingerprintIfPresent() {
 
   }
 
-  if ( finger.fingerSearch() != FINGERPRINT_OK) {
+  int searchResult = finger.fingerSearch();
+  if ( searchResult != FINGERPRINT_OK) {
+    Serial.printf("fingerSearch failed: %s (0x%02X)\n", getFingerprintErrorString(searchResult).c_str(), searchResult);
     tftShowFullScreen( "NO MATCH", "Not registered", COLOR_RED );
 
     while ( finger.getImage() != FINGERPRINT_NOFINGER) {
@@ -3319,8 +3360,8 @@ bool processFingerprintIfPresent() {
 
   Serial.printf( "Fingerprint ID=%d Confidence=%d\n", fingerId, confidence );
 
-  if (confidence < 50) {
-    tftShowFullScreen( "LOW CONFIDENCE", "Try again", COLOR_YELLOW );
+  if (confidence < 40) {
+    tftShowFullScreen( "LOW CONFIDENCE", "Press firmly", COLOR_YELLOW );
 
     while ( finger.getImage() != FINGERPRINT_NOFINGER) {
       delay(75);
