@@ -2561,6 +2561,25 @@ bool runEnrollmentSequence( const String &userId, const String &userName, const 
   if (!fingerprintReady) return false;
 
   // ------------------------------------------------------------
+  // STEP 0: LOCATE NEXT AVAILABLE SENSOR SLOT BEFORE SCANNING
+  // (CRITICAL: Prevents loadModel from clobbering CharBuffer 1 after createModel)
+  // ------------------------------------------------------------
+  int nextId = -1;
+  for (int id = 1; id <= finger.capacity; id++) {
+    int result = finger.loadModel(id);
+    if ( result != FINGERPRINT_OK) {
+      nextId = id;
+      break;
+    }
+  }
+
+  if (nextId < 1) {
+    tftShowFullScreen( "ENROLL FAILED", "No free sensor slots", COLOR_RED );
+    delay(2000);
+    return false;
+  }
+
+  // ------------------------------------------------------------
   // STEP 1/2: FINGERPRINT SCAN & MERGE
   // ------------------------------------------------------------
 
@@ -2640,27 +2659,7 @@ bool runEnrollmentSequence( const String &userId, const String &userName, const 
 
   }
 
-  int nextId = -1;
-
-  for (int id = 1; id <= finger.capacity; id++) {
-    int result = finger.loadModel(id);
-
-    if ( result != FINGERPRINT_OK) {
-      nextId = id;
-      break;
-    }
-
-  }
-
-  if (nextId < 1) {
-    tftShowFullScreen( "ENROLL FAILED", "No free sensor slots", COLOR_RED );
-
-    delay(2000);
-
-    return false;
-
-  }
-
+  // Store newly created model (safely in CharBuffer 1) directly into nextId!
   p = finger.storeModel( nextId );
 
   if ( p != FINGERPRINT_OK) {
