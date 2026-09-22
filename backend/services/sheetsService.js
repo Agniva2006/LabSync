@@ -444,9 +444,17 @@ async function deleteRow(sheetName, rowIndex) {
   const cacheKey = sheetName.toUpperCase();
   sheetDataCache.delete(cacheKey);
 
-  const arrayIndex = rowIndex - 2;
-  if (localDb[cacheKey] && arrayIndex >= 0 && arrayIndex < localDb[cacheKey].length) {
-    localDb[cacheKey].splice(arrayIndex, 1);
+  // Remove from local DB by _rowNumber or fallback to array index
+  if (localDb[cacheKey]) {
+    const idx = localDb[cacheKey].findIndex(item => item._rowNumber === rowIndex);
+    if (idx !== -1) {
+      localDb[cacheKey].splice(idx, 1);
+    } else {
+      const arrayIndex = rowIndex - 2;
+      if (arrayIndex >= 0 && arrayIndex < localDb[cacheKey].length) {
+        localDb[cacheKey].splice(arrayIndex, 1);
+      }
+    }
     saveLocalDb();
   }
 

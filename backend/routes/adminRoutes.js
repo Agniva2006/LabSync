@@ -249,8 +249,13 @@ router.post('/users/delete', async (req, res) => {
         deletedCount++;
         console.log(`🗑️ Deleted user: ${userId} (row ${rowIndex})`);
       } else {
-        console.warn(`⚠️ User not found for deletion: ${userId}`);
+        console.warn(`⚠️ User not found in Sheets for deletion: ${userId}`);
       }
+
+      // Also clean up from memory face database and localDb
+      try {
+        await faceService.deleteFace(userId);
+      } catch (e) {}
     }
 
     res.json({ success: true, message: `Deleted ${deletedCount} of ${userIds.length} users` });
