@@ -2398,41 +2398,46 @@ void sendHeartbeat() {
 // ENROLLMENT ERRORS
 // ============================================================
 
-String getFingerprintErrorString( int p) {
+String getFingerprintErrorString(int p) {
   switch (p) {
-  case 0x01:
-    return "Communication error";
+    case FINGERPRINT_OK:
+      return "OK";
 
-  case 0x02:
-    return "Imaging error";
+    case FINGERPRINT_PACKETRECIEVEERR:
+      return "Communication error";
 
-  case 0x03:
-    return "Bad image packet";
+    case FINGERPRINT_NOFINGER:
+      return "No finger detected";
 
-  case 0x06:
-    return "Image too messy";
+    case FINGERPRINT_IMAGEFAIL:
+      return "Fingerprint imaging failed";
 
-  case 0x07:
-    return "Features not found";
+    case FINGERPRINT_IMAGEMESS:
+      return "Image too messy";
 
-  case 0x08:
-    return "Invalid image";
+    case FINGERPRINT_FEATUREFAIL:
+      return "Fingerprint features not found";
 
-  case 0x0A:
-    return "Fingerprints mismatch";
+    case FINGERPRINT_NOMATCH:
+      return "Fingerprint does not match";
 
-  case 0x0B:
-    return "Invalid storage";
+    case FINGERPRINT_NOTFOUND:
+      return "Fingerprint not found";
 
-  case 0x18:
-    return "Flash error";
+    case FINGERPRINT_ENROLLMISMATCH:
+      return "Fingerprints mismatch";
 
-  case 0x1F:
-    return "Conversion failed";
+    case FINGERPRINT_BADLOCATION:
+      return "Invalid storage location";
 
-  default:
-    return "Unknown (" + String(p) + ")";
+    case FINGERPRINT_INVALIDIMAGE:
+      return "Invalid fingerprint image";
 
+    case FINGERPRINT_FLASHERR:
+      return "Fingerprint flash error";
+
+    default:
+      return "Fingerprint error 0x" + String(p, HEX);
   }
 }
 
