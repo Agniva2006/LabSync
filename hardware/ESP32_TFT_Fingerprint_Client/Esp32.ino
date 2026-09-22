@@ -73,6 +73,7 @@ constexpr int TFT_DC = 2;
 constexpr int TFT_MOSI = 23;
 constexpr int TFT_SCLK = 18;
 constexpr int TFT_MISO = 19;
+constexpr int TFT_LED = 21; // Connect TFT 'LED'/'BL' pin to GPIO 21 (or wire directly to 3.3V rail for always-on)
 
 constexpr uint8_t TFT_ROTATION = 2; // Portrait 240 x 320 (180-degree portrait orientation)
 
@@ -432,6 +433,9 @@ void updateIdleScreen() {
 void enterIdleMode() {
   systemState = STATE_IDLE;
 
+  // Keep fingerprint sensor optical backlight LED illuminated
+  finger.LEDcontrol(FINGERPRINT_LED_ON);
+
   tft.fillScreen( COLOR_BG );
 
   resetIdleAnimation();
@@ -579,6 +583,9 @@ bool verifyFingerprintSensor() {
   Serial.printf( "Capacity: %d\n", finger.capacity );
 
   Serial.printf( "Security: %d\n", finger.security_level );
+
+  // Keep optical sensor prism backlight LED always ON
+  finger.LEDcontrol(FINGERPRINT_LED_ON);
 
   return true;
 }
@@ -3414,6 +3421,15 @@ void setup() {
   pinMode( RELAY_PIN, OUTPUT );
 
   digitalWrite( RELAY_PIN, LOW );
+
+  // =========================================================
+  // TFT BACKLIGHT (ALWAYS ON)
+  // =========================================================
+
+  if (TFT_LED >= 0) {
+    pinMode( TFT_LED, OUTPUT );
+    digitalWrite( TFT_LED, HIGH );
+  }
 
   // =========================================================
   // TFT
