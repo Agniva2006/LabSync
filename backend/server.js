@@ -22,9 +22,11 @@ const dashboardRoutes = require('./routes/dashboardRoutes');
 
 // ==================== IMPORT MIDDLEWARE ====================
 const { verifyToken, verifyAdmin } = require('./middleware/authMiddleware');
+const deviceAuth = require('./middleware/deviceAuth');
 
 // ==================== IMPORT SERVICES ====================
 const faceService = require('./services/faceService');
+const { getStorageMode } = require('./services/sheetsService');
 
 // ==================== INITIALIZE EXPRESS ====================
 const app = express();
@@ -69,9 +71,28 @@ app.use(cors({
 // Handle preflight requests
 app.options('*', cors());
 
-// Body Parsers
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// Body Parsers.
+// The device HMAC covers a hash of the request body, so the raw bytes are
+// captured through body-parser's `verify` hook. Multipart requests are left
+// alone — those routes authenticate via requireDeviceAuth instead.
+app.use(express.json({
+  limit: '2mb',
+  verify: (req, res, buf) => { req.rawBody = deviceAuth.captureRawBody(buf); },
+}));
+app.use(express.urlencoded({
+  extended: true,
+  limit: '2mb',
+  verify: (req, res, buf) => { req.rawBody = deviceAuth.captureRawBody(buf); },
+}));
+
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
 
 // Static Files
 app.use('/models', express.static(path.join(__dirname, 'models')));
@@ -148,7 +169,24 @@ app.get('/api/status', (req, res) => {
     faceRecognition: {
       modelsLoaded: faceService.modelsLoaded,
       enrolledFaces: faceService.getEnrolledCount()
-    }
+    },
+    storage: getStorageMode()
+  });
+});
+
+// Diagnostic: confirm biometric descriptors will survive a restart, and list
+// exactly who is enrolled. Reachable from a phone/browser so no SSH is needed.
+app.get('/api/face/storage-health', async (req, res) => {
+  const mode = getStorageMode();
+  res.json({
+    success: true,
+    durable: mode.durable,
+    backend: mode.backend,
+    spreadsheetId: mode.spreadsheetId,
+    localDbPath: mode.localDbPath,
+    warning: mode.warning,
+    enrolledFaces: faceService.getEnrolledCount(),
+    enrolledUsers: faceService.getEnrolledUsers(),
   });
 });
 
@@ -157,7 +195,12 @@ app.get('/api/status', (req, res) => {
 // Public routes (no auth required)
 app.get('/api/wake', (req, res) => res.json({ success: true, message: 'Server awake', timestamp: new Date().toISOString() }));
 app.use('/api/auth', authLimiter, authRoutes);
-app.use('/api/esp32', esp32Routes);          // Hardware — no JWT (ESP32 can't carry tokens)
+
+// Hardware routes. Every endpoint requires a valid device HMAC signature.
+// This was previously mounted with no authentication at all, which meant any
+// host that could reach the server could queue an unlock command, enrol a face
+// for an arbitrary userId, or wipe the biometric database.
+app.use('/api/esp32', deviceAuth.verifyDeviceSignature, esp32Routes);
 
 // Apply global rate limiter to all other non-auth API routes
 app.use('/api/', globalLimiter);
@@ -168,8 +211,11 @@ app.use('/api/qr', verifyToken, qrRoutes);
 app.use('/api/notifications', verifyToken, notificationRoutes);
 app.use('/api/requests', verifyToken, requestRoutes);
 app.use('/api/dual-auth', verifyToken, dualAuthRoutes);
-app.use('/api/face', faceRoutes);            // Face verify called by ESP32 (no JWT)
-                                             // Face enroll/delete protected inside route
+// Face routes split by risk:
+//  - verify / enroll-hardware / status  -> reachable by a signed device OR a
+//    logged-in user (the ESP32 posts frames here)
+//  - enroll / delete                    -> app/admin only
+app.use('/api/face', faceRoutes);
 // Admin-only routes
 app.use('/api/admin', verifyToken, verifyAdmin, adminRoutes);
 app.use('/api/room-access', verifyToken, roomAccessRoutes);
@@ -302,6 +348,7 @@ async function startServer() {
     faceService.initialize().then(() => {
       console.log('✅ Face recognition service initialized successfully');
       console.log(`👥 Loaded ${faceService.getEnrolledCount()} enrolled faces`);
+      reportStorageDurability();
     }).catch(error => {
       console.error('⚠️  Face recognition initialization failed:', error.message);
       console.log('💡 Face features will be unavailable until models are downloaded');
@@ -315,6 +362,25 @@ async function startServer() {
 }
 
 // ==================== HELPER FUNCTIONS ====================
+
+/**
+ * Make biometric-data durability impossible to miss at boot. Losing face
+ * descriptors looks identical to "enrollment never worked", so it must never
+ * fail silently again.
+ */
+function reportStorageDurability() {
+  const mode = getStorageMode();
+  if (mode.durable) {
+    console.log('💾 [STORAGE] Durable backend: Google Sheets ✅');
+    return;
+  }
+  console.warn('\n╔══════════════════════════════════════════════════════════════╗');
+  console.warn('║  ⚠️  NON-DURABLE BIOMETRIC STORAGE DETECTED                 ║');
+  console.warn('╚══════════════════════════════════════════════════════════════╝');
+  console.warn(mode.warning.split('. ').map(l => '   • ' + l).join('\n'));
+  console.warn('   Faces loaded at boot: ' + faceService.getEnrolledCount());
+  console.warn('');
+}
 
 function formatUptime(seconds) {
   const days = Math.floor(seconds / 86400);

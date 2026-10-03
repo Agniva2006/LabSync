@@ -41,8 +41,15 @@ async function checkNightLockout(userId) {
       message: 'Night Lockout Policy Active (22:00 - 06:00). Contact admin for emergency access.' 
     };
   } catch (error) {
-    console.error('❌ Error checking night lockout:', error.message);
-    return { lockedOut: false }; // Fail open if error
+    // Fail CLOSED. Returning lockedOut:false here meant that any Google Sheets
+    // timeout silently disabled the night policy, letting anyone walk into a
+    // restricted lab between 22:00 and 06:00.
+    console.error('❌ Error checking night lockout — failing CLOSED:', error.message);
+    return {
+      lockedOut: true,
+      message: 'Access policy could not be verified. Please retry or contact the administrator.',
+      reason: 'policy_lookup_failed',
+    };
   }
 }
 

@@ -317,14 +317,18 @@ async function appendRow(sheetName, rowData) {
   localDb[cacheKey].push(rowObj);
   saveLocalDb();
 
-  // If online, also push to Google Sheets
+  // If online, also push to Google Sheets.
+  // NOTE: insertDataOption must stay 'OVERWRITE' (the default). 'INSERT_ROWS'
+  // physically shifts every existing row down, which invalidates every cached
+  // _rowNumber and makes a later updateRow() write a user's face descriptor
+  // onto a DIFFERENT user's row. Appending after the last populated row keeps
+  // row numbers stable.
   if (isSheetsConfigured && sheets) {
     try {
       const response = await withRetry(() => sheets.spreadsheets.values.append({
         spreadsheetId,
         range: `${sheetName}!A1`,
         valueInputOption: 'USER_ENTERED',
-        insertDataOption: 'INSERT_ROWS',
         resource: { values: [rowData] }
       }));
       console.log(`✅ [DATABASE-WRITE] (Sheets) Row appended to "${sheetName}" (${Date.now() - startTime}ms)`);
@@ -363,7 +367,11 @@ async function updateRow(sheetName, rowIndex, rowData) {
   const cacheKey = sheetName.toUpperCase();
   sheetDataCache.delete(cacheKey);
 
-  // Update local DB
+  // Update local DB.
+  // Match strictly on the primary key. Falling back to a _rowNumber match is
+  // unsafe: the local cache can hold a stale row number, and the fallback would
+  // silently overwrite an unrelated record. Appending a fresh row is far
+  // preferable to writing one user's face descriptor onto another's row.
   const headers = SHEET_HEADERS[cacheKey] || [];
   const rowObj = { _rowNumber: rowIndex };
   headers.forEach((h, idx) => {
@@ -373,16 +381,14 @@ async function updateRow(sheetName, rowIndex, rowData) {
   });
 
   if (!localDb[cacheKey]) localDb[cacheKey] = [];
-  
-  // Find matching row in localDb by ID or by _rowNumber
+
   const primaryKey = headers[0] ? headers[0].toLowerCase() : 'id';
-  const targetId = String(rowObj[primaryKey] || '').toLowerCase();
-  
-  const existingIdx = localDb[cacheKey].findIndex(item => {
-    if (targetId && String(item[primaryKey] || item[headers[0]] || '').toLowerCase() === targetId) return true;
-    if (item._rowNumber && item._rowNumber === rowIndex) return true;
-    return false;
-  });
+  const targetId = String(rowObj[primaryKey] || '').trim().toLowerCase();
+
+  const existingIdx = targetId
+    ? localDb[cacheKey].findIndex(item =>
+        String(item[primaryKey] || item[headers[0]] || '').trim().toLowerCase() === targetId)
+    : -1;
 
   if (existingIdx !== -1) {
     localDb[cacheKey][existingIdx] = { ...localDb[cacheKey][existingIdx], ...rowObj };
@@ -414,9 +420,13 @@ async function updateRow(sheetName, rowIndex, rowData) {
 
 /**
  * Find row index by column name and value (1-indexed row number for Sheets)
+ *
+ * @param {boolean} [opts.fresh] - bypass the 5s read cache. Use for any write
+ *   that targets a biometric row, so the physical row number is never stale.
  */
-async function findRowIndex(sheetName, columnName, value) {
+async function findRowIndex(sheetName, columnName, value, opts = {}) {
   try {
+    if (opts.fresh) sheetDataCache.delete(sheetName.toUpperCase());
     const data = await getSheetData(sheetName);
     if (!data || data.length === 0) return -1;
 
@@ -642,6 +652,27 @@ function getLocalDbData(sheetName) {
   return localDb[cacheKey] || [];
 }
 
+/**
+ * Report where writes are actually landing.
+ * On ephemeral hosts (Render, Railway free tiers, Heroku) local-only mode means
+ * every enrolled fingerprint/face descriptor is destroyed on the next deploy,
+ * which resurfaces to the user as "face not enrolled" long after it worked.
+ */
+function getStorageMode() {
+  return {
+    durable: isSheetsConfigured,
+    backend: isSheetsConfigured ? 'google-sheets' : 'local-db-file',
+    spreadsheetId: isSheetsConfigured ? spreadsheetId : null,
+    localDbPath,
+    warning: isSheetsConfigured
+      ? null
+      : 'Biometrics are stored ONLY in ' + localDbPath +
+        '. If this process runs on an ephemeral filesystem (Render/Railway/Heroku free), ' +
+        'every enrolled face and fingerprint is lost on the next deploy or restart. ' +
+        'Set GOOGLE_CREDENTIALS in backend/.env to persist to Google Sheets.',
+  };
+}
+
 module.exports = {
   getSheetData,
   getLocalDbData,
@@ -652,5 +683,6 @@ module.exports = {
   deleteRow,
   updatePartialRow,
   logAccessEvent,
+  getStorageMode,
   isSheetsConfigured: () => isSheetsConfigured
 };

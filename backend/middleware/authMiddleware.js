@@ -1,6 +1,22 @@
 const jwt = require('jsonwebtoken');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'labsync-super-secret-key-2024';
+/**
+ * JWT signing secret.
+ *
+ * Previously fell back to a literal committed to source control, which meant a
+ * missing .env silently produced forgeable tokens. There is no default: the
+ * server refuses to start rather than run on a known key.
+ */
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+  console.error('\n╔══════════════════════════════════════════════════════════════╗');
+  console.error('║  🔴 FATAL: JWT_SECRET missing or shorter than 32 characters  ║');
+  console.error('╚══════════════════════════════════════════════════════════════╝');
+  console.error('Set a strong secret in backend/.env before starting.');
+  console.error('Generate one with:  node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"\n');
+  process.exit(1);
+}
 
 /**
  * Middleware: verify JWT token from Authorization header

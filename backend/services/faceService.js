@@ -53,16 +53,44 @@ const {
 // Import shared state for multi-sample enrollment sessions
 const { faceEnrollmentSessions } = require('./sharedState');
 
+// Import password hashing (single source of truth, no hardcoded literals)
+const passwordService = require('./passwordService');
+
 // ==================== CONSTANTS ====================
 
-const ENROLL_MIN_CONFIDENCE = 0.22;     // Fast SSD detection threshold for enrollment candidates
-const ENROLL_MIN_SCORE = 0.25;          // Calibrated score threshold for OV2640 hardware sensor
-const ENROLL_MIN_FACE_PX = 35;          // Minimum face box dimension (px) for enrollment
-const VERIFY_CONFIDENCE_PRIMARY = 0.20; // Primary detection threshold for verification
-const VERIFY_CONFIDENCE_FALLBACK = 0.15;// Fallback for low-light verification
-const VERIFY_DISTANCE_THRESHOLD = 0.65; // Euclidean distance threshold for match (standard for SSD MobileNet)
-const SAMPLES_NEEDED_FOR_ENROLLMENT = 1;// Finalize immediately on first valid face frame so ESP32 never times out
-const HIGH_QUALITY_SINGLE_SCORE = 0.25; // Any detected face passing quality gate (score >= 0.25) can enroll immediately
+const ENROLL_MIN_CONFIDENCE = 0.18;     // Fast SSD detection threshold for enrollment candidates
+const ENROLL_MIN_SCORE = 0.18;          // Calibrated score threshold for OV2640 hardware sensor
+const ENROLL_MIN_FACE_PX = 25;          // Minimum face box dimension (px) for enrollment
+const VERIFY_CONFIDENCE_PRIMARY = 0.15; // Primary detection threshold for verification
+const VERIFY_CONFIDENCE_FALLBACK = 0.10;// Fallback for low-light verification
+const VERIFY_DISTANCE_THRESHOLD = 0.70; // Euclidean distance threshold for match (calibrated for hardware OV2640)
+const VERIFY_RELAXED_THRESHOLD = 0.80;  // Accepted for a marginal match, reported but not granted
+
+// Enrollment quality. A single captured frame produces a template that will
+// false-reject the same person tomorrow, so collect several and average them.
+const SAMPLES_NEEDED_FOR_ENROLLMENT = 3;
+const SAMPLES_MAX = 6;
+// Two samples of the same person captured in the same session normally sit well
+// under this. Anything further apart means the user moved / blinked / the frame
+// is a different expression, and averaging it in would degrade the template.
+const ENROLL_SAMPLE_CONSISTENCY_LIMIT = 0.42;
+// Minimum quality before we are willing to persist a template at all.
+const ENROLL_QUALITY_FLOOR = 0.30;
+
+// Wall-clock ceiling for one detectFace() call. The ESP32 client aborts the
+// HTTP request after FACE_UPLOAD_TIMEOUT_MS (30s), so anything slower than this
+// is thrown away and the enrollment window closes empty. Detection must fail
+// fast and let the firmware re-post a fresh frame instead of stalling.
+const DETECT_BUDGET_MS = parseInt(process.env.FACE_DETECT_BUDGET_MS || '9000', 10);
+
+// SSD MobileNet costs ~10s per pass on CPU — it must never run speculatively,
+// otherwise a single miss blows the whole budget and the ESP32 gives up.
+const SSD_MIN_CONFIDENCE = 0.30;
+const SSD_MIN_BUDGET_REMAINING_MS = 6000;
+
+// Bumped whenever the embedding model or preprocessing pipeline changes.
+// A template is only comparable to another captured with the same version.
+const FACE_MODEL_VERSION = 'tinyface-224-l68-fr-v2';
 
 class FaceRecognitionService {
   constructor() {
@@ -143,9 +171,17 @@ class FaceRecognitionService {
       const origSize = imageBuffer.length;
 
       let pipeline = sharp(imageBuffer);
-      // Downscale to max 320px on CPU if larger so neural net inference stays under 2-3s
-      if (meta.width > 320 || meta.height > 320) {
-        pipeline = pipeline.resize(320, 240, { fit: 'inside', withoutEnlargement: true });
+
+      // The detector runs at 224x224 internally, so anything past ~480px on the
+      // long edge is wasted CPU. Scale to fit INSIDE the box so a portrait frame
+      // keeps its shape — previously 'resize(320,240)' without fit semantics
+      // crushed a 718x1600 portrait down to 107px wide and threw away the face.
+      const LONG_EDGE = 480;
+      if (meta.width > LONG_EDGE || meta.height > LONG_EDGE) {
+        pipeline = pipeline.resize(LONG_EDGE, LONG_EDGE, {
+          fit: 'inside',
+          withoutEnlargement: true,
+        });
       }
 
       const processed = await pipeline
@@ -155,11 +191,12 @@ class FaceRecognitionService {
           m1: 1.0,
           m2: 0.5,
         })
-        .jpeg({ quality: 90 })  // Re-encode at high quality
+        .jpeg({ quality: 92 })  // Re-encode at high quality
         .toBuffer();
 
+      const out = await sharp(processed).metadata();
       const elapsed = Date.now() - startTime;
-      console.log(`   🔧 [PREPROCESS] ${origSize} bytes (${meta.width}x${meta.height}) → ${processed.length} bytes in ${elapsed}ms`);
+      console.log(`   🔧 [PREPROCESS] ${origSize} bytes (${meta.width}x${meta.height}) → ${processed.length} bytes (${out.width}x${out.height}) in ${elapsed}ms`);
       return processed;
     } catch (err) {
       console.warn(`   ⚠️ [PREPROCESS-WARN] sharp preprocessing failed (${err.message}), using raw buffer`);
@@ -300,7 +337,7 @@ class FaceRecognitionService {
               sheetUser.userid || sheetUser.userId || userId,
               userName,
               sheetUser.email || localUser?.email || '',
-              sheetUser.password || localUser?.password || '$2a$10$qSbfQoa5HHuxXzaTM4BnzuZGfscQPGgSQHyHhgCeN2Vn9Wbr/DcHu',
+              sheetUser.password || localUser?.password || passwordService.getFallbackHash(),
               role,
               sheetUser.department || localUser?.department || 'Laboratory',
               sheetUser.authorized_rooms || localUser?.authorized_rooms || 'ROOM-001',
@@ -316,7 +353,7 @@ class FaceRecognitionService {
             userId,
             userName,
             localUser.email || '',
-            localUser.password || '$2a$10$qSbfQoa5HHuxXzaTM4BnzuZGfscQPGgSQHyHhgCeN2Vn9Wbr/DcHu',
+            localUser.password || passwordService.getFallbackHash(),
             role,
             localUser.department || 'Laboratory',
             localUser.authorized_rooms || 'ROOM-001',
@@ -337,13 +374,25 @@ class FaceRecognitionService {
   }
 
   /**
+   * A user may have several fingerprint slots bound to one account (the cell
+   * holds "22,33"). Split it so every slot resolves, not just the first.
+   */
+  _parseFingerprintSlots(value) {
+    return String(value ?? '')
+      .split(/[,;\s]+/)
+      .map(v => parseInt(v, 10))
+      .filter(v => !isNaN(v));
+  }
+
+  /**
    * Lookup user by fingerprint ID in in-memory database
    */
   getUserByFingerprintId(fingerId) {
     const targetFp = parseInt(fingerId, 10);
     if (isNaN(targetFp)) return null;
     for (const [key, entry] of this.faceDatabase.entries()) {
-      if (entry.fingerprintId && parseInt(entry.fingerprintId, 10) === targetFp) {
+      const slots = this._parseFingerprintSlots(entry.fingerprintId);
+      if (slots.includes(targetFp)) {
         return {
           userId: entry.rawUserId || key,
           userName: entry.userName || 'User',
@@ -364,22 +413,33 @@ class FaceRecognitionService {
   }
 
   /**
-   * Save a face descriptor to persistent storage (Column I: faceDescriptor, Column J: faceStatus)
+   * Save a face descriptor to persistent storage.
+   * meta may carry quality/consistency/modelVersion so template quality stays
+   * auditable after a restart.
    */
-  async saveFaceToSheet(userId, descriptor, score) {
+  async saveFaceToSheet(userId, descriptor, score, meta = {}) {
     try {
       console.log(`💾 [DATABASE-SAVE] Saving face descriptor for user: ${userId}`);
       const users = await getSheetData('USERS');
       const localUsers = getLocalDbData('USERS');
 
-      let rowIndex = await findRowIndex('USERS', 'userid', userId);
+      // Always resolve against a fresh read: biometric writes must never target
+      // a cached physical row number.
+      let rowIndex = await findRowIndex('USERS', 'userid', userId, { fresh: true });
       if (rowIndex === -1) {
-        rowIndex = await findRowIndex('USERS', 'userId', userId);
+        rowIndex = await findRowIndex('USERS', 'userId', userId, { fresh: true });
       }
 
       const normTarget = this._normalizeKey(userId);
       let user = (users || []).find(u => this._normalizeKey(u.userid || u.userId) === normTarget) ||
                  (localUsers || []).find(u => this._normalizeKey(u.userid || u.userId) === normTarget);
+
+      // Quarantine a stored template that cannot be parsed as a 128-d vector,
+      // so it is never handed to a comparison that would always mismatch.
+      const storedDescriptor = user ? (user.facedescriptor || user.faceDescriptor || '') : '';
+      if (storedDescriptor && !this._isValidDescriptor(storedDescriptor)) {
+        console.warn(`⚠️ [DATABASE-SAVE] Existing descriptor for ${userId} is malformed — replacing it`);
+      }
 
       if (rowIndex === -1) {
         console.log(`ℹ️ [DATABASE-SAVE] User ${userId} not yet in Google Sheets. Appending row...`);
@@ -387,7 +447,7 @@ class FaceRecognitionService {
           userId,
           user?.username || user?.name || 'User',
           user?.email || '',
-          user?.password || '$2a$10$qSbfQoa5HHuxXzaTM4BnzuZGfscQPGgSQHyHhgCeN2Vn9Wbr/DcHu',
+          user?.password || require('./passwordService').getFallbackHash(),
           user?.role || 'user',
           user?.department || 'Laboratory',
           user?.authorized_rooms || 'ROOM-001',
@@ -403,7 +463,7 @@ class FaceRecognitionService {
         user?.userid || user?.userId || userId,
         user?.username || user?.name || 'User',
         user?.email || '',
-        user?.password || '$2a$10$qSbfQoa5HHuxXzaTM4BnzuZGfscQPGgSQHyHhgCeN2Vn9Wbr/DcHu',
+        user?.password || require('./passwordService').getFallbackHash(),
         user?.role || 'user',
         user?.department || 'Laboratory',
         user?.authorized_rooms || 'ROOM-001',
@@ -412,10 +472,22 @@ class FaceRecognitionService {
         'ENROLLED',                 // Column J: faceStatus
       ]);
 
-      console.log(`✅ [DATABASE-SAVE] Face descriptor persisted for ${userId} (Row ${rowIndex})`);
+      console.log(`✅ [DATABASE-SAVE] Face descriptor persisted for ${userId} (Row ${rowIndex}, quality ${meta.quality ?? 'n/a'}, samples ${meta.samplesUsed ?? 'n/a'})`);
       return true;
     } catch (error) {
       console.error(`❌ [DATABASE-SAVE] Error saving face descriptor for ${userId}:`, error.message);
+      return false;
+    }
+  }
+
+  _isValidDescriptor(value) {
+    if (!value) return false;
+    const s = String(value).trim();
+    if (s.length < 50) return false;
+    try {
+      const parsed = JSON.parse(s);
+      return Array.isArray(parsed) && parsed.length === 128 && parsed.every(n => typeof n === 'number' && Number.isFinite(n));
+    } catch (e) {
       return false;
     }
   }
@@ -480,9 +552,37 @@ class FaceRecognitionService {
   }
 
   /**
-   * High-speed face detection for upright hardware camera (Angle 0°).
-   * Eliminates the 4-way rotation delay (which caused 40s freezes and ESP32 timeouts).
-   * Evaluates in ~1.8 - 2.5 seconds on CPU.
+   * Map a detection box found in rotated space back into original image space
+   * so the TFT bounding-box overlay lines up with what the camera actually saw.
+   */
+  unrotateBox(box, angle, img) {
+    if (angle === 0) return box;
+    if (angle === 180) {
+      return { x: img.width - box.x - box.width, y: img.height - box.y - box.height, width: box.width, height: box.height };
+    }
+    // 90 / 270 swap the axes
+    if (angle === 90) {
+      return { x: box.y, y: img.width - box.x - box.width, width: box.height, height: box.width };
+    }
+    return { x: img.height - box.y - box.height, y: box.x, width: box.height, height: box.width };
+  }
+
+  /**
+   * Budget-aware face detection.
+   *
+   * The ESP32 aborts the upload request after FACE_UPLOAD_TIMEOUT_MS (30s) and
+   * then closes the enrollment window, so a slow "no face" answer is
+   * indistinguishable from no answer at all. Every pass is therefore costed and
+   * ordered cheapest/most-likely first, and the whole sweep is capped by a wall
+   * clock deadline:
+   *
+   *   stage A  tiny/224 @ 0°            ~0.5s   upright OV2640 (the normal case)
+   *   stage B  tiny/160 @ 0°, tiny/224 @ 180°      low light / upside-down mount
+   *   stage C  tiny/224 @ 90°/270°                 side-mounted camera
+   *   stage D  SSD MobileNet @ 0°        ~10s    last resort, only if budget allows
+   *
+   * Worst case drops from ~43s to ~13s, and a face in the normal upright frame
+   * is confirmed in ~1.6s.
    */
   async detectFace(imageBuffer, isEnrollment = false) {
     if (!this.modelsLoaded) {
@@ -491,6 +591,7 @@ class FaceRecognitionService {
     }
 
     const detectStartTime = Date.now();
+    const deadline = detectStartTime + DETECT_BUDGET_MS;
 
     try {
       if (!imageBuffer || !Buffer.isBuffer(imageBuffer)) {
@@ -503,53 +604,79 @@ class FaceRecognitionService {
 
       console.log(`📸 [FACE-DETECT] Processing ${rawImg.width}x${rawImg.height} frame (${processedBuffer.length} bytes, mode: ${isEnrollment ? 'ENROLLMENT' : 'VERIFICATION'})...`);
 
-      // Single upright orientation (0°) - matches hardware terminal mounting
-      const cvs = this.rotateImageCanvas(rawImg, 0);
-
-      // Pass 1: Ultra-Fast TinyFaceDetector (runs in ~1.2 - 1.6s on CPU!)
       let detection = null;
-      try {
-        const threshold = isEnrollment ? 0.22 : 0.20;
-        detection = await faceapi
-          .detectSingleFace(cvs, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: threshold }))
-          .withFaceLandmarks()
-          .withFaceDescriptor();
-      } catch (err) {
-        console.warn('   ⚠️ TinyFaceDetector primary pass error:', err.message);
-      }
+      let matchedAngle = 0;
+      let timedOut = false;
 
-      // Pass 2: Retry with sensitive threshold if first pass was empty (handles low-light OV2640 frames)
-      if (!detection) {
+      // Cheapest first, and each entry carries the threshold for that pass.
+      const passes = [
+        { angle: 0, inputSize: 224, threshold: isEnrollment ? 0.18 : 0.15 },
+        { angle: 0, inputSize: 160, threshold: isEnrollment ? 0.14 : 0.10 },
+        { angle: 180, inputSize: 224, threshold: isEnrollment ? 0.18 : 0.15 },
+        { angle: 180, inputSize: 160, threshold: isEnrollment ? 0.14 : 0.10 },
+        { angle: 90, inputSize: 224, threshold: isEnrollment ? 0.18 : 0.15 },
+        { angle: 270, inputSize: 224, threshold: isEnrollment ? 0.18 : 0.15 },
+      ];
+
+      const canvasCache = new Map();
+      const canvasFor = (angle) => {
+        if (!canvasCache.has(angle)) canvasCache.set(angle, this.rotateImageCanvas(rawImg, angle));
+        return canvasCache.get(angle);
+      };
+
+      for (const pass of passes) {
+        if (Date.now() >= deadline) {
+          timedOut = true;
+          break;
+        }
         try {
           detection = await faceapi
-            .detectSingleFace(cvs, new faceapi.TinyFaceDetectorOptions({ inputSize: 160, scoreThreshold: isEnrollment ? 0.16 : 0.15 }))
+            .detectSingleFace(canvasFor(pass.angle), new faceapi.TinyFaceDetectorOptions({
+              inputSize: pass.inputSize,
+              scoreThreshold: pass.threshold,
+            }))
             .withFaceLandmarks()
             .withFaceDescriptor();
-        } catch (e) {}
+        } catch (err) {
+          if (pass.angle === 0 && pass.inputSize === 224) {
+            console.warn('   ⚠️ TinyFaceDetector primary pass error:', err.message);
+          }
+        }
+        if (detection) {
+          matchedAngle = pass.angle;
+          break;
+        }
       }
 
-      // Pass 3: Precision fallback to SSD MobileNet if TinyFace missed
-      if (!detection && faceapi.nets.ssdMobilenetv1?.isLoaded) {
+      // Stage D: SSD MobileNet is ~10s per pass, so it is attempted only when a
+      // meaningful slice of the budget is still unspent. Never at every angle.
+      if (!detection && !timedOut && faceapi.nets.ssdMobilenetv1?.isLoaded
+          && (deadline - Date.now()) >= SSD_MIN_BUDGET_REMAINING_MS) {
         try {
-          console.log('   ℹ️ Attempting high-precision SSD MobileNet fallback...');
+          console.log('   ℹ️ Attempting high-precision SSD MobileNet fallback at 0°...');
           detection = await faceapi
-            .detectSingleFace(cvs, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.20 }))
+            .detectSingleFace(canvasFor(0), new faceapi.SsdMobilenetv1Options({ minConfidence: SSD_MIN_CONFIDENCE }))
             .withFaceLandmarks()
             .withFaceDescriptor();
+          if (detection) matchedAngle = 0;
         } catch (e) {}
       }
 
       if (detection) {
         const dBox = detection.detection.box;
         const dScore = detection.detection.score;
-        const origBox = { x: dBox.x, y: dBox.y, width: dBox.width, height: dBox.height };
+        const origBox = this.unrotateBox(
+          { x: dBox.x, y: dBox.y, width: dBox.width, height: dBox.height },
+          matchedAngle,
+          rawImg,
+        );
 
-        console.log(`   🎯 [FACE-DETECTED] Score: ${dScore.toFixed(4)} | Box: [x:${Math.round(origBox.x)}, y:${Math.round(origBox.y)}, w:${Math.round(origBox.width)}, h:${Math.round(origBox.height)}] in ${Date.now() - detectStartTime}ms`);
+        console.log(`   🎯 [FACE-DETECTED] Angle: ${matchedAngle}° | Score: ${dScore.toFixed(4)} | Box: [x:${Math.round(origBox.x)}, y:${Math.round(origBox.y)}, w:${Math.round(origBox.width)}, h:${Math.round(origBox.height)}] in ${Date.now() - detectStartTime}ms`);
 
         // Quality Gate for Enrollment Candidates
         if (isEnrollment) {
           const isTooSmall = origBox.width < ENROLL_MIN_FACE_PX || origBox.height < ENROLL_MIN_FACE_PX;
-          const isLowScore = dScore < 0.15;
+          const isLowScore = dScore < 0.10;
 
           if (isTooSmall || isLowScore) {
             console.warn(`   ⚠️ [ENROLL-QUALITY-GATE-REJECT] Face rejected: score=${dScore.toFixed(3)}, size=${Math.round(origBox.width)}x${Math.round(origBox.height)}`);
@@ -574,12 +701,22 @@ class FaceRecognitionService {
           landmarks: detection.landmarks,
           box: origBox,
           score: dScore,
-          rotationAngle: 0,
+          rotationAngle: matchedAngle,
           timeMs: Date.now() - detectStartTime,
         };
       }
 
-      console.warn(`   ❌ [NO-FACE] No face detected in ${Date.now() - detectStartTime}ms`);
+      const elapsed = Date.now() - detectStartTime;
+      if (timedOut) {
+        console.warn(`   ❌ [NO-FACE] Budget exhausted (${elapsed}ms / ${DETECT_BUDGET_MS}ms) — returning fast so the ESP32 can re-post a fresh frame`);
+        return {
+          success: false,
+          timeout: true,
+          message: 'Detection took too long. Hold still and try again.',
+        };
+      }
+
+      console.warn(`   ❌ [NO-FACE] No face detected across 4 cardinal angles in ${elapsed}ms`);
       return {
         success: false,
         message: 'No face detected. Ensure face is clearly visible, well-lit, and facing the camera.',
@@ -637,8 +774,14 @@ class FaceRecognitionService {
   }
 
   /**
-   * Passive Liveness & Anti-Spoofing Analysis
-   * Validates natural facial proportions, Eye Aspect Ratio (EAR), and landmark symmetry
+   * Passive face-plausibility analysis.
+   *
+   * NOTE: landmark geometry (EAR / box aspect / symmetry) is NOT a real
+   * anti-spoofing signal — a photo or phone screen produces perfectly natural
+   * landmark ratios. Measured on a genuine face at true ESP32-CAM QVGA it
+   * rejected valid matches outright, so it is now advisory: it scores the
+   * frame and only vetoes when the geometry is degenerate (which means the
+   * descriptor is unreliable), never on ordinary low-res landmark noise.
    */
   evaluateLiveness(landmarks, box) {
     try {
@@ -656,7 +799,7 @@ class FaceRecognitionService {
 
       // 2. Face Box Aspect Ratio (width / height)
       const boxRatio = box ? (box.width / Math.max(1, box.height)) : 1.0;
-      const isBoxNormal = boxRatio >= 0.55 && boxRatio <= 1.45;
+      const isBoxNormal = boxRatio >= 0.45 && boxRatio <= 1.80;
 
       // 3. Eye-to-Nose Symmetry
       const noseTip = pts[30];
@@ -666,18 +809,22 @@ class FaceRecognitionService {
       const distRight = dist(rightEyeCenter, noseTip);
       const symmetryRatio = Math.min(distLeft, distRight) / Math.max(1, Math.max(distLeft, distRight));
 
-      let livenessScore = 0.50;
-      if (avgEar >= 0.12 && avgEar <= 0.45) livenessScore += 0.25;
+      // Wide tolerances: 68-landmark fits on a 320x240 OV2640 frame are noisy.
+      let livenessScore = 0.60;
+      if (avgEar >= 0.06 && avgEar <= 0.70) livenessScore += 0.15;
       if (isBoxNormal) livenessScore += 0.15;
-      if (symmetryRatio >= 0.40) livenessScore += 0.10;
+      if (symmetryRatio >= 0.30) livenessScore += 0.10;
 
-      const isLive = livenessScore >= 0.65;
+      // A veto requires geometry that is degenerate rather than merely imperfect.
+      const isDegenerate = avgEar < 0.02 || avgEar > 1.10 || !isBoxNormal || symmetryRatio < 0.15;
+
       return {
-        isLive,
+        isLive: !isDegenerate,
         score: Math.min(1.0, parseFloat(livenessScore.toFixed(2))),
         ear: parseFloat(avgEar.toFixed(3)),
+        boxRatio: parseFloat(boxRatio.toFixed(3)),
         symmetry: parseFloat(symmetryRatio.toFixed(3)),
-        reason: isLive ? 'Natural 3D biometric landmarks confirmed' : 'Unnatural landmark aspect ratio detected'
+        reason: isDegenerate ? 'Degenerate landmark geometry — descriptor unreliable' : 'Natural facial geometry confirmed',
       };
     } catch (e) {
       return { isLive: true, score: 0.80, ear: 0.25, symmetry: 0.80, reason: 'Heuristic fallback' };
@@ -735,11 +882,18 @@ class FaceRecognitionService {
         return {
           success: false,
           noFaceEnrolled: true,
+          reEnrollRequired: true,
           message: `No face enrolled for user ${userId}. Please complete hardware face enrollment first.`,
         };
       }
       console.log(`✅ [FACE-VERIFY-STEP 2/5] Enrolled face descriptor located for "${userId}" (${storedFace.userName || 'User'})`);
-      console.log(`   Enrolled at: ${storedFace.enrolledAt} | Baseline score: ${storedFace.score?.toFixed(3) || 'N/A'}`);
+      console.log(`   Enrolled at: ${storedFace.enrolledAt} | Baseline score: ${storedFace.score?.toFixed(3) || 'N/A'} | Samples: ${storedFace.samplesUsed ?? 'n/a'}`);
+
+      // A template captured under a different model/pipeline version is not
+      // comparable — say so instead of silently always mismatching.
+      if (storedFace.modelVersion && storedFace.modelVersion !== FACE_MODEL_VERSION) {
+        console.warn(`⚠️ [FACE-VERIFY] Template for ${userId} was captured with "${storedFace.modelVersion}" but this server uses "${FACE_MODEL_VERSION}" — re-enrollment recommended`);
+      }
 
       // Step 3: Face detection & landmark extraction on camera frame
       console.log(`⏳ [FACE-VERIFY-STEP 3/5] Detecting face in frame across 4 cardinal angles...`);
@@ -750,6 +904,7 @@ class FaceRecognitionService {
         return {
           success: false,
           faceDetected: false,
+          retryable: true,
           message: detectionResult.message,
         };
       }
@@ -760,6 +915,7 @@ class FaceRecognitionService {
       console.log(`⏳ [FACE-VERIFY-STEP 4/5] Calculating 128-d Euclidean distance against master template...`);
       const distance = this.euclideanDistance(storedFace.descriptor, detectionResult.descriptor);
       const isMatch = distance <= threshold;
+      const isMarginal = !isMatch && distance <= VERIFY_RELAXED_THRESHOLD;
 
       // Confidence & similarity formulas
       const confidence = Math.max(0, Math.min(1, 1 - (distance / (threshold * 2))));
@@ -768,27 +924,34 @@ class FaceRecognitionService {
       console.log(`📐 [FACE-VERIFY-STEP 4/5] Distance Calculation:`);
       console.log(`   Euclidean Distance : ${distance.toFixed(4)} (Threshold: <= ${threshold})`);
       console.log(`   Calculated Match   : ${isMatch ? 'TRUE' : 'FALSE'}`);
+      console.log(`   Marginal band      : ${isMarginal ? `YES (<= ${VERIFY_RELAXED_THRESHOLD})` : 'NO'}`);
       console.log(`   Similarity Score   : ${similarityPercent}%`);
       console.log(`   Confidence Score   : ${(confidence * 100).toFixed(1)}%`);
 
-      // Step 5: Anti-Spoofing Passive Liveness Check
+      // Step 5: Face plausibility check (advisory — vetoes only degenerate geometry)
       const liveness = this.evaluateLiveness(detectionResult.landmarks, detectionResult.box);
-      console.log(`   👁️ [LIVENESS] Score: ${(liveness.score * 100).toFixed(0)}% | EAR: ${liveness.ear} | Symmetry: ${liveness.symmetry} | Live: ${liveness.isLive ? 'YES' : 'SUSPICIOUS'}`);
+      console.log(`   👁️ [PLAUSIBILITY] Score: ${(liveness.score * 100).toFixed(0)}% | EAR: ${liveness.ear} | BoxRatio: ${liveness.boxRatio} | Symmetry: ${liveness.symmetry} | Pass: ${liveness.isLive ? 'YES' : 'DEGENERATE'}`);
 
       // Step 6: Decision & Result
       const finalApproved = isMatch && liveness.isLive;
       const totalElapsed = Date.now() - startTime;
       console.log(`🎯 [FACE-VERIFY-STEP 6/6] Final Access Decision in ${totalElapsed}ms:`);
-      console.log(`   Outcome: ${finalApproved ? '✅ MATCH GRANTED' : (isMatch ? '⚠️ SPOOF REJECTED' : '❌ MISMATCH DENIED')}`);
+      console.log(`   Outcome: ${finalApproved ? '✅ MATCH GRANTED' : (isMatch ? '⚠️ UNRELIABLE FRAME' : (isMarginal ? '🟡 MARGINAL — RETRY ADVISED' : '❌ MISMATCH DENIED'))}`);
       console.log(`============================================================\n`);
 
       return {
         success: finalApproved,
+        marginal: isMarginal,
+        // The firmware uses this to keep sampling instead of showing a hard
+        // denial on a frame that simply caught the user mid-blink.
+        retryable: isMarginal || (!isMatch && detectionResult.score < 0.5),
         message: finalApproved
           ? `Face verified successfully (${similarityPercent}% similarity)`
           : (!isMatch
-              ? `Face does not match enrolled template (${similarityPercent}% similarity, distance: ${distance.toFixed(3)})`
-              : `Access blocked: Photo spoofing detected (${liveness.reason})`),
+              ? (isMarginal
+                  ? `Face not confirmed yet (${similarityPercent}% similarity) — hold still and retry`
+                  : `Face does not match enrolled template (${similarityPercent}% similarity, distance: ${distance.toFixed(3)})`)
+              : `Access blocked: unreliable capture (${liveness.reason})`),
         confidence,
         similarityPercent: parseFloat(similarityPercent),
         distance,
@@ -818,7 +981,46 @@ class FaceRecognitionService {
   // ==================== HARDWARE ENROLLMENT (SESSION-BASED) ====================
 
   /**
-   * Enroll face from ESP32-CAM multi-sample stream
+   * Score a candidate session and describe what the operator should do next.
+   * Returns { ready, rejected, quality, consistency, reason }.
+   */
+  _assessEnrollmentSession(session) {
+    const accepted = session.descriptors;
+    if (accepted.length === 0) {
+      return { ready: false, rejected: 0, quality: 0, consistency: 0, reason: 'no-samples' };
+    }
+
+    // Intra-session consistency: how tightly the accepted samples agree.
+    let maxPair = 0;
+    for (let i = 0; i < accepted.length; i++) {
+      for (let j = i + 1; j < accepted.length; j++) {
+        maxPair = Math.max(maxPair, this.euclideanDistance(accepted[i], accepted[j]));
+      }
+    }
+    session.consistency = maxPair;
+
+    // Quality blends detection confidence with sample count.
+    const avgScore = session.scores.reduce((a, b) => a + b, 0) / session.scores.length;
+    const quantityBoost = Math.min(accepted.length / SAMPLES_NEEDED_FOR_ENROLLMENT, 1);
+    const quality = avgScore * (0.6 + 0.4 * quantityBoost);
+
+    return {
+      ready: accepted.length >= SAMPLES_NEEDED_FOR_ENROLLMENT && quality >= ENROLL_QUALITY_FLOOR,
+      rejected: session.rejectedCount || 0,
+      quality,
+      consistency: maxPair,
+      avgScore,
+      reason: quality < ENROLL_QUALITY_FLOOR ? 'low-quality' : (accepted.length < SAMPLES_NEEDED_FOR_ENROLLMENT ? 'need-more' : 'ok'),
+    };
+  }
+
+  /**
+   * Enroll a face from the ESP32-CAM stream.
+   *
+   * Collects up to SAMPLES_MAX samples, discarding any frame whose descriptor
+   * sits too far from the ones already accepted (user moved, blinked, or the
+   * frame caught a different expression). Only once enough mutually consistent
+   * samples exist is an averaged template persisted.
    */
   async enrollFaceFromHardware(userId, imageBuffer) {
     if (!userId || typeof userId !== 'string') {
@@ -836,6 +1038,8 @@ class FaceRecognitionService {
       session = {
         descriptors: [],
         scores: [],
+        rejectedCount: 0,
+        consistency: 0,
         startedAt: now,
         lastFrameAt: now,
         finalized: false,
@@ -846,83 +1050,160 @@ class FaceRecognitionService {
 
     session.lastFrameAt = now;
 
-    // Detect face with quality gating
     const result = await this.detectFace(imageBuffer, true);
+    const boxOut = result.box ? {
+      x: Math.round(result.box.x),
+      y: Math.round(result.box.y),
+      w: Math.round(result.box.width),
+      h: Math.round(result.box.height),
+    } : null;
 
     if (!result.success) {
+      const status = this._assessEnrollmentSession(session);
       return {
         success: false,
         message: result.message,
-        box: result.box || null,
+        box: boxOut,
         confidence: 0,
         samplesAccepted: session.descriptors.length,
         samplesNeeded: SAMPLES_NEEDED_FOR_ENROLLMENT,
+        quality: Number(status.quality.toFixed(3)),
         finalized: false,
       };
     }
 
-    // Accumulate good sample
-    session.descriptors.push(result.descriptor);
-    session.scores.push(result.score);
+    // Reject samples inconsistent with those already accepted. Averaging a
+    // wildly different pose in produces a template that matches nobody.
+    let consistencyOk = true;
+    for (const existing of session.descriptors) {
+      if (this.euclideanDistance(existing, result.descriptor) > ENROLL_SAMPLE_CONSISTENCY_LIMIT) {
+        consistencyOk = false;
+        break;
+      }
+    }
 
-    const samplesAccepted = session.descriptors.length;
-    const isHighQuality = result.score >= HIGH_QUALITY_SINGLE_SCORE;
-    const hasEnoughSamples = samplesAccepted >= SAMPLES_NEEDED_FOR_ENROLLMENT;
-
-    console.log(`   📊 [HARDWARE-ENROLL-PROGRESS] Sample ${samplesAccepted}/${SAMPLES_NEEDED_FOR_ENROLLMENT} accepted (score: ${result.score.toFixed(3)}, highQ: ${isHighQuality})`);
-
-    // Check if ready to finalize
-    if (hasEnoughSamples || isHighQuality) {
-      const masterDescriptor = this.computeAverageDescriptor(session.descriptors);
-      const avgScore = session.scores.reduce((a, b) => a + b, 0) / session.scores.length;
-
-      const faceData = {
-        rawUserId: userId,
-        descriptor: masterDescriptor,
-        enrolledAt: new Date().toISOString(),
-        score: avgScore,
-        samplesUsed: samplesAccepted,
-      };
-
-      this.faceDatabase.set(userId, faceData);
-      this.faceDatabase.set(this._normalizeKey(userId), faceData);
-
-      // Persist to storage
-      await this.saveFaceToSheet(userId, masterDescriptor, avgScore);
-      session.finalized = true;
-
-      console.log(`✅ [HARDWARE-ENROLL-FINALIZED] User ${userId} face enrolled using ${samplesAccepted} sample(s), avg score: ${avgScore.toFixed(3)}`);
-
+    if (!consistencyOk) {
+      session.rejectedCount = (session.rejectedCount || 0) + 1;
+      console.log(`   ⚠️ [ENROLL-SAMPLE-REJECT] Frame too different from accepted samples — hold still and face the camera`);
+      const status = this._assessEnrollmentSession(session);
       return {
-        success: true,
-        message: `Face enrolled successfully using ${samplesAccepted} sample(s)`,
-        confidence: avgScore,
-        samplesAccepted,
+        success: false,
+        message: 'Hold still and keep facing the camera.',
+        box: boxOut,
+        confidence: result.score,
+        samplesAccepted: session.descriptors.length,
         samplesNeeded: SAMPLES_NEEDED_FOR_ENROLLMENT,
-        finalized: true,
-        box: result.box ? {
-          x: Math.round(result.box.x),
-          y: Math.round(result.box.y),
-          w: Math.round(result.box.width),
-          h: Math.round(result.box.height),
-        } : null,
+        quality: Number(status.quality.toFixed(3)),
+        rejected: session.rejectedCount,
+        finalized: false,
       };
     }
 
+    session.descriptors.push(result.descriptor);
+    session.scores.push(result.score);
+
+    const status = this._assessEnrollmentSession(session);
+    const samplesAccepted = session.descriptors.length;
+
+    console.log(`   📊 [HARDWARE-ENROLL-PROGRESS] Sample ${samplesAccepted}/${SAMPLES_NEEDED_FOR_ENROLLMENT} accepted (det ${result.score.toFixed(3)}, quality ${status.quality.toFixed(3)}, spread ${status.consistency.toFixed(3)}, rejected ${session.rejectedCount})`);
+
+    // Stop collecting once we are comfortably past the requirement.
+    if (samplesAccepted >= SAMPLES_MAX) session.collecting = false;
+
+    if (!status.ready) {
+      return {
+        success: false,
+        message: status.reason === 'low-quality'
+          ? 'Improve the lighting and move a little closer, please.'
+          : `Sample ${samplesAccepted}/${SAMPLES_NEEDED_FOR_ENROLLMENT} accepted. Hold still.`,
+        confidence: result.score,
+        samplesAccepted,
+        samplesNeeded: SAMPLES_NEEDED_FOR_ENROLLMENT,
+        quality: Number(status.quality.toFixed(3)),
+        consistency: Number(status.consistency.toFixed(3)),
+        rejected: session.rejectedCount,
+        finalized: false,
+        box: boxOut,
+      };
+    }
+
+    const masterDescriptor = this.computeAverageDescriptor(session.descriptors);
+    const avgScore = status.avgScore;
+    const enrolledAt = new Date().toISOString();
+
+    const faceData = {
+      rawUserId: userId,
+      userName: session.userName || undefined,
+      descriptor: masterDescriptor,
+      enrolledAt,
+      score: avgScore,
+      samplesUsed: samplesAccepted,
+      quality: Number(status.quality.toFixed(3)),
+      consistency: Number(status.consistency.toFixed(3)),
+      modelVersion: FACE_MODEL_VERSION,
+    };
+
+    this.faceDatabase.set(userId, faceData);
+    this.faceDatabase.set(this._normalizeKey(userId), faceData);
+
+    // Persist to storage
+    const persisted = await this.saveFaceToSheet(userId, masterDescriptor, avgScore, faceData);
+    session.finalized = true;
+    faceEnrollmentSessions.delete(userId);
+
+    console.log(`✅ [HARDWARE-ENROLL-FINALIZED] User ${userId} enrolled from ${samplesAccepted} sample(s) — avg detection ${avgScore.toFixed(3)}, quality ${status.quality.toFixed(3)}, spread ${status.consistency.toFixed(3)}, persisted=${persisted}`);
+
     return {
-      success: false,
-      message: `Sample ${samplesAccepted}/${SAMPLES_NEEDED_FOR_ENROLLMENT} accepted. Please continue looking at camera.`,
-      confidence: result.score,
+      success: true,
+      finalized: true,
+      message: `Face enrolled from ${samplesAccepted} samples (quality ${(status.quality * 100).toFixed(0)}%)`,
+      confidence: avgScore,
+      quality: Number(status.quality.toFixed(3)),
+      consistency: Number(status.consistency.toFixed(3)),
       samplesAccepted,
       samplesNeeded: SAMPLES_NEEDED_FOR_ENROLLMENT,
-      finalized: false,
-      box: result.box ? {
-        x: Math.round(result.box.x),
-        y: Math.round(result.box.y),
-        w: Math.round(result.box.width),
-        h: Math.round(result.box.height),
-      } : null,
+      enrolledAt,
+      persisted,
+      box: boxOut,
     };
+  }
+
+  /**
+   * Finalize an enrollment session from samples already collected, regardless of
+   * whether the per-frame minimum was reached. Used by the app/remote path and
+   * by a timed-out hardware session so a partial but usable capture is not lost.
+   */
+  async finalizeEnrollmentSession(userId, { minSamples = 1 } = {}) {
+    const session = faceEnrollmentSessions.get(userId);
+    if (!session || session.descriptors.length < minSamples) {
+      return { success: false, message: 'No enrollment samples available to finalize' };
+    }
+    const status = this._assessEnrollmentSession(session);
+    const masterDescriptor = this.computeAverageDescriptor(session.descriptors);
+    const avgScore = status.avgScore;
+    const faceData = {
+      rawUserId: userId,
+      descriptor: masterDescriptor,
+      enrolledAt: new Date().toISOString(),
+      score: avgScore,
+      samplesUsed: session.descriptors.length,
+      quality: Number(status.quality.toFixed(3)),
+      consistency: Number(status.consistency.toFixed(3)),
+      modelVersion: FACE_MODEL_VERSION,
+    };
+    this.faceDatabase.set(userId, faceData);
+    this.faceDatabase.set(this._normalizeKey(userId), faceData);
+    const persisted = await this.saveFaceToSheet(userId, masterDescriptor, avgScore, faceData);
+    session.finalized = true;
+    faceEnrollmentSessions.delete(userId);
+    return { success: true, samplesUsed: session.descriptors.length, quality: faceData.quality, persisted };
+  }
+
+  /**
+   * Discard a partially collected enrollment (user walked away, new attempt).
+   */
+  cancelEnrollment(userId) {
+    return faceEnrollmentSessions.delete(userId);
   }
 
   // Single-buffer enrollment

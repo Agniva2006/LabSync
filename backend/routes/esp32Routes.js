@@ -5,7 +5,7 @@ const { createNotification } = require('../services/notificationService');
 const { checkNightLockout, trackFailedAttempt, clearFailedAttempts } = require('../services/securityService');
 const faceService = require('../services/faceService');
 
-const { pendingCommands, deviceStatus, enrollmentStatus, pendingFaceAuth, cameraRegistry } = require('../services/sharedState');
+const { pendingCommands, deviceStatus, enrollmentStatus, pendingFaceAuth, cameraRegistry, heartbeatCounters, stateSize } = require('../services/sharedState');
 
 // ==================== DUAL AUTH — STEP 1: FINGERPRINT VERIFIED ====================
 // Called by ESP32 DevKit after fingerSearch() succeeds
@@ -235,16 +235,30 @@ router.post('/door-closed', async (req, res) => {
 
 // ==================== GET COMMANDS (ESP32 polls this) ====================
 // ESP32 DevKit polls every 3 seconds — in-memory (NO Sheets reads = no quota burn)
+//
+// Delivery is ACK-based. The command is NOT removed on first read: it stays
+// queued until the device explicitly acknowledges it, or until it expires.
+// Previously it was deleted on the first poll, so a dropped response meant the
+// unlock was lost permanently and the user had to retry.
 router.get('/get-commands/:roomId', (req, res) => {
   const { roomId } = req.params;
+  const now = Date.now();
+  const COMMAND_TTL_MS = parseInt(process.env.COMMAND_TTL_MS || '120000', 10);
   const command = pendingCommands.get(roomId);
 
   if (command) {
-    pendingCommands.delete(roomId); // One-time use
-    console.log(`📤 Delivering command to ESP32: ${command.command} → ${roomId}`);
+    if (now - new Date(command.timestamp).getTime() > COMMAND_TTL_MS) {
+      pendingCommands.delete(roomId);
+      console.log(`⌛ [COMMAND] Expired unacknowledged command for ${roomId}: ${command.command}`);
+      return res.json({ success: true, hasCommand: false, expired: true });
+    }
+    if (!command.commandId) command.commandId = `CMD-${now}-${Math.random().toString(36).slice(2, 8)}`;
+
+    console.log(`📤 Delivering command to ESP32: ${command.command} → ${roomId} (awaiting ack)`);
     return res.json({
       success: true,
       hasCommand: true,
+      commandId: command.commandId,
       command: command.command,
       userName: command.userName,
       adminId: command.adminId,
@@ -252,6 +266,35 @@ router.get('/get-commands/:roomId', (req, res) => {
   }
 
   res.json({ success: true, hasCommand: false });
+});
+
+// Device confirms it executed a command — only then is it removed from the queue.
+router.post('/command-ack', (req, res) => {
+  const { roomId, commandId, ok = true, detail } = req.body || {};
+  if (!roomId) return res.status(400).json({ success: false, message: 'roomId required' });
+
+  const command = pendingCommands.get(roomId);
+  if (!command) {
+    return res.json({ success: true, message: 'Nothing to acknowledge (already processed or expired)' });
+  }
+  if (commandId && command.commandId && commandId !== command.commandId) {
+    console.warn(`⚠️ [COMMAND-ACK] Stale ack for ${roomId} (${commandId} != ${command.commandId}) — ignoring`);
+    return res.status(409).json({ success: false, message: 'Stale command id' });
+  }
+
+  pendingCommands.delete(roomId);
+  console.log(`✅ [COMMAND-ACK] ${command.command} → ${roomId} acknowledged (ok=${ok})`);
+
+  logAccessEvent({
+    action: 'COMMAND_ACK',
+    authMethod: 'SYSTEM',
+    status: ok ? 'SUCCESS' : 'FAILED',
+    userId: command.adminId || 'SYSTEM',
+    roomId,
+    details: `${command.command} ${ok ? 'executed' : 'failed'}${detail ? ': ' + detail : ''}`,
+  }).catch(() => {});
+
+  res.json({ success: true, message: 'Acknowledged' });
 });
 
 // ==================== GET NEXT AVAILABLE USER FOR HARDWARE ENROLLMENT ====================
@@ -337,6 +380,14 @@ router.get('/next-available-user', async (req, res) => {
 
 // ==================== GET USER BY FINGERPRINT ID (UNIVERSAL) ====================
 // ESP32 calls this after fingerSearch() to get the matching userId
+// A user may have several slots bound in one cell (e.g. "22,33") — all must resolve.
+function fingerprintSlotsMatch(cellValue, targetFp) {
+  return String(cellValue || '')
+    .split(/[,;\s]+/)
+    .map(v => parseInt(v, 10))
+    .some(v => !isNaN(v) && v === targetFp);
+}
+
 router.get('/user-by-finger/:fingerId', async (req, res) => {
   try {
     const { fingerId } = req.params;
@@ -347,18 +398,12 @@ router.get('/user-by-finger/:fingerId', async (req, res) => {
 
     // 1. Search in Google Sheets
     const users = await getSheetData('USERS');
-    let user = (users || []).find(u => {
-      const storedId = parseInt(u.fingerprintid || u.fingerprintId || '', 10);
-      return !isNaN(storedId) && storedId === targetFp;
-    });
+    let user = (users || []).find(u => fingerprintSlotsMatch(u.fingerprintid ?? u.fingerprintId, targetFp));
 
     // 2. Universal Fallback: Search in local database cache
     if (!user) {
       const localUsers = getLocalDbData('USERS');
-      user = (localUsers || []).find(u => {
-        const storedId = parseInt(u.fingerprintid || u.fingerprintId || '', 10);
-        return !isNaN(storedId) && storedId === targetFp;
-      });
+      user = (localUsers || []).find(u => fingerprintSlotsMatch(u.fingerprintid ?? u.fingerprintId, targetFp));
     }
 
     // 3. Universal Fallback: Check in-memory faceService database
@@ -501,8 +546,6 @@ router.post('/enrollment-failed', async (req, res) => {
 
 // ==================== HEARTBEAT (ESP32 posts every 30s) ====================
 // Keep track of how many times a device has posted to limit Sheets quota usage
-const heartbeatCounters = new Map();
-
 router.post('/heartbeat', async (req, res) => {
   const { roomId, deviceId, rssi, freeHeap, uptime } = req.body;
   if (deviceId) {
@@ -516,20 +559,18 @@ router.post('/heartbeat', async (req, res) => {
     count++;
     if (count >= 10) {
       count = 0;
-      try {
-        await appendRow('SYSTEM_TELEMETRY', [
-          `TEL-${Date.now()}`,
-          new Date().toISOString(),
-          deviceId,
-          roomId,
-          rssi,
-          freeHeap,
-          uptime
-        ]);
-        console.log(`📊 Telemetry logged for ${deviceId}`);
-      } catch (err) {
-        // Skip log if sheet doesn't exist yet
-      }
+      // Fire-and-forget must still have a catch: an unhandled rejection here
+      // fires every 5 minutes per device under Sheets quota pressure.
+      appendRow('SYSTEM_TELEMETRY', [
+        `TEL-${Date.now()}`,
+        new Date().toISOString(),
+        deviceId,
+        roomId,
+        rssi,
+        freeHeap,
+        uptime
+      ]).catch(err => console.warn(`⚠️ Telemetry write failed for ${deviceId}: ${err.message}`));
+      console.log(`📊 Telemetry logged for ${deviceId}`);
     }
     heartbeatCounters.set(deviceId, count);
   }
@@ -545,6 +586,7 @@ router.get('/status', (req, res) => {
     pendingCommandsCount: pendingCommands.size,
     pendingFaceAuthCount: pendingFaceAuth.size,
     enrollmentStatusCount: enrollmentStatus.size,
+    memory: stateSize(),
   });
 });
 
@@ -613,31 +655,34 @@ router.get('/camera-ip/:roomId', (req, res) => {
 
   res.status(404).json({ success: false, message: 'No camera registered for this room yet' });
 });
+// ==================== DEBUG (dev only, requires explicit opt-in) ====================
+// These dump every pending command, auth window and enrolment record. They must
+// never be reachable on a deployed instance.
+const DEBUG_ENABLED = process.env.ENABLE_DEBUG_ENDPOINTS === 'true';
 
-// ==================== DEBUG (remove in production) ====================
-router.get('/debug/pending', (req, res) => {
-  // Synchronize live face enrollment state for all tracked enrollment entries
-  for (const [uid, status] of enrollmentStatus.entries()) {
-    if (!status.faceEnrolled && faceService.isUserEnrolled(uid)) {
-      status.faceEnrolled = true;
-      status.faceEnrolledAt = status.faceEnrolledAt || status.enrolledAt;
+if (DEBUG_ENABLED) {
+  router.get('/debug/pending', (req, res) => {
+    for (const [uid, status] of enrollmentStatus.entries()) {
+      if (!status.faceEnrolled && faceService.isUserEnrolled(uid)) {
+        status.faceEnrolled = true;
+        status.faceEnrolledAt = status.faceEnrolledAt || status.enrolledAt;
+      }
     }
-  }
-
-  res.json({
-    pendingCommands: Object.fromEntries(pendingCommands),
-    pendingFaceAuth: Object.fromEntries(pendingFaceAuth),
-    deviceStatus: Object.fromEntries(deviceStatus),
-    enrollmentStatus: Object.fromEntries(enrollmentStatus),
+    res.json({
+      pendingCommands: Object.fromEntries(pendingCommands),
+      pendingFaceAuth: Object.fromEntries(pendingFaceAuth),
+      deviceStatus: Object.fromEntries(deviceStatus),
+      enrollmentStatus: Object.fromEntries(enrollmentStatus),
+    });
   });
-});
 
-router.post('/debug/clear-all', (req, res) => {
-  pendingCommands.clear();
-  pendingFaceAuth.clear();
-  console.log('🗑️ All pending states cleared');
-  res.json({ success: true, message: 'Cleared' });
-});
+  router.post('/debug/clear-all', (req, res) => {
+    pendingCommands.clear();
+    pendingFaceAuth.clear();
+    console.log('🗑️ All pending states cleared');
+    res.json({ success: true, message: 'Cleared' });
+  });
+}
 
 // ==================== UNIVERSAL REMOTE FINGERPRINT BINDING ====================
 router.post('/bind-fingerprint', async (req, res) => {

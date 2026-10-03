@@ -3,9 +3,39 @@ const router = express.Router();
 const multer = require('multer');
 const faceService = require('../services/faceService');
 const { getSheetData, findRowIndex, updateRow, appendRow, logAccessEvent } = require('../services/sheetsService');
-const { verifyToken } = require('../middleware/authMiddleware');
+const { verifyToken, verifyAdmin } = require('../middleware/authMiddleware');
+const deviceAuth = require('../middleware/deviceAuth');
 const { checkNightLockout, trackFailedAttempt, clearFailedAttempts } = require('../services/securityService');
 const { enrollmentStatus, pendingCommands } = require('../services/sharedState');
+
+// ==================== AUTHORIZATION HELPERS ====================
+
+/**
+ * Accept EITHER a signed hardware device OR a valid user JWT.
+ *
+ * Face frames are posted by the ESP32, which cannot hold a JWT, so verify and
+ * hardware-enrol stay reachable from the device. Previously these routes were
+ * reachable by anyone at all.
+ */
+function deviceOrUser(req, res, next) {
+  if (req.device) return next();
+  return verifyToken(req, res, next);
+}
+
+/** A user may only enrol or delete their own face; admins may do either. */
+function selfOrAdmin(getUserId) {
+  return (req, res, next) => {
+    if (req.user && String(req.user.role).toLowerCase() === 'admin') return next();
+    const target = getUserId(req);
+    const caller = req.user && (req.user.userId || req.user.userid || req.user.id);
+    if (caller && target && String(caller).toLowerCase() === String(target).toLowerCase()) return next();
+    return res.status(403).json({
+      success: false,
+      error: 'forbidden',
+      message: 'You may only manage your own biometric enrolment.',
+    });
+  };
+}
 
 // ==================== MULTER CONFIGURATION ====================
 
@@ -69,7 +99,7 @@ function extractImageBuffer(req) {
 }
 
 // ==================== UNIVERSAL REMOTE / APP / WEB FACE ENROLLMENT ====================
-router.post('/enroll', upload.single('faceImage'), handleMulterError, async (req, res) => {
+router.post('/enroll', deviceAuth.requireDeviceAuth, verifyToken, selfOrAdmin(req => req.body.userId), upload.single('faceImage'), handleMulterError, async (req, res) => {
   try {
     const { userId } = req.body;
     const { buffer: imageBuffer, source } = extractImageBuffer(req);
@@ -132,7 +162,7 @@ router.post('/enroll', upload.single('faceImage'), handleMulterError, async (req
 
 // ==================== HARDWARE FACE ENROLLMENT (ESP32-CAM MULTI-SAMPLE) ====================
 
-router.post('/enroll-hardware', upload.single('faceImage'), handleMulterError, async (req, res) => {
+router.post('/enroll-hardware', deviceAuth.requireDeviceAuth, upload.single('faceImage'), handleMulterError, async (req, res) => {
   try {
     const { userId } = req.body;
     const { buffer: imageBuffer, source } = extractImageBuffer(req);
@@ -197,7 +227,7 @@ router.post('/enroll-hardware', upload.single('faceImage'), handleMulterError, a
 
 // ==================== FACE VERIFICATION ====================
 
-router.post('/verify', upload.single('faceImage'), handleMulterError, async (req, res) => {
+router.post('/verify', deviceAuth.requireDeviceAuth, upload.single('faceImage'), handleMulterError, async (req, res) => {
   const reqStart = Date.now();
   try {
     const { userId, roomId } = req.body;
@@ -296,7 +326,7 @@ router.post('/verify', upload.single('faceImage'), handleMulterError, async (req
 
 // ==================== FACE STATUS ====================
 
-router.get('/status/:userId', async (req, res) => {
+router.get('/status/:userId', deviceAuth.requireDeviceAuth, verifyToken, selfOrAdmin(req => req.params.userId), async (req, res) => {
   try {
     const { userId } = req.params;
     if (!userId) {
@@ -319,7 +349,7 @@ router.get('/status/:userId', async (req, res) => {
 
 // ==================== DELETE FACE ====================
 
-router.delete('/:userId', verifyToken, async (req, res) => {
+router.delete('/:userId', verifyToken, selfOrAdmin(req => req.params.userId), async (req, res) => {
   try {
     const { userId } = req.params;
     if (!userId) {
@@ -337,7 +367,7 @@ router.delete('/:userId', verifyToken, async (req, res) => {
 
 // ==================== FACE STATS ====================
 
-router.get('/stats', async (req, res) => {
+router.get('/stats', verifyAdmin, async (req, res) => {
   try {
     const enrolledCount = faceService.getEnrolledCount();
     const modelsLoaded = faceService.modelsLoaded;
@@ -357,7 +387,7 @@ router.get('/stats', async (req, res) => {
 
 // ==================== LIST ENROLLED USERS ====================
 
-router.get('/enrolled-users', async (req, res) => {
+router.get('/enrolled-users', verifyAdmin, async (req, res) => {
   try {
     const enrolledUsers = faceService.getEnrolledUsers();
     console.log(`📋 [FACE-ENROLLED-USERS] Total: ${enrolledUsers.length}`);
