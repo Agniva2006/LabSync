@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  labsync-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: labsync-backend
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - NODE_ENV=production
+      - JWT_SECRET=labsync_super_secure_jwt_secret_key_2026_production
+      - SPREADSHEET_ID=1swE1x8y7xNFaPFZovR9BJ6usq7baM3gGkXqNI8cgWmI
+      - ENFORCE_DEVICE_AUTH=false
+      - REQUIRE_DEVICE_AUTH=false
+    volumes:
+      - ./backend/data:/app/data
+      - ./backend/logs:/app/logs

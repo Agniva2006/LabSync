@@ -578,7 +578,7 @@ router.post('/heartbeat', async (req, res) => {
 });
 
 // ==================== STATUS (admin/Flutter polls) ====================
-router.get('/status', (req, res) => {
+router.get(['/status', '/status/:roomId'], (req, res) => {
   const devices = Object.fromEntries(deviceStatus);
   res.json({
     success: true,

@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+*.err
+*.log
+.env.local
+scratch
+e2e-server.log
+e2e-server.err

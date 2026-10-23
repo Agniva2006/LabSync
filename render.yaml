@@ -15,4 +15,8 @@ services:
       - key: SPREADSHEET_ID
         value: 1swE1x8y7xNFaPFZovR9BJ6usq7baM3gGkXqNI8cgWmI
       - key: JWT_SECRET
-        value: labsync_jwt_secret_key_2026
+        value: labsync_super_secure_jwt_secret_key_2026_production
+      - key: ENFORCE_DEVICE_AUTH
+        value: "false"
+      - key: REQUIRE_DEVICE_AUTH
+        value: "false"

@@ -267,15 +267,15 @@ router.post('/verify', deviceAuth.requireDeviceAuth, upload.single('faceImage'),
       clearFailedAttempts(roomId);
     }
 
-    // Audit log to ROOM_ACCESS table
-    await logAccessEvent({
+    // Audit log to ROOM_ACCESS table asynchronously (non-blocking for sub-second door response)
+    logAccessEvent({
       action: 'ENTRY',
       authMethod: 'FACE',
       status: result.success ? 'GRANTED' : 'DENIED',
       userId: userId,
       roomId: roomId || 'ROOM-001',
       details: `Distance: ${result.distance?.toFixed(4) || 'N/A'} | Similarity: ${result.similarityPercent || 0}% | Time: ${Date.now() - reqStart}ms`
-    });
+    }).catch(err => console.warn('Non-blocking access log warning:', err.message));
 
     if (!result.success) {
       console.log(`❌ [FACE-VERIFY-ROUTE] Verification FAILED for ${userId}: ${result.message} (${Date.now() - reqStart}ms)\n`);
@@ -284,16 +284,12 @@ router.post('/verify', deviceAuth.requireDeviceAuth, upload.single('faceImage'),
 
     console.log(`✅ [FACE-VERIFY-ROUTE] Verification SUCCEEDED for ${userId} in ${Date.now() - reqStart}ms\n`);
 
-    // Look up user name for richer response
+    // Look up user name directly from in-memory cache without blocking on Google Sheets API
     let userName = userId;
-    try {
-      const users = await getSheetData('USERS');
-      const normUser = String(userId).toLowerCase();
-      const user = users.find(u => String(u.userid || u.userId || '').toLowerCase() === normUser);
-      if (user) {
-        userName = user.username || user.name || userId;
-      }
-    } catch (e) { /* non-critical */ }
+    const cachedEntry = faceService.faceDatabase.get(userId) || faceService.faceDatabase.get(String(userId).toLowerCase());
+    if (cachedEntry?.userName) {
+      userName = cachedEntry.userName;
+    }
 
     // If roomId is provided and match is valid, queue door unlock command for ESP32
     if (roomId) {
