@@ -362,6 +362,27 @@
       "details": "Distance: 0.0000 | Similarity: 100% | Time: 1584ms",
       "durationminutes": "",
       "durationMinutes": ""
+    },
+    {
+      "logid": "LOG-1792763940174",
+      "logId": "LOG-1792763940174",
+      "timestamp": "2026-10-23T13:59:00.174Z",
+      "userid": "USR-001",
+      "userId": "USR-001",
+      "username": "Agniva Ghosh",
+      "userName": "Agniva Ghosh",
+      "department": "Computer Science",
+      "roomid": "ROOM-001",
+      "roomId": "ROOM-001",
+      "roomname": "Advanced IoT & Robotics Lab",
+      "roomName": "Advanced IoT & Robotics Lab",
+      "action": "ENTRY",
+      "authmethod": "FACE",
+      "authMethod": "FACE",
+      "status": "GRANTED",
+      "details": "Distance: 0.4021 | Similarity: 61.7% | Time: 2993ms",
+      "durationminutes": "",
+      "durationMinutes": ""
     }
   ],
   "NOTIFICATIONS": [

@@ -22,8 +22,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy package files
 COPY package*.json ./
 
-# Install production dependencies
-RUN npm install --omit=dev
+# Configure npm network resilience and install production dependencies
+RUN npm config set fetch-retries 5 \
+    && npm config set fetch-retry-mintimeout 20000 \
+    && npm config set fetch-retry-maxtimeout 120000 \
+    && npm install --omit=dev
 
 # Copy entire backend source (including local neural models in models/)
 COPY . .
