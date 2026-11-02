@@ -361,7 +361,8 @@ bool isValidPhone(String phone) {
 class AppConstants {
   // ==================== BACKEND URL CONFIGURATION ====================
   // Production Render Cloud Backend
-  static const String baseUrl = 'https://labsync-pnr8.onrender.com/api';
+  static const String baseUrl =
+      'https://labsync-460952407297.asia-south1.run.app/api';
 
   // App Info
   static const String appName = 'LABSYNC';
