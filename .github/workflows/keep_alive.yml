@@ -1,8 +1,8 @@
-name: Keep Render Backend Awake
+name: Keep GCP Cloud Run Backend Awake
 
 on:
   schedule:
-    # Run every 10 minutes to prevent Render free instance from idling
+    # Run every 10 minutes to prevent Cloud Run cold starts
     - cron: '*/10 * * * *'
   workflow_dispatch: # Allows manual trigger from GitHub UI
 
@@ -10,13 +10,13 @@ jobs:
   ping-backend:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping LabSync Render Backend
+      - name: Ping LabSync GCP Cloud Run Backend
         run: |
-          echo "Pinging LabSync backend at $(date)..."
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 https://labsync-pnr8.onrender.com/api/wake || echo "FAILED")
+          echo "Pinging LabSync GCP backend at $(date)..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 https://labsync-460952407297.asia-south1.run.app/api/wake || echo "FAILED")
           echo "Keep-alive ping returned status: $HTTP_STATUS"
           if [ "$HTTP_STATUS" = "200" ]; then
-            echo "✅ LabSync backend is warm and active."
+            echo "✅ LabSync GCP backend is warm and active."
           else
             echo "⚠️ Non-200 response received ($HTTP_STATUS)."
           fi

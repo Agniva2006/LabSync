@@ -360,7 +360,7 @@ bool isValidPhone(String phone) {
 // ==================== APP CONSTANTS ====================
 class AppConstants {
   // ==================== BACKEND URL CONFIGURATION ====================
-  // Production Render Cloud Backend
+  // Production Google Cloud Run Backend
   static const String baseUrl =
       'https://labsync-460952407297.asia-south1.run.app/api';
 

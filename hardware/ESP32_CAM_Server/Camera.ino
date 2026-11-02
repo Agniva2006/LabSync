@@ -71,11 +71,11 @@ const char *WIFI_PASSWORD = "4064097a"; // REQUIRED: must match Main ESP32
 // ============================================================
 // OPTIONAL BACKEND REGISTRATION
 // ============================================================
-// Replace SERVER_URL later with your actual backend URL.
+// Production Google Cloud Run Backend in Mumbai (asia-south1)
 // The camera will POST its current DHCP IP to the backend.
 // ============================================================
 
-const char *SERVER_URL = "https://labsync-pnr8.onrender.com";
+const char *SERVER_URL = "https://labsync-460952407297.asia-south1.run.app";
 const char *ROOM_ID = "ROOM-001";
 
 // RECOMMENDED while SERVER_URL is only a placeholder.

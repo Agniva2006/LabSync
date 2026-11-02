@@ -3131,7 +3131,7 @@ void loop() {
       p.begin("labsync", false);
       p.remove("server_url");
       p.end();
-      Serial.println("✅ Server URL reset to Render cloud: " + activeServerUrl);
+      Serial.println("✅ Server URL reset to GCP Cloud Run: " + activeServerUrl);
     } else if (line == "IP_STATUS") {
       Serial.println("=== LABSYNC DYNAMIC IP STATUS ===");
       Serial.println("ESP32 Local IP: " + WiFi.localIP().toString());

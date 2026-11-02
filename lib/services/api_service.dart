@@ -17,6 +17,11 @@ class ApiService {
     try {
       final prefs = await SharedPreferences.getInstance();
       _customBaseUrl = prefs.getString('custom_base_url');
+      if (_customBaseUrl != null && _customBaseUrl!.contains('onrender.com')) {
+        await prefs.remove('custom_base_url');
+        _customBaseUrl = null;
+        print('🔄 Purged obsolete Render URL from local storage. Migrated to GCP: ${AppConstants.baseUrl}');
+      }
       if (_customBaseUrl != null && _customBaseUrl!.isNotEmpty) {
         print('🌐 ApiService initialized with dynamic custom URL: $_customBaseUrl');
       } else {
