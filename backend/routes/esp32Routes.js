@@ -553,6 +553,7 @@ router.post('/heartbeat', async (req, res) => {
       roomId, rssi, freeHeap, uptime,
       lastSeen: new Date().toISOString(),
     });
+    console.log(`💓 [HARDWARE-HEARTBEAT] ESP32 '${deviceId}' active in ${roomId} | RSSI: ${rssi} dBm | FreeHeap: ${freeHeap} B | Uptime: ${uptime}s`);
 
     // Telemetry Logging (Log every 10th heartbeat = roughly every 5 mins)
     let count = heartbeatCounters.get(deviceId) || 0;
@@ -580,12 +581,24 @@ router.post('/heartbeat', async (req, res) => {
 // ==================== STATUS (admin/Flutter polls) ====================
 router.get(['/status', '/status/:roomId'], (req, res) => {
   const devices = Object.fromEntries(deviceStatus);
+  const cameras = Object.fromEntries(cameraRegistry);
+  const commands = Object.fromEntries(pendingCommands);
+  const faceAuths = Object.fromEntries(pendingFaceAuth);
   res.json({
     success: true,
+    serverTime: new Date().toISOString(),
     devices,
+    cameras,
+    pendingCommands: commands,
     pendingCommandsCount: pendingCommands.size,
+    pendingFaceAuth: faceAuths,
     pendingFaceAuthCount: pendingFaceAuth.size,
     enrollmentStatusCount: enrollmentStatus.size,
+    faceRecognition: {
+      modelsLoaded: faceService.modelsLoaded,
+      enrolledFaces: faceService.getEnrolledCount(),
+      enrolledUsers: faceService.getEnrolledUsers(),
+    },
     memory: stateSize(),
   });
 });
@@ -640,7 +653,7 @@ router.post('/register-camera', (req, res) => {
     lastSeen: new Date().toISOString(),
   });
 
-  console.log(`📷 Dynamic Camera IP registered for ${targetRoom}: http://${clientIp}`);
+  console.log(`📷 [ESP32-CAM ONLINE] Dynamic Camera IP registered for ${targetRoom}: http://${clientIp} (reported by ESP32-CAM)`);
   res.json({ success: true, message: `Camera dynamic IP registered for ${targetRoom}`, ip: clientIp });
 });
 

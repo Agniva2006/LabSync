@@ -74,7 +74,7 @@ const char *WIFI_PASSWORD = "YOUR_WIFI_PASS";   // ← Change this
 1. Connect to the same WiFi
 2. ESP32-CAM registers as `esp32cam.local` via mDNS
 3. ESP32 DevKit discovers the camera automatically
-4. ESP32 DevKit polls the backend at `https://labsync-pnr8.onrender.com`
+4. ESP32 DevKit polls the backend at `https://labsync-460952407297.asia-south1.run.app`
 
 ### ⚠️ If camera discovery fails:
 If your WiFi router doesn't support mDNS (common with mobile hotspots):

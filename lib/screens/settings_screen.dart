@@ -161,7 +161,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ),
                         ),
                         child: const Text(
-                          'RENDER CLOUD 24/7',
+                          'GOOGLE CLOUD RUN 24/7',
                           style: TextStyle(
                             color: AppColors.neonGreen,
                             fontSize: 10,
@@ -173,7 +173,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   const SizedBox(height: 8),
                   const Text(
-                    'Hosted remotely on Render Cloud. Always accessible anywhere without any local PC or laptop server.',
+                    'Hosted remotely on Google Cloud Run (asia-south1 Mumbai). Always accessible anywhere without any local PC or laptop server.',
                     style: TextStyle(color: AppColors.textSecondary, fontSize: 12),
                   ),
                   const SizedBox(height: 12),
@@ -216,7 +216,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       if (ApiService.isUsingCustomUrl) ...[
                         const SizedBox(width: 12),
                         IconButton(
-                          tooltip: 'Reset to Default Render Cloud',
+                          tooltip: 'Reset to Default Google Cloud Run',
                           icon: const Icon(Icons.refresh, color: AppColors.neonGreen),
                           onPressed: () async {
                             await ApiService.setCustomBaseUrl(null);
@@ -225,7 +225,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               _measureLatency();
                               ScaffoldMessenger.of(context).showSnackBar(
                                 const SnackBar(
-                                  content: Text('☁️ Reset to Default Render Cloud endpoint'),
+                                  content: Text('☁️ Reset to Default Google Cloud Run endpoint'),
                                   backgroundColor: AppColors.success,
                                 ),
                               );
@@ -377,7 +377,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
                     const SizedBox(height: 12),
                     _buildInfoRow('API Endpoint:', ApiService.effectiveBaseUrl),
-                    _buildInfoRow('Network Mode:', ApiService.isUsingCustomUrl ? 'Custom Dynamic IP' : 'Cloud Render (Production)'),
+                    _buildInfoRow('Network Mode:', ApiService.isUsingCustomUrl ? 'Custom Dynamic IP' : 'Google Cloud Run (Production)'),
                     _buildInfoRow('Sheets Sync Engine:', 'Batch append (appendRows Enabled)'),
                     _buildInfoRow('Neural Models Path:', 'backend/models (Local Disk)'),
                     _buildInfoRow('Auto-Rotation Engine:', '4-Way Canvas (0°, 180°, 90°, 270°)'),
@@ -465,7 +465,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'Enter your remote cloud backend endpoint. Default is your 24/7 production server on Render.',
+                'Enter your remote cloud backend endpoint. Default is your 24/7 production server on Google Cloud Run.',
                 style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
               ),
               const SizedBox(height: 16),
@@ -475,7 +475,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 decoration: InputDecoration(
                   labelText: 'Cloud Backend URL',
                   labelStyle: const TextStyle(color: AppColors.neonCyan),
-                  hintText: 'https://labsync-pnr8.onrender.com/api',
+                  hintText: 'https://labsync-460952407297.asia-south1.run.app/api',
                   hintStyle: const TextStyle(color: AppColors.textSecondary),
                   prefixIcon: const Icon(Icons.link, color: AppColors.neonCyan),
                   filled: true,
@@ -495,7 +495,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ActionChip(
                 backgroundColor: AppColors.bgDark,
                 avatar: const Icon(Icons.cloud, color: AppColors.neonGreen, size: 16),
-                label: const Text('Default Render Cloud', style: TextStyle(color: AppColors.neonGreen, fontSize: 12)),
+                label: const Text('Default Google Cloud Run', style: TextStyle(color: AppColors.neonGreen, fontSize: 12)),
                 onPressed: () => controller.text = AppConstants.baseUrl,
               ),
             ],

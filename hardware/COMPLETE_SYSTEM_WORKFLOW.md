@@ -446,7 +446,7 @@ Be prepared to answer these key technical questions from professors during your 
    - Both `Camera.ino` and `Esp32.ino` treat network addresses as fluid, dynamic entities.
    - When moving between home Wi-Fi, lab routers, or Android/iPhone mobile hotspots, the hardware adapts without requiring any code changes or reflashing.
 2. **Flutter In-App Server Switching**:
-   - Developers and evaluators can switch between **Cloud Render** (`https://labsync-pnr8.onrender.com/api`) and **Local Laptop IP** (`http://192.168.X.Y:5000/api`) directly inside the mobile app (**Settings > Dynamic Server & Network Config**).
+   - Developers and evaluators can switch between **Google Cloud Run** (`https://labsync-460952407297.asia-south1.run.app/api`) and **Local Laptop IP** (`http://192.168.X.Y:5000/api`) directly inside the mobile app (**Settings > Dynamic Server & Network Config**).
    - The setting is persisted in `SharedPreferences` and takes effect across all app services instantly.
 3. **Master ESP32 Serial Runtime Commands**:
    - Master ESP32 can be reconfigured directly via Serial Monitor during live demos:
