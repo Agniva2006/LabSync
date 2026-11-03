@@ -597,6 +597,20 @@ class FaceRecognitionService {
 
       // Preprocess image (size normalization, contrast & gentle sharpen)
       const processedBuffer = await this.preprocessImage(imageBuffer);
+
+      // Fast-reject gate: verify frame brightness in <2ms before heavy neural inference
+      const stats = await sharp(processedBuffer).stats();
+      const avgBrightness = (stats.channels[0].mean + stats.channels[1].mean + stats.channels[2].mean) / 3;
+      if (avgBrightness < 12) {
+        console.warn(`   ⚠️ [FAST-REJECT] Frame too dark (${avgBrightness.toFixed(1)}/255) — rejected in ${Date.now() - detectStartTime}ms`);
+        return {
+          success: false,
+          faceDetected: false,
+          retryable: true,
+          message: 'Frame is too dark. Ensure face is properly illuminated.',
+        };
+      }
+
       const rawImg = await loadImage(processedBuffer);
 
       console.log(`📸 [FACE-DETECT] Processing ${rawImg.width}x${rawImg.height} frame (${processedBuffer.length} bytes, mode: ${isEnrollment ? 'ENROLLMENT' : 'VERIFICATION'})...`);

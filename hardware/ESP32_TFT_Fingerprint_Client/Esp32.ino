@@ -121,7 +121,7 @@ constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 5000;
 constexpr size_t JPEG_BUFFER_PRIMARY_BYTES = 45000;
 constexpr size_t JPEG_BUFFER_FALLBACK_1_BYTES = 38000;
 constexpr size_t JPEG_BUFFER_FALLBACK_2_BYTES = 32000;
-constexpr size_t MIN_FACE_JPEG_BYTES = 1500;
+constexpr size_t MIN_FACE_JPEG_BYTES = 7500; // Human face + clothing in QVGA produces >= 7.5KB; filters out empty walls
 
 // ============================================================
 // TFT LAYOUT
@@ -2223,9 +2223,20 @@ bool runFaceRegistrationOnly(const String &userId, const String &userName,
       }
 
       unsigned long now = millis();
-      if (!faceRequestBusy && !faceResultReady &&
-          jpegLen > MIN_FACE_JPEG_BYTES &&
-          now - lastFaceRequest >= FACE_REQUEST_INTERVAL_MS) {
+      bool hasHumanPresence = (jpegLen >= MIN_FACE_JPEG_BYTES);
+
+      if (faceRequestBusy) {
+        tftShowStatus("Enrolling face...", "Extracting template", COLOR_CYAN);
+      } else if (!hasHumanPresence) {
+        tftShowStatus("Position Face", "Center face in reticle", COLOR_YELLOW);
+      } else {
+        tftShowStatus("Face Detected", "Hold still for capture", COLOR_GREEN);
+      }
+
+      uint32_t adaptiveInterval = overlayBox.valid ? 700 : 1200;
+
+      if (!faceRequestBusy && !faceResultReady && hasHumanPresence &&
+          now - lastFaceRequest >= adaptiveInterval) {
         if (startFaceRequestAsync(FACE_REQUEST_ENROLL, faceSession, userId, "",
                                   jpegBuffer, jpegLen)) {
           lastFaceRequest = now;
@@ -2752,21 +2763,20 @@ void runAccessFlow(int fingerId) {
 
   uint16_t reticleColor = COLOR_CYAN;
 
-  while (millis() - start < LIVE_VIEW_TIME_MS && !faceVerified) {
-    // Read completed server work first. The server request itself
-    // runs in faceRequestWorker(), not in this live-preview loop.
-    bool resultSuccess = false;
+  size_t prevVerifyJpegLen = 0;
+  int verifyAttempts = 0;
+  constexpr int MAX_VERIFY_ATTEMPTS = 8;
 
+  while (millis() - start < LIVE_VIEW_TIME_MS && !faceVerified) {
+    // Read completed server work first from async worker
+    bool resultSuccess = false;
     FaceBox resultBox = {0, 0, 0, 0, false};
 
     if (takeFaceResult(faceSession, FACE_REQUEST_VERIFY, resultSuccess,
                        resultBox)) {
       overlayBox = resultBox;
-
       faceVerified = resultSuccess;
-
       overlayColor = faceVerified ? COLOR_GREEN : COLOR_RED;
-
       reticleColor = faceVerified ? COLOR_GREEN : COLOR_RED;
     }
 
@@ -2774,7 +2784,6 @@ void runAccessFlow(int fingerId) {
 
     if (jpegLen > 0) {
       displayJpegOnTFT(jpegBuffer, jpegLen);
-
       drawFaceReticle(reticleColor);
 
       if (overlayBox.valid) {
@@ -2783,33 +2792,34 @@ void runAccessFlow(int fingerId) {
 
       if (faceVerified) {
         tftShowStatus("Identity Confirmed!", "Face matched", COLOR_GREEN);
-
         delay(500);
         break;
       }
 
+      // Smart Presence Detection:
+      // When human face enters the frame, JPEG size rises above MIN_FACE_JPEG_BYTES (7500 B)
+      bool hasHumanPresence = (jpegLen >= MIN_FACE_JPEG_BYTES);
+
       if (faceRequestBusy) {
-        tftShowStatus("Look at camera", "Checking face...", COLOR_CYAN);
+        tftShowStatus("Verifying face...", "AI matching in cloud", COLOR_CYAN);
+      } else if (!hasHumanPresence) {
+        tftShowStatus("Position Face", "Waiting for face...", COLOR_YELLOW);
       } else {
-        tftShowStatus("Look at camera", "Live preview", COLOR_CYAN);
+        tftShowStatus("Face Detected", "Hold still...", COLOR_GREEN);
       }
 
       unsigned long now = millis();
+      // Adaptive timing: fast 600ms when face candidate was found, calm 1200ms when waiting
+      uint32_t adaptiveInterval = overlayBox.valid ? 600 : 1200;
 
-      // IMAGE-SELECTION RULE:
-      // /capture is used continuously for the TFT preview.
-      // A frame is copied and sent to the face server only when:
-      //   - JPEG size is above the minimum,
-      //   - no face request is already active, and
-      //   - at least FACE_REQUEST_INTERVAL_MS has elapsed.
-      if (!faceRequestBusy && !faceResultReady &&
-          jpegLen > MIN_FACE_JPEG_BYTES &&
-          now - lastFaceRequest >= FACE_REQUEST_INTERVAL_MS) {
+      // Only dispatch to cloud when human presence is confirmed and attempts remain
+      if (!faceRequestBusy && !faceResultReady && hasHumanPresence &&
+          verifyAttempts < MAX_VERIFY_ATTEMPTS &&
+          now - lastFaceRequest >= adaptiveInterval) {
         if (startFaceRequestAsync(FACE_REQUEST_VERIFY, faceSession, userId,
                                   String(ROOM_ID), jpegBuffer, jpegLen)) {
           lastFaceRequest = now;
-
-          // Neutral while the new candidate is being evaluated.
+          verifyAttempts++;
           reticleColor = COLOR_CYAN;
         }
       }
