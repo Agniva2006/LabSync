@@ -38,7 +38,7 @@ const char *WIFI_PASSWORD = "4064097a"; // ← Change to your WiFi password
 // Default Server URL (Can be changed dynamically via Preferences / Serial
 // without reflashing)
 const char *DEFAULT_SERVER_URL =
-    "https://labsync-460952407297.asia-south1.run.app/api";
+    "https://labsync-460952407297.asia-south1.run.app";
 String activeServerUrl = DEFAULT_SERVER_URL;
 
 const char *CAMERA_MDNS_NAME = "esp32cam";
@@ -1294,6 +1294,27 @@ void drawFaceReticle(uint16_t color) {
 }
 
 // ============================================================
+// SERVER URL NORMALIZATION
+// ============================================================
+// Firmware paths already start with "/api/...". If the stored server URL
+// also ends with "/api" (easy mistake when copying the Flutter base URL),
+// requests would hit /api/api/... and 404 forever. Strip any trailing
+// "/api" so both URL styles work.
+String normalizeServerUrl(String url) {
+  url.trim();
+  while (url.endsWith("/")) {
+    url = url.substring(0, url.length() - 1);
+  }
+  if (url.endsWith("/api")) {
+    url = url.substring(0, url.length() - 4);
+  }
+  while (url.endsWith("/")) {
+    url = url.substring(0, url.length() - 1);
+  }
+  return url;
+}
+
+// ============================================================
 // HTTP GET
 // ============================================================
 
@@ -1306,7 +1327,7 @@ String httpGet(const String &path) {
     return "";
   }
 
-  String url = activeServerUrl + path;
+  String url = normalizeServerUrl(activeServerUrl) + path;
 
   HTTPClient http;
 
@@ -1369,7 +1390,7 @@ String httpPostJson(const String &path, const String &jsonBody) {
     return "";
   }
 
-  String url = activeServerUrl + path;
+  String url = normalizeServerUrl(activeServerUrl) + path;
 
   HTTPClient http;
 
@@ -1438,7 +1459,7 @@ bool postMultipartStreaming(const String &path, const String &part1,
     return false;
   }
 
-  String server = activeServerUrl;
+  String server = normalizeServerUrl(activeServerUrl);
 
   bool https = server.startsWith("https://");
 
@@ -3007,6 +3028,9 @@ void setup() {
     Serial.println("🌐 Using default Server URL: " + activeServerUrl);
   }
 
+  // Sanitize against /api double-prefix and trailing slashes
+  activeServerUrl = normalizeServerUrl(activeServerUrl);
+
   // =========================================================
   // RELAY
   // =========================================================
@@ -3127,7 +3151,7 @@ void loop() {
       String newUrl = line.substring(11);
       newUrl.trim();
       if (newUrl.length() > 0) {
-        activeServerUrl = newUrl;
+        activeServerUrl = normalizeServerUrl(newUrl);
         Preferences p;
         p.begin("labsync", false);
         p.putString("server_url", activeServerUrl);
