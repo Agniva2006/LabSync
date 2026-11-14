@@ -41,10 +41,9 @@ if (canvasModule) {
   });
 }
 
-// Import sheets service for persistent storage (supports Google Sheets + local DB fallback)
+// Import sheets service for persistent storage (Google Sheets, cloud-only)
 const {
   getSheetData,
-  getLocalDbData,
   appendRow,
   findRowIndex,
   updateRow,
@@ -259,14 +258,14 @@ class FaceRecognitionService {
 
   /**
    * Universal Biometric Sync & Healing System
-   * Ensures all users across the system have their fingerprints and face vectors
-   * synchronized between memory, local_db.json, and Google Sheets without losing or wiping any data.
+   * Ensures all users' fingerprints and face vectors are synchronized between
+   * the in-memory cache and Google Sheets (the single cloud source of truth).
    */
   async syncAndHealAllBiometrics(cachedUsers = null) {
     try {
       console.log('🔄 [BIOMETRIC-SYNC] Running universal biometric sync across all users...');
       const users = cachedUsers || await getSheetData('USERS');
-      const localUsers = getLocalDbData('USERS');
+      const localUsers = [];
 
       // Build unified list of all unique user IDs
       const allUserIds = new Set();
@@ -418,7 +417,6 @@ class FaceRecognitionService {
     try {
       console.log(`💾 [DATABASE-SAVE] Saving face descriptor for user: ${userId}`);
       const users = await getSheetData('USERS');
-      const localUsers = getLocalDbData('USERS');
 
       // Always resolve against a fresh read: biometric writes must never target
       // a cached physical row number.
@@ -428,8 +426,7 @@ class FaceRecognitionService {
       }
 
       const normTarget = this._normalizeKey(userId);
-      let user = (users || []).find(u => this._normalizeKey(u.userid || u.userId) === normTarget) ||
-                 (localUsers || []).find(u => this._normalizeKey(u.userid || u.userId) === normTarget);
+      let user = (users || []).find(u => this._normalizeKey(u.userid || u.userId) === normTarget);
 
       // Quarantine a stored template that cannot be parsed as a 128-d vector,
       // so it is never handed to a comparison that would always mismatch.

@@ -2,12 +2,15 @@
 ============================
 Hi, looks like you are running TensorFlow.js in Node.js. To speed things up dramatically, install our node backend, visit https://github.com/tensorflow/tfjs-node for more details. 
 ============================
-
-╔══════════════════════════════════════════════════════════════╗
-║  ⚠️  NON-DURABLE BIOMETRIC STORAGE DETECTED                 ║
-╚══════════════════════════════════════════════════════════════╝
-   • Biometrics are stored ONLY in C:\Users\User\Desktop\best_resume_maker\project_done_during_internship_IIT_KGP\LabSync\backend\data\local_db.json
-   • If this process runs on an ephemeral filesystem (Render/Railway/Heroku free), every enrolled face and fingerprint is lost on the next deploy or restart
-   • Set GOOGLE_CREDENTIALS in backend/.env to persist to Google Sheets.
-   Faces loaded at boot: 7
-
+🚨 [DEVICE-AUTH] Replay detected from test-esp32-01 (nonce 9eeaccd762b59c5c)
+⚠️  [DEVICE-AUTH] Stale timestamp from test-esp32-01 (1794656714069)
+🚨 [DEVICE-AUTH] Bad signature from test-esp32-01 for POST /api/esp32/send-command
+🚨 [DEVICE-AUTH] Replay detected from test-esp32-01 (nonce 9d017e395b0b511c)
+⚠️  [DEVICE-AUTH] Stale timestamp from test-esp32-01 (1794656726460)
+🚨 [DEVICE-AUTH] Bad signature from test-esp32-01 for POST /api/esp32/send-command
+🚨 [DEVICE-AUTH] Replay detected from test-esp32-01 (nonce 7aabf2fa564c0786)
+⚠️  [DEVICE-AUTH] Stale timestamp from test-esp32-01 (1794656738477)
+🚨 [DEVICE-AUTH] Bad signature from test-esp32-01 for POST /api/esp32/send-command
+🚨 [DEVICE-AUTH] Replay detected from test-esp32-01 (nonce 09e800f8eed7f09d)
+⚠️  [DEVICE-AUTH] Stale timestamp from test-esp32-01 (1794656769979)
+🚨 [DEVICE-AUTH] Bad signature from test-esp32-01 for POST /api/esp32/send-command

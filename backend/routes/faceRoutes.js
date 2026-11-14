@@ -213,6 +213,8 @@ router.post('/enroll-hardware', deviceAuth.requireDeviceAuth, upload.single('fac
       samplesAccepted: result.samplesAccepted || 0,
       samplesNeeded: result.samplesNeeded || 1,
       finalized: result.finalized || false,
+      quality: typeof result.quality === 'number' ? result.quality : undefined,
+      consistency: typeof result.consistency === 'number' ? result.consistency : undefined,
     });
 
   } catch (error) {

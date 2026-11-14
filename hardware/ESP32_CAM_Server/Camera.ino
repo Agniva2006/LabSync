@@ -35,13 +35,13 @@
     GET /stop
         Deinitialize camera
         PWDN HIGH
-        Enable WiFi modem sleep
+        Apply configured idle WiFi mode
 
     GET /status
         ACTIVE or SLEEP
 
   IDLE:
-    WiFi        = connected with modem sleep
+    WiFi        = connected; idle modem sleep configurable (default off)
     UDP         = active
     mDNS        = active
     HTTP        = active
@@ -59,6 +59,7 @@
 #include <WiFiClientSecure.h>
 
 #include "esp_camera.h"
+#include "esp_err.h"
 #include "esp_http_server.h"
 
 // ============================================================
@@ -78,9 +79,13 @@ const char *WIFI_PASSWORD = "4064097a"; // REQUIRED: must match Main ESP32
 const char *SERVER_URL = "https://labsync-460952407297.asia-south1.run.app";
 const char *ROOM_ID = "ROOM-001";
 
-// RECOMMENDED while SERVER_URL is only a placeholder.
+// Optional. Invalid SERVER_URL values are skipped.
 // UDP + mDNS continue to work with this disabled.
 constexpr bool ENABLE_BACKEND_REGISTRATION = true;
+
+// Keep the HTTP wake channel responsive. Only OV2640 powers down at idle.
+// Set true only after repeated wake tests on your access point.
+constexpr bool ENABLE_IDLE_WIFI_MODEM_SLEEP = false;
 
 unsigned long lastDynamicIpRegister = 0;
 constexpr unsigned long DYNAMIC_IP_REFRESH_INTERVAL_MS = 60000;
@@ -381,17 +386,17 @@ bool initializeCamera()
 
   if (error != ESP_OK)
   {
-    Serial.printf(
-        "Camera init failed: 0x%X\n",
-        error);
+    Serial.printf("Camera init failed: %s (0x%X), heap=%u\n",
+                  esp_err_to_name(error), (unsigned int)error,
+                  (unsigned int)ESP.getFreeHeap());
 
     digitalWrite(PWDN_GPIO_NUM, HIGH);
 
     cameraInitialized = false;
     cameraEnabled = false;
 
-    // Camera is sleeping again, so WiFi modem sleep can resume.
-    WiFi.setSleep(true);
+    // Restore the configured idle WiFi mode.
+    WiFi.setSleep(ENABLE_IDLE_WIFI_MODEM_SLEEP);
 
     return false;
   }
@@ -474,8 +479,8 @@ void sleepCamera()
   pinMode(PWDN_GPIO_NUM, OUTPUT);
   digitalWrite(PWDN_GPIO_NUM, HIGH);
 
-  // Keep WiFi connected so /start, UDP and mDNS remain available.
-  WiFi.setSleep(true);
+  // Keep the HTTP wake channel, UDP and mDNS available.
+  WiFi.setSleep(ENABLE_IDLE_WIFI_MODEM_SLEEP);
 
   Serial.println("Camera state: SLEEP");
 }
@@ -506,43 +511,36 @@ esp_err_t rootHandler(httpd_req_t *req)
 
 esp_err_t startHandler(httpd_req_t *req)
 {
-  Serial.println();
   Serial.println("Received /start");
+  const unsigned long startedAt = millis();
 
-  if (!cameraInitialized)
+  // A retry after a lost HTTP reply must not flush more frames.
+  if (cameraInitialized && cameraEnabled)
   {
-    if (!initializeCamera())
-    {
-      httpd_resp_set_status(
-          req,
-          "500 Internal Server Error");
-
-      return sendText(
-          req,
-          "CAMERA_INIT_FAILED");
-    }
+    return sendText(req, "CAMERA_ON");
   }
 
+  if (!initializeCamera())
+  {
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return sendText(req, "CAMERA_INIT_FAILED");
+  }
+
+  // Validate ONE frame. The driver can wait seconds for a frame.
+  // Never report ACTIVE when the sensor initializes but produces no image.
+  camera_fb_t *firstFrame = esp_camera_fb_get();
+  if (firstFrame == nullptr)
+  {
+    Serial.println("Wake failed: sensor initialized but no frame arrived");
+    sleepCamera();
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return sendText(req, "CAMERA_FRAME_FAILED");
+  }
+  esp_camera_fb_return(firstFrame);
   cameraEnabled = true;
 
-  // Flush two initial frames so exposure / white balance can settle.
-  for (int f = 0; f < 2; f++)
-  {
-    camera_fb_t *oldFrame = esp_camera_fb_get();
-
-    if (oldFrame != nullptr)
-    {
-      esp_camera_fb_return(oldFrame);
-    }
-
-    delay(20);
-  }
-
-  Serial.println("Camera ACTIVE and exposure stabilized");
-
-  return sendText(
-      req,
-      "CAMERA_ON");
+  Serial.printf("Camera ACTIVE, wake took %lu ms\n", millis() - startedAt);
+  return sendText(req, "CAMERA_ON");
 }
 
 // ============================================================
@@ -590,57 +588,26 @@ esp_err_t statusHandler(httpd_req_t *req)
 
 esp_err_t captureHandler(httpd_req_t *req)
 {
-  // Auto-wake if /capture arrives while camera is sleeping.
+  // /capture also works without a preceding /start.
   if (!cameraInitialized || !cameraEnabled)
   {
     Serial.println("Auto-waking OV2640 for capture...");
-
     if (!initializeCamera())
     {
-      httpd_resp_set_status(
-          req,
-          "500 Internal Server Error");
-
-      return sendText(
-          req,
-          "CAMERA_INIT_FAILED");
-    }
-
-    cameraEnabled = true;
-
-    // Flush two initial frames after wake-up.
-    for (int f = 0; f < 2; f++)
-    {
-      camera_fb_t *oldFrame = esp_camera_fb_get();
-
-      if (oldFrame != nullptr)
-      {
-        esp_camera_fb_return(oldFrame);
-      }
-
-      delay(20);
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      return sendText(req, "CAMERA_INIT_FAILED");
     }
   }
 
   camera_fb_t *frame = esp_camera_fb_get();
-
-  if (frame == nullptr)
-  {
-    Serial.println("Camera capture failed - retrying once...");
-
-    delay(30);
-
-    frame = esp_camera_fb_get();
-  }
-
   if (frame == nullptr)
   {
     Serial.println("Camera frame acquisition failed");
-
-    httpd_resp_send_500(req);
-
-    return ESP_FAIL;
+    sleepCamera();
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return sendText(req, "CAMERA_FRAME_FAILED");
   }
+  cameraEnabled = true;
 
   Serial.printf(
       "JPEG captured: %u bytes\n",
@@ -806,6 +773,13 @@ void registerCameraWithBackend()
     return;
   }
 
+  String backend = SERVER_URL;
+  if (!backend.startsWith("http://") && !backend.startsWith("https://"))
+  {
+    Serial.println("Backend camera registration skipped: configure SERVER_URL");
+    return;
+  }
+
   String localIp = WiFi.localIP().toString();
 
   Serial.print("Announcing dynamic camera IP (");
@@ -966,14 +940,10 @@ void connectWiFi()
     // Original discovery announcement immediately after connection.
     broadcastCameraIP();
 
-    // Additional backend DHCP-IP registration.
-    registerCameraWithBackend();
-    lastDynamicIpRegister = millis();
-
-    // Camera normally sleeps while idle.
+    // Apply the configured WiFi idle mode when the sensor sleeps.
     if (!cameraEnabled)
     {
-      WiFi.setSleep(true);
+      WiFi.setSleep(ENABLE_IDLE_WIFI_MODEM_SLEEP);
     }
   }
   else
@@ -1042,20 +1012,27 @@ void setup()
     }
   }
 
-  // Camera is asleep, so allow WiFi modem sleep.
+  // Camera sleeps; WiFi remains reachable for HTTP wake commands.
   if (WiFi.status() == WL_CONNECTED)
   {
-    WiFi.setSleep(true);
+    WiFi.setSleep(ENABLE_IDLE_WIFI_MODEM_SLEEP);
   }
 
   Serial.println();
   Serial.println("ESP32-CAM READY");
   Serial.println("Camera sensor: SLEEP");
   Serial.println("Resolution: 320 x 240");
-  Serial.println("WiFi: ACTIVE with modem sleep while camera sleeps");
+  Serial.println(ENABLE_IDLE_WIFI_MODEM_SLEEP
+                     ? "WiFi: modem sleep enabled"
+                     : "WiFi: continuously reachable (modem sleep disabled)");
   Serial.println("UDP discovery: ACTIVE");
   Serial.println("HTTP server: ACTIVE");
   Serial.println("mDNS: esp32cam.local");
+
+  // Start the HTTP listener BEFORE optional backend traffic.
+  broadcastCameraIP();
+  registerCameraWithBackend();
+  lastDynamicIpRegister = millis();
 }
 
 // ============================================================

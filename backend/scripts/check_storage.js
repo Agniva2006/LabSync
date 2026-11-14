@@ -17,7 +17,6 @@ const { getStorageMode, getSheetData } = require('../services/sheetsService');
   console.log(`Backend        : ${mode.backend}`);
   console.log(`Durable        : ${mode.durable ? 'YES' : 'NO'}`);
   console.log(`Spreadsheet ID : ${mode.spreadsheetId || '(none)'}`);
-  console.log(`Local DB path  : ${mode.localDbPath}`);
 
   if (!mode.durable) {
     console.log('\n❌ NOT DURABLE — enrolled faces/fingerprints are lost on restart.\n');

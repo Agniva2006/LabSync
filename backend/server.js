@@ -183,8 +183,6 @@ app.get('/api/face/storage-health', async (req, res) => {
     durable: mode.durable,
     backend: mode.backend,
     spreadsheetId: mode.spreadsheetId,
-    localDbPath: mode.localDbPath,
-    warning: mode.warning,
     enrolledFaces: faceService.getEnrolledCount(),
     enrolledUsers: faceService.getEnrolledUsers(),
   });

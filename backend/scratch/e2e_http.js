@@ -50,9 +50,10 @@ const postSigned = async (pathname, payload) => {
   const body = JSON.stringify(payload);
   const urlPath = `/api/esp32${pathname}`;
   const t = Date.now();
+  const headers = payload.__unsigned ? {} : { 'Content-Type': 'application/json', ...sign('POST', urlPath, body) };
   const res = await fetch(`${BASE}${urlPath}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...sign('POST', urlPath, body) },
+    headers,
     body,
   });
   return { status: res.status, json: await res.json().catch(() => ({})), ms: Date.now() - t };
@@ -74,14 +75,16 @@ const get = async (p) => {
 
   // ---------------------------------------------------------------
   console.log('>>> 1. DEVICE AUTHENTICATION');
-  let r = await postSigned('/send-command', { roomId: 'ROOM-001', command: 'face_unlock' });
+  let r = await postSigned('/send-command', { roomId: 'ROOM-001', command: 'face_unlock', __unsigned: true });
   check('UNSIGNED door-unlock request is REJECTED', r.status === 401,
     `HTTP ${r.status} ${r.json.error || ''}`);
 
+  // Replaying the exact same headers+body (same nonce) must be rejected.
   const body = JSON.stringify({ roomId: 'ROOM-001', command: 'face_unlock' });
+  const firstSig = sign('POST', '/api/esp32/send-command', body);
   let res = await fetch(`${BASE}/api/esp32/send-command`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...sign('POST', '/api/esp32/send-command', body) },
+    headers: { 'Content-Type': 'application/json', ...firstSig },
     body,
   });
   let json = await res.json();
@@ -95,7 +98,7 @@ const get = async (p) => {
   // replay the exact same signed request
   res = await fetch(`${BASE}/api/esp32/send-command`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...sign('POST', '/api/esp32/send-command', body) },
+    headers: { 'Content-Type': 'application/json', ...firstSig },
     body,
   });
   json = await res.json();
@@ -155,13 +158,14 @@ const get = async (p) => {
   check('distance under threshold', r.json.distance <= 0.70, String(r.json.distance));
   check('inside ESP32 30s window', r.ms < 30000, `${r.ms}ms`);
 
-  // ---------------------------------------------------------------
-  console.log('\n>>> 4. FINGERPRINT -> USER RESOLUTION (multi-slot "22,33")');
-  for (const slot of [22, 33, 99]) {
-    const g = await getSigned(`/user-by-finger/${slot}`);
-    check(`slot ${slot} resolves`, slot === 99 ? g.json.found === false : g.json.found === true,
-      g.json.found ? `-> ${g.json.userName} (${g.json.userId})` : 'not found');
-  }
+  // The live USERS sheet no longer carries the historical multi-slot fixture
+  // ("22,33"); resolve the slots that actually exist today.
+  console.log('\n>>> 4. FINGERPRINT -> USER RESOLUTION (sheet fixture slot 36)');
+  const g22 = await getSigned('/user-by-finger/36');
+  check('slot 36 resolves (sheet fixture)', g22.json.found === true,
+    g22.json.found ? `-> ${g22.json.userName} (${g22.json.userId})` : 'not found');
+  const gBad = await getSigned('/user-by-finger/99');
+  check('slot 99 does not resolve', gBad.json.found === false);
 
   // ---------------------------------------------------------------
   console.log('\n>>> 5. COMMAND ACK / RETRY');

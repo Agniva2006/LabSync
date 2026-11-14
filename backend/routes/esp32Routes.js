@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { getSheetData, getLocalDbData, appendRow, findRowIndex, updateRow, logAccessEvent } = require('../services/sheetsService');
+const { getSheetData, appendRow, findRowIndex, updateRow, logAccessEvent } = require('../services/sheetsService');
 const { createNotification } = require('../services/notificationService');
 const { checkNightLockout, trackFailedAttempt, clearFailedAttempts } = require('../services/securityService');
 const faceService = require('../services/faceService');
@@ -400,13 +400,7 @@ router.get('/user-by-finger/:fingerId', async (req, res) => {
     const users = await getSheetData('USERS');
     let user = (users || []).find(u => fingerprintSlotsMatch(u.fingerprintid ?? u.fingerprintId, targetFp));
 
-    // 2. Universal Fallback: Search in local database cache
-    if (!user) {
-      const localUsers = getLocalDbData('USERS');
-      user = (localUsers || []).find(u => fingerprintSlotsMatch(u.fingerprintid ?? u.fingerprintId, targetFp));
-    }
-
-    // 3. Universal Fallback: Check in-memory faceService database
+    // 2. Universal Fallback: Check in-memory faceService database
     if (!user) {
       const memoryUser = faceService.getUserByFingerprintId(targetFp);
       if (memoryUser) {
@@ -450,13 +444,11 @@ router.post('/enrollment-complete', async (req, res) => {
 
     // Update USERS sheet fingerprintId column — PRESERVE face data
     const users = await getSheetData('USERS');
-    const localUsers = getLocalDbData('USERS');
     let rowIndex = await findRowIndex('USERS', 'userid', userId);
     if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', userId);
 
     const normId = String(userId).toLowerCase();
-    const user = (users || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId) ||
-                 (localUsers || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId) || {};
+    const user = (users || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId) || {};
 
     // Track in-memory for polling — accurately preserve face status from memory or database
     const existingStatus = enrollmentStatus.get(userId);
@@ -713,10 +705,8 @@ router.post('/bind-fingerprint', async (req, res) => {
     if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', userId);
 
     const users = await getSheetData('USERS');
-    const localUsers = getLocalDbData('USERS');
     const normId = String(userId).toLowerCase();
-    const user = (users || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId) ||
-                 (localUsers || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId);
+    const user = (users || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId);
 
     if (rowIndex !== -1 && user) {
       await updateRow('USERS', rowIndex, [

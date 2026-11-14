@@ -15,97 +15,10 @@ const SHEET_HEADERS = {
   SYSTEM_TELEMETRY: ['telemetryId', 'timestamp', 'deviceId', 'roomId', 'rssi', 'freeHeap', 'uptime']
 };
 
-const DEFAULT_SEEDS = {
-  USERS: [
-    {
-      userid: 'USR-001',
-      username: 'Agniva Ghosh',
-      email: 'agnivaghosh2006@gmail.com',
-      password: '$2a$10$Q7NvwZVWG6.QlIZEPE8hMubZoIpbtedjHiLpQCOc5UJPbvEeph8uK', // 'user123'
-      role: 'admin',
-      department: 'Computer Science & AI',
-      authorized_rooms: 'ROOM-001,ROOM-002',
-      fingerprintid: '1',
-      facedescriptor: '',
-      facestatus: 'NOT_ENROLLED'
-    },
-    {
-      userid: 'USR-002',
-      username: 'Milan Samanta',
-      email: 'milan@iitkgp.ac.in',
-      password: '$2a$10$Q7NvwZVWG6.QlIZEPE8hMubZoIpbtedjHiLpQCOc5UJPbvEeph8uK',
-      role: 'user',
-      department: 'Mechanical Engineering',
-      authorized_rooms: 'ROOM-001',
-      fingerprintid: '2',
-      facedescriptor: '',
-      facestatus: 'NOT_ENROLLED'
-    }
-  ],
-  ROOMS: [
-    {
-      roomid: 'ROOM-001',
-      roomname: 'Advanced IoT & Robotics Lab',
-      securitylevel: 'LOW',
-      status: 'ACTIVE'
-    },
-    {
-      roomid: 'ROOM-002',
-      roomname: 'High-Security Biomaterials Vault',
-      securitylevel: 'HIGH',
-      status: 'ACTIVE'
-    }
-  ],
-  ROOM_ACCESS: [],
-  NOTIFICATIONS: [],
-  REQUESTS: [],
-  INVENTORY: [],
-  SYSTEM_TELEMETRY: []
-};
-
-// Local JSON DB File Path
-const dataDir = path.join(__dirname, '../data');
-const localDbPath = path.join(dataDir, 'local_db.json');
-
-// Ensure data directory exists
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
-}
-
-// In-memory local database representation
-let localDb = null;
-
-function loadLocalDb() {
-  if (localDb) return localDb;
-  try {
-    if (fs.existsSync(localDbPath)) {
-      const raw = fs.readFileSync(localDbPath, 'utf8');
-      localDb = JSON.parse(raw);
-      console.log(`📂 [DATABASE-LOCAL] Loaded local database from ${localDbPath}`);
-    } else {
-      localDb = JSON.parse(JSON.stringify(DEFAULT_SEEDS));
-      saveLocalDb();
-      console.log(`✨ [DATABASE-LOCAL] Seeded initial local database at ${localDbPath}`);
-    }
-  } catch (err) {
-    console.warn(`⚠️ [DATABASE-LOCAL] Error reading local_db.json: ${err.message}, re-initializing seeds`);
-    localDb = JSON.parse(JSON.stringify(DEFAULT_SEEDS));
-    saveLocalDb();
-  }
-  return localDb;
-}
-
-function saveLocalDb() {
-  if (!localDb) return;
-  try {
-    fs.writeFileSync(localDbPath, JSON.stringify(localDb, null, 2), 'utf8');
-  } catch (err) {
-    console.error(`❌ [DATABASE-LOCAL] Error saving local_db.json: ${err.message}`);
-  }
-}
-
-// Initialize local DB
-loadLocalDb();
+// CLOUD-ONLY MODE: Google Sheets is the single source of truth.
+// There is no local_db.json file. Data lives in Google Sheets, with a short
+// TTL in-memory read cache (sheetDataCache) and permanent in-memory caches in
+// sharedState.js / faceService.js holding operational state.
 
 // ==================== GOOGLE SHEETS API INITIALIZATION ====================
 
@@ -146,10 +59,10 @@ try {
     isSheetsConfigured = true;
     console.log(`🌐 [DATABASE-INIT] Google Sheets API initialized for Spreadsheet ID: ${spreadsheetId}`);
   } else {
-    console.log('ℹ️ [DATABASE-INIT] No Google service-account.json found. Operating in LOCAL PERSISTENCE MODE (data/local_db.json).');
+    console.error('❌ [DATABASE-INIT] No Google credentials found! Cloud persistence requires either the GOOGLE_CREDENTIALS env variable or backend/config/service-account.json.');
   }
 } catch (initError) {
-  console.warn(`⚠️ [DATABASE-INIT] Google Sheets init error (${initError.message}). Operating in LOCAL PERSISTENCE MODE.`);
+  console.error(`❌ [DATABASE-INIT] Google Sheets init error: ${initError.message}`);
 }
 
 // Cache for sheetName -> sheetId mapping
@@ -161,14 +74,14 @@ const sheetDataCache = new Map();
  * Get Sheet ID for a given Sheet Name (required for batchUpdate structural changes)
  */
 async function getSheetId(sheetName) {
-  if (!isSheetsConfigured || !sheets) return 0;
+  if (!sheets) return 0;
   if (sheetIdCache.has(sheetName)) {
     return sheetIdCache.get(sheetName);
   }
-  
+
   const response = await sheets.spreadsheets.get({ spreadsheetId });
   const sheet = response.data.sheets.find(s => s.properties.title === sheetName);
-  
+
   if (sheet) {
     sheetIdCache.set(sheetName, sheet.properties.sheetId);
     return sheet.properties.sheetId;
@@ -212,81 +125,51 @@ async function getSheetData(sheetName) {
     return cached.data;
   }
 
-  // 2. Try Google Sheets if configured
-  if (isSheetsConfigured && sheets) {
-    try {
-      const response = await withRetry(() => sheets.spreadsheets.values.get({
-        spreadsheetId,
-        range: `${sheetName}!A1:Z`
-      }));
-
-      const rows = response.data.values;
-      if (!rows || rows.length < 2) {
-        console.log(`📭 [DATABASE-READ] Sheets "${sheetName}" is empty or has only headers (${Date.now() - startTime}ms)`);
-        sheetDataCache.set(cacheKey, { timestamp: Date.now(), data: [] });
-        return [];
-      }
-
-      // Clean headers to lowercase
-      const headers = rows[0].map(h => (h || '').trim());
-      const data = [];
-
-      for (let i = 1; i < rows.length; i++) {
-        const row = rows[i];
-        if (!row || row.every(cell => !cell || cell.trim() === '')) continue;
-        const obj = {
-          _rowNumber: i + 1 // Exact physical Google Sheet Row Number (1-indexed, header is row 1)
-        };
-        headers.forEach((header, index) => {
-          const key = header.toLowerCase();
-          obj[key] = (row[index] || '').toString().trim();
-          // Also keep original key
-          obj[header] = obj[key];
-        });
-        data.push(obj);
-      }
-
-      sheetDataCache.set(cacheKey, { timestamp: Date.now(), data });
-      console.log(`📊 [DATABASE-READ] (Sheets) Loaded ${data.length} row(s) from "${sheetName}" (${Date.now() - startTime}ms)`);
-      
-      // Mirror to local DB for backup — cleanly merge to preserve all users & biometrics
-      const userMap = new Map();
-      (localDb[cacheKey] || []).forEach(item => {
-        const id = (item.userid || item.userId || item.id || '').toLowerCase();
-        if (id) userMap.set(id, item);
-      });
-
-      data.forEach(sheetItem => {
-        const id = (sheetItem.userid || sheetItem.userId || sheetItem.id || '').toLowerCase();
-        if (id) {
-          const localMatch = userMap.get(id) || {};
-          userMap.set(id, {
-            ...localMatch,
-            ...sheetItem,
-            _rowNumber: sheetItem._rowNumber || localMatch._rowNumber,
-            fingerprintid: (sheetItem.fingerprintid && sheetItem.fingerprintid !== '') ? sheetItem.fingerprintid : (localMatch.fingerprintid || localMatch.fingerprintId || ''),
-            fingerprintId: (sheetItem.fingerprintId && sheetItem.fingerprintId !== '') ? sheetItem.fingerprintId : (localMatch.fingerprintId || localMatch.fingerprintid || ''),
-            facedescriptor: (sheetItem.facedescriptor && sheetItem.facedescriptor.length > 50) ? sheetItem.facedescriptor : (localMatch.facedescriptor || localMatch.faceDescriptor || ''),
-            faceDescriptor: (sheetItem.faceDescriptor && sheetItem.faceDescriptor.length > 50) ? sheetItem.faceDescriptor : (localMatch.faceDescriptor || localMatch.facedescriptor || ''),
-            facestatus: (sheetItem.facestatus && sheetItem.facestatus !== 'NOT_ENROLLED') ? sheetItem.facestatus : (localMatch.facestatus || localMatch.faceStatus || sheetItem.facestatus || 'NOT_ENROLLED'),
-            faceStatus: (sheetItem.faceStatus && sheetItem.faceStatus !== 'NOT_ENROLLED') ? sheetItem.faceStatus : (localMatch.faceStatus || localMatch.facestatus || sheetItem.faceStatus || 'NOT_ENROLLED'),
-          });
-        }
-      });
-
-      localDb[cacheKey] = Array.from(userMap.values());
-      saveLocalDb();
-      return data;
-    } catch (sheetErr) {
-      console.warn(`⚠️ [DATABASE-READ] Sheets read error for "${sheetName}" (${sheetErr.message}). Falling back to local DB.`);
-    }
+  // 2. Google Sheets is the only persistence backend
+  if (!sheets) {
+    console.error(`❌ [DATABASE-READ] Google Sheets not configured — cannot read "${sheetName}".`);
+    return [];
   }
 
-  // 3. Fallback to Local JSON DB
-  const data = localDb[cacheKey] || [];
-  sheetDataCache.set(cacheKey, { timestamp: Date.now(), data });
-  console.log(`📊 [DATABASE-READ] (Local DB) Loaded ${data.length} row(s) from "${sheetName}" (${Date.now() - startTime}ms)`);
-  return data;
+  try {
+    const response = await withRetry(() => sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${sheetName}!A1:Z`
+    }));
+
+    const rows = response.data.values;
+    if (!rows || rows.length < 2) {
+      console.log(`📭 [DATABASE-READ] Sheets "${sheetName}" is empty or has only headers (${Date.now() - startTime}ms)`);
+      sheetDataCache.set(cacheKey, { timestamp: Date.now(), data: [] });
+      return [];
+    }
+
+    // Clean headers to lowercase
+    const headers = rows[0].map(h => (h || '').trim());
+    const data = [];
+
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i];
+      if (!row || row.every(cell => !cell || cell.trim() === '')) continue;
+      const obj = {
+        _rowNumber: i + 1 // Exact physical Google Sheet Row Number (1-indexed, header is row 1)
+      };
+      headers.forEach((header, index) => {
+        const key = header.toLowerCase();
+        obj[key] = (row[index] || '').toString().trim();
+        // Also keep original key
+        obj[header] = obj[key];
+      });
+      data.push(obj);
+    }
+
+    sheetDataCache.set(cacheKey, { timestamp: Date.now(), data });
+    console.log(`📊 [DATABASE-READ] (Google Sheets) Loaded ${data.length} row(s) from "${sheetName}" (${Date.now() - startTime}ms)`);
+    return data;
+  } catch (sheetErr) {
+    console.error(`❌ [DATABASE-READ] Sheets read error for "${sheetName}": ${sheetErr.message}`);
+    return [];
+  }
 }
 
 /**
@@ -300,47 +183,29 @@ async function appendRow(sheetName, rowData) {
   const cacheKey = sheetName.toUpperCase();
   sheetDataCache.delete(cacheKey);
 
-  // Update local DB representation
-  const headers = SHEET_HEADERS[cacheKey] || [];
-  const rowObj = {};
-  headers.forEach((h, idx) => {
-    const val = rowData[idx] !== undefined ? String(rowData[idx]) : '';
-    rowObj[h.toLowerCase()] = val;
-    rowObj[h] = val;
-  });
-
-  if (!localDb[cacheKey]) localDb[cacheKey] = [];
-  if (cacheKey === 'NOTIFICATIONS') {
-    rowObj['read'] = rowObj['isread'] || rowObj['isRead'] || 'false';
-    rowObj['createdAt'] = rowObj['timestamp'] || new Date().toISOString();
+  if (!sheets) {
+    console.error(`❌ [DATABASE-WRITE] Google Sheets not configured — row NOT saved to "${sheetName}".`);
+    return { success: false, error: 'Google Sheets not configured' };
   }
-  localDb[cacheKey].push(rowObj);
-  saveLocalDb();
 
-  // If online, also push to Google Sheets.
   // NOTE: insertDataOption must stay 'OVERWRITE' (the default). 'INSERT_ROWS'
   // physically shifts every existing row down, which invalidates every cached
   // _rowNumber and makes a later updateRow() write a user's face descriptor
   // onto a DIFFERENT user's row. Appending after the last populated row keeps
   // row numbers stable.
-  if (isSheetsConfigured && sheets) {
-    try {
-      const response = await withRetry(() => sheets.spreadsheets.values.append({
-        spreadsheetId,
-        range: `${sheetName}!A1`,
-        valueInputOption: 'USER_ENTERED',
-        resource: { values: [rowData] }
-      }));
-      console.log(`✅ [DATABASE-WRITE] (Sheets) Row appended to "${sheetName}" (${Date.now() - startTime}ms)`);
-      return { success: true, updates: response.data.updates };
-    } catch (sheetErr) {
-      console.warn(`⚠️ [DATABASE-WRITE] Sheets append failed for "${sheetName}" (${sheetErr.message}). Saved locally.`);
-      return { success: true, localOnly: true };
-    }
+  try {
+    const response = await withRetry(() => sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: `${sheetName}!A1`,
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: [rowData] }
+    }));
+    console.log(`✅ [DATABASE-WRITE] (Google Sheets) Row appended to "${sheetName}" (${Date.now() - startTime}ms)`);
+    return { success: true, updates: response.data.updates };
+  } catch (sheetErr) {
+    console.error(`❌ [DATABASE-WRITE] Sheets append failed for "${sheetName}" (${sheetErr.message}).`);
+    return { success: false, error: sheetErr.message };
   }
-
-  console.log(`✅ [DATABASE-WRITE] (Local DB) Row appended to "${sheetName}" (${Date.now() - startTime}ms)`);
-  return { success: true, localOnly: true };
 }
 
 /**
@@ -367,55 +232,24 @@ async function updateRow(sheetName, rowIndex, rowData) {
   const cacheKey = sheetName.toUpperCase();
   sheetDataCache.delete(cacheKey);
 
-  // Update local DB.
-  // Match strictly on the primary key. Falling back to a _rowNumber match is
-  // unsafe: the local cache can hold a stale row number, and the fallback would
-  // silently overwrite an unrelated record. Appending a fresh row is far
-  // preferable to writing one user's face descriptor onto another's row.
-  const headers = SHEET_HEADERS[cacheKey] || [];
-  const rowObj = { _rowNumber: rowIndex };
-  headers.forEach((h, idx) => {
-    const val = rowData[idx] !== undefined ? String(rowData[idx]) : '';
-    rowObj[h.toLowerCase()] = val;
-    rowObj[h] = val;
-  });
-
-  if (!localDb[cacheKey]) localDb[cacheKey] = [];
-
-  const primaryKey = headers[0] ? headers[0].toLowerCase() : 'id';
-  const targetId = String(rowObj[primaryKey] || '').trim().toLowerCase();
-
-  const existingIdx = targetId
-    ? localDb[cacheKey].findIndex(item =>
-        String(item[primaryKey] || item[headers[0]] || '').trim().toLowerCase() === targetId)
-    : -1;
-
-  if (existingIdx !== -1) {
-    localDb[cacheKey][existingIdx] = { ...localDb[cacheKey][existingIdx], ...rowObj };
-  } else {
-    localDb[cacheKey].push(rowObj);
-  }
-  saveLocalDb();
-
-  // If online, update Google Sheets
-  if (isSheetsConfigured && sheets) {
-    try {
-      const response = await withRetry(() => sheets.spreadsheets.values.update({
-        spreadsheetId,
-        range: `${sheetName}!A${rowIndex}`,
-        valueInputOption: 'USER_ENTERED',
-        resource: { values: [rowData] }
-      }));
-      console.log(`✅ [DATABASE-WRITE] (Sheets) Row ${rowIndex} updated in "${sheetName}" (${Date.now() - startTime}ms)`);
-      return { success: true, updates: response.data.updatedCells };
-    } catch (sheetErr) {
-      console.warn(`⚠️ [DATABASE-WRITE] Sheets update failed for row ${rowIndex} in "${sheetName}" (${sheetErr.message}). Saved locally.`);
-      return { success: true, localOnly: true };
-    }
+  if (!sheets) {
+    console.error(`❌ [DATABASE-WRITE] Google Sheets not configured — row ${rowIndex} NOT updated in "${sheetName}".`);
+    return { success: false, error: 'Google Sheets not configured' };
   }
 
-  console.log(`✅ [DATABASE-WRITE] (Local DB) Row ${rowIndex} updated in "${sheetName}" (${Date.now() - startTime}ms)`);
-  return { success: true, localOnly: true };
+  try {
+    const response = await withRetry(() => sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${sheetName}!A${rowIndex}`,
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: [rowData] }
+    }));
+    console.log(`✅ [DATABASE-WRITE] (Google Sheets) Row ${rowIndex} updated in "${sheetName}" (${Date.now() - startTime}ms)`);
+    return { success: true, updates: response.data.updatedCells };
+  } catch (sheetErr) {
+    console.error(`❌ [DATABASE-WRITE] Sheets update failed for row ${rowIndex} in "${sheetName}" (${sheetErr.message}).`);
+    return { success: false, error: sheetErr.message };
+  }
 }
 
 /**
@@ -454,49 +288,36 @@ async function deleteRow(sheetName, rowIndex) {
   const cacheKey = sheetName.toUpperCase();
   sheetDataCache.delete(cacheKey);
 
-  // Remove from local DB by _rowNumber or fallback to array index
-  if (localDb[cacheKey]) {
-    const idx = localDb[cacheKey].findIndex(item => item._rowNumber === rowIndex);
-    if (idx !== -1) {
-      localDb[cacheKey].splice(idx, 1);
-    } else {
-      const arrayIndex = rowIndex - 2;
-      if (arrayIndex >= 0 && arrayIndex < localDb[cacheKey].length) {
-        localDb[cacheKey].splice(arrayIndex, 1);
-      }
-    }
-    saveLocalDb();
+  if (!sheets) {
+    console.error(`❌ [DATABASE-DELETE] Google Sheets not configured — row ${rowIndex} NOT deleted in "${sheetName}".`);
+    return { success: false, error: 'Google Sheets not configured' };
   }
 
-  if (isSheetsConfigured && sheets) {
-    try {
-      const sheetId = await getSheetId(sheetName);
-      await withRetry(() => sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        resource: {
-          requests: [
-            {
-              deleteDimension: {
-                range: {
-                  sheetId: sheetId,
-                  dimension: 'ROWS',
-                  startIndex: rowIndex - 1,
-                  endIndex: rowIndex
-                }
+  try {
+    const sheetId = await getSheetId(sheetName);
+    await withRetry(() => sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      resource: {
+        requests: [
+          {
+            deleteDimension: {
+              range: {
+                sheetId: sheetId,
+                dimension: 'ROWS',
+                startIndex: rowIndex - 1,
+                endIndex: rowIndex
               }
             }
-          ]
-        }
-      }));
-      console.log(`✅ [DATABASE-DELETE] (Sheets) Row ${rowIndex} deleted in "${sheetName}"`);
-      return { success: true };
-    } catch (sheetErr) {
-      console.warn(`⚠️ [DATABASE-DELETE] Sheets delete failed (${sheetErr.message}). Removed locally.`);
-    }
+          }
+        ]
+      }
+    }));
+    console.log(`✅ [DATABASE-DELETE] (Google Sheets) Row ${rowIndex} deleted in "${sheetName}"`);
+    return { success: true };
+  } catch (sheetErr) {
+    console.error(`❌ [DATABASE-DELETE] Sheets delete failed (${sheetErr.message}).`);
+    return { success: false, error: sheetErr.message };
   }
-
-  console.log(`✅ [DATABASE-DELETE] (Local DB) Row ${rowIndex} deleted in "${sheetName}"`);
-  return { success: true };
 }
 
 /**
@@ -537,19 +358,22 @@ async function flushAccessLogs() {
   if (accessLogQueue.length === 0) return;
   const batch = accessLogQueue.splice(0, accessLogQueue.length);
 
-  if (isSheetsConfigured && sheets) {
-    try {
-      await withRetry(() => sheets.spreadsheets.values.append({
-        spreadsheetId,
-        range: 'ROOM_ACCESS!A1',
-        valueInputOption: 'USER_ENTERED',
-        insertDataOption: 'INSERT_ROWS',
-        resource: { values: batch }
-      }));
-      console.log(`✅ [AUDIT-BATCH] Successfully flushed ${batch.length} access log(s) to Google Sheets`);
-    } catch (err) {
-      console.warn(`⚠️ [AUDIT-BATCH] Failed to flush logs to Google Sheets (${err.message}). Retained in local DB.`);
-    }
+  if (!sheets) {
+    console.error(`❌ [AUDIT-BATCH] Google Sheets not configured — ${batch.length} access log(s) DROPPED.`);
+    return;
+  }
+
+  try {
+    await withRetry(() => sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: 'ROOM_ACCESS!A1',
+      valueInputOption: 'USER_ENTERED',
+      insertDataOption: 'INSERT_ROWS',
+      resource: { values: batch }
+    }));
+    console.log(`✅ [AUDIT-BATCH] Successfully flushed ${batch.length} access log(s) to Google Sheets`);
+  } catch (err) {
+    console.error(`❌ [AUDIT-BATCH] Failed to flush logs to Google Sheets (${err.message}). ${batch.length} access log(s) lost.`);
   }
 }
 
@@ -570,7 +394,7 @@ function queueAccessLog(rowData) {
 }
 
 /**
- * Robustly log an access event to ROOM_ACCESS (Immediate Local DB + Batched Sheets)
+ * Robustly log an access event to ROOM_ACCESS (Batched Sheets append)
  */
 async function logAccessEvent({ action, authMethod, status, userId, roomId, details, durationMinutes }) {
   try {
@@ -624,19 +448,7 @@ async function logAccessEvent({ action, authMethod, status, userId, roomId, deta
       durationMinutes ? String(durationMinutes) : ''
     ];
 
-    // 1. Immediately record in localDb (0ms latency, zero drop)
-    if (!localDb['ROOM_ACCESS']) localDb['ROOM_ACCESS'] = [];
-    const headers = SHEET_HEADERS['ROOM_ACCESS'] || [];
-    const rowObj = {};
-    headers.forEach((h, idx) => {
-      const val = rowData[idx] !== undefined ? String(rowData[idx]) : '';
-      rowObj[h.toLowerCase()] = val;
-      rowObj[h] = val;
-    });
-    localDb['ROOM_ACCESS'].push(rowObj);
-    saveLocalDb();
-
-    // 2. Queue for batched Google Sheets append (avoids 429 quota limits)
+    // Queue for batched Google Sheets append (avoids 429 quota limits)
     queueAccessLog(rowData);
 
     console.log(`📝 [AUDIT-LOG] [${action}] User: ${userName} (${userId}) | Room: ${roomName} (${roomId}) | Method: ${authMethod} | Status: ${status}`);
@@ -647,35 +459,23 @@ async function logAccessEvent({ action, authMethod, status, userId, roomId, deta
   }
 }
 
-function getLocalDbData(sheetName) {
-  const cacheKey = sheetName.toUpperCase();
-  return localDb[cacheKey] || [];
-}
-
 /**
- * Report where writes are actually landing.
- * On ephemeral hosts (Render, Railway free tiers, Heroku) local-only mode means
- * every enrolled fingerprint/face descriptor is destroyed on the next deploy,
- * which resurfaces to the user as "face not enrolled" long after it worked.
+ * Report where writes are actually landing. Cloud-only mode: always Google Sheets.
  */
 function getStorageMode() {
   return {
     durable: isSheetsConfigured,
-    backend: isSheetsConfigured ? 'google-sheets' : 'local-db-file',
+    backend: 'google-sheets',
     spreadsheetId: isSheetsConfigured ? spreadsheetId : null,
-    localDbPath,
     warning: isSheetsConfigured
       ? null
-      : 'Biometrics are stored ONLY in ' + localDbPath +
-        '. If this process runs on an ephemeral filesystem (Render/Railway/Heroku free), ' +
-        'every enrolled face and fingerprint is lost on the next deploy or restart. ' +
-        'Set GOOGLE_CREDENTIALS in backend/.env to persist to Google Sheets.',
+      : 'Google Sheets is not configured (no GOOGLE_CREDENTIALS env var and no backend/config/service-account.json). NOTHING will persist. Add credentials to restore persistence.',
   };
 }
 
 module.exports = {
   getSheetData,
-  getLocalDbData,
+  sheetDataCache,
   appendRow,
   appendRows,
   updateRow,

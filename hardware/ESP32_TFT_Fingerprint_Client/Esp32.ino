@@ -1,6 +1,6 @@
 /*
 
-LabSync Main ESP32 Client v3.5 - Responsive Portrait + Async Face Processing
+LabSync Main ESP32 Client v3.6 - Camera Wake Handshake + Async Face Processing
 
 Hardware:
 ESP32 DevKit / WROOM
@@ -48,7 +48,7 @@ CAMERA_IP_FALLBACK:
 Used only if mDNS, Backend Registry, and NVS Cache all fail.
 */
 const char *CAMERA_IP_FALLBACK =
-    ""; // ← Set to CAM IP if mDNS fails (e.g. "192.168.1.100")
+    "esp32cam"; // ← Set to CAM IP if mDNS fails (e.g. "192.168.1.100")
 
 const char *ROOM_ID = "ROOM-001";
 
@@ -61,6 +61,9 @@ const char *ROOM_ID = "ROOM-001";
 
 constexpr uint16_t CAMERA_DISCOVERY_PORT = 4210;
 constexpr uint32_t CAMERA_UDP_WAIT_MS = 1300;
+constexpr uint16_t CAMERA_CONNECT_TIMEOUT_MS = 2500;
+constexpr uint16_t CAMERA_WAKE_TIMEOUT_MS = 15000;
+constexpr uint16_t CAMERA_COMMAND_TIMEOUT_MS = 5000;
 
 WiFiUDP cameraDiscoveryUdp;
 bool cameraUdpStarted = false;
@@ -172,6 +175,8 @@ String cameraBaseUrl = "";
 
 bool fingerprintReady = false;
 bool cameraStreaming = false;
+int cameraLastHttpCode = 0;
+String cameraLastResponse = "";
 bool mdnsStarted = false;
 
 unsigned long lastHeartbeat = 0;
@@ -729,7 +734,7 @@ bool processCameraUdpAnnouncement(uint32_t waitMs = 0) {
   return false;
 }
 
-bool resolveCamera() {
+bool resolveCamera(const String &excludedBaseUrl = "") {
   if (WiFi.status() != WL_CONNECTED) {
     cameraBaseUrl = "";
     return false;
@@ -738,11 +743,12 @@ bool resolveCamera() {
   // =========================================================
   // TIER 1: UDP CAMERA ANNOUNCEMENT
   // Usually cameraBaseUrl is already populated in loop().
-  // Keep the on-demand wait short so access flow stays responsive.
+  // Wait longer than the camera's one-second announcement interval.
   // =========================================================
   Serial.println("Trying ESP32-CAM UDP discovery...");
 
-  if (processCameraUdpAnnouncement(450)) {
+  if (processCameraUdpAnnouncement(CAMERA_UDP_WAIT_MS) &&
+      cameraBaseUrl != excludedBaseUrl) {
     return true;
   }
 
@@ -758,7 +764,8 @@ bool resolveCamera() {
 
     IPAddress camIp = MDNS.queryHost(CAMERA_MDNS_NAME, 900);
 
-    if (!ipIsZero(camIp)) {
+    if (!ipIsZero(camIp) &&
+        "http://" + camIp.toString() != excludedBaseUrl) {
       setCameraIp(camIp.toString(), "mDNS", true);
 
       return true;
@@ -768,7 +775,7 @@ bool resolveCamera() {
   // =========================================================
   // TIER 3: LAST KNOWN CAMERA IP FROM NVS
   // Fast local fallback. startCamera() will reject it and
-  // rediscover if the cached DHCP address is stale.
+  // rediscover while excluding a failed DHCP address.
   // =========================================================
   Preferences prefs;
   prefs.begin("labsync", true);
@@ -778,7 +785,8 @@ bool resolveCamera() {
   if (cachedIp.length() > 0) {
     IPAddress parsed;
 
-    if (parsed.fromString(cachedIp)) {
+    if (parsed.fromString(cachedIp) &&
+        "http://" + cachedIp != excludedBaseUrl) {
       setCameraIp(cachedIp, "NVS cache", false);
 
       return true;
@@ -802,7 +810,8 @@ bool resolveCamera() {
 
       IPAddress parsed;
 
-      if (strlen(dynIp) > 0 && parsed.fromString(dynIp)) {
+      if (strlen(dynIp) > 0 && parsed.fromString(dynIp) &&
+          "http://" + String(dynIp) != excludedBaseUrl) {
         setCameraIp(String(dynIp), "backend registry", true);
 
         return true;
@@ -818,7 +827,8 @@ bool resolveCamera() {
 
     IPAddress parsed;
 
-    if (parsed.fromString(fallback)) {
+    if (parsed.fromString(fallback) &&
+        "http://" + fallback != excludedBaseUrl) {
       setCameraIp(fallback, "manual fallback", false);
 
       return true;
@@ -837,57 +847,62 @@ bool resolveCamera() {
 // ============================================================
 
 bool sendCameraCmd(const char *path) {
+  cameraLastHttpCode = 0;
+  cameraLastResponse = "";
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Camera command skipped: WiFi disconnected");
-
     return false;
   }
 
-  if (cameraBaseUrl.length() == 0) {
-    if (!resolveCamera()) {
-      return false;
-    }
+  if (cameraBaseUrl.length() == 0 && !resolveCamera()) {
+    Serial.println("Camera command failed: no camera address");
+    return false;
   }
 
   NetworkClient client;
   HTTPClient http;
-
-  // /start includes OV2640 initialization, but it normally
-  // completes well below these limits.
-  http.setConnectTimeout(1500);
-  http.setTimeout(4000);
+  const bool waking = strcmp(path, "/start") == 0;
+  http.setConnectTimeout(CAMERA_CONNECT_TIMEOUT_MS);
+  http.setTimeout(waking ? CAMERA_WAKE_TIMEOUT_MS : CAMERA_COMMAND_TIMEOUT_MS);
   http.useHTTP10(true);
+  http.setReuse(false);
 
   String url = cameraBaseUrl + path;
-
   Serial.println("Camera request: " + url);
-
+  const unsigned long startedAt = millis();
   if (!http.begin(client, url)) {
-    cameraBaseUrl = "";
+    cameraLastResponse = "HTTP_BEGIN_FAILED";
+    Serial.println(cameraLastResponse);
     return false;
   }
 
-  int code = http.GET();
-
-  String response = "";
-
-  if (code > 0) {
-    response = http.getString();
+  cameraLastHttpCode = http.GET();
+  if (cameraLastHttpCode > 0) {
+    cameraLastResponse = http.getString();
+    cameraLastResponse.trim();
+  } else {
+    cameraLastResponse = HTTPClient::errorToString(cameraLastHttpCode);
   }
-
   http.end();
 
-  if (code == HTTP_CODE_OK) {
-    Serial.println("Camera response: " + response);
-
-    return true;
+  Serial.printf("Camera HTTP %d after %lu ms: %s\n", cameraLastHttpCode,
+                millis() - startedAt, cameraLastResponse.c_str());
+  if (cameraLastHttpCode != HTTP_CODE_OK) {
+    // Keep the address. An HTTP 500 is a reachable camera with an error.
+    return false;
   }
 
-  Serial.printf("Camera HTTP error: %d\n", code);
+  // Reject another device or a stale IP that happens to return HTTP 200.
+  const char *expected = nullptr;
+  if (waking) expected = "CAMERA_ON";
+  else if (strcmp(path, "/status") == 0) expected = "ACTIVE";
+  else if (strcmp(path, "/stop") == 0) expected = "CAMERA_SLEEP";
 
-  cameraBaseUrl = "";
-
-  return false;
+  if (expected != nullptr && cameraLastResponse != expected) {
+    Serial.println("Unexpected camera reply; command not confirmed");
+    return false;
+  }
+  return true;
 }
 
 // ============================================================
@@ -896,40 +911,48 @@ bool sendCameraCmd(const char *path) {
 
 bool startCamera() {
   Serial.println("Waking ESP32-CAM camera...");
-
-  if (cameraBaseUrl.length() == 0) {
-    if (!resolveCamera()) {
-      cameraStreaming = false;
-
-      return false;
-    }
-  }
-
-  if (sendCameraCmd("/start")) {
-    cameraStreaming = true;
-
-    Serial.println("Camera ACTIVE");
-
-    return true;
-  }
-
-  // IP may have changed.
-  cameraBaseUrl = "";
-
-  if (!resolveCamera()) {
-    cameraStreaming = false;
-
+  cameraStreaming = false;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Cannot wake camera: main ESP32 WiFi disconnected");
     return false;
   }
+  WiFi.setSleep(false);
 
-  if (sendCameraCmd("/start")) {
-    cameraStreaming = true;
+  String rejectedBaseUrl = "";
+  // Try the current address, then one newly discovered address.
+  for (int candidate = 0; candidate < 2; candidate++) {
+    if (cameraBaseUrl.length() == 0 && !resolveCamera(rejectedBaseUrl)) {
+      break;
+    }
+    const String attemptedBaseUrl = cameraBaseUrl;
+    // A lost reply does not mean DHCP changed. Retry the same camera first.
+    for (int attempt = 0; attempt < 2; attempt++) {
+      if (sendCameraCmd("/start") && sendCameraCmd("/status")) {
+        cameraStreaming = true;
+        Serial.println("Camera ACTIVE confirmed");
+        return true;
+      }
 
-    return true;
+      if (cameraLastHttpCode >= 500 &&
+          (cameraLastResponse == "CAMERA_INIT_FAILED" ||
+           cameraLastResponse == "CAMERA_FRAME_FAILED")) {
+        Serial.println("Camera reached, but sensor failed. Check camera Serial log.");
+        return false;
+      }
+      if (cameraLastHttpCode == HTTP_CODE_OK || cameraLastHttpCode == 404) {
+        // Wrong device/reply, or status did not confirm ACTIVE. Rediscover.
+        break;
+      }
+      if (attempt == 0) {
+        Serial.println("Retrying wake at the same address...");
+        delay(250);
+      }
+    }
+    rejectedBaseUrl = attemptedBaseUrl;
+    cameraBaseUrl = "";
   }
 
-  cameraStreaming = false;
-
+  Serial.println("Camera wake failed; see HTTP code and reply above");
   return false;
 }
 
@@ -938,16 +961,12 @@ bool startCamera() {
 // ============================================================
 
 void stopCamera() {
-  if (!cameraStreaming)
-    return;
-
+  if (!cameraStreaming) return;
   Serial.println("Putting camera into standby...");
-
-  sendCameraCmd("/stop");
-
+  const bool confirmed = sendCameraCmd("/stop");
   cameraStreaming = false;
-
-  Serial.println("ESP32-CAM camera now sleeping");
+  Serial.println(confirmed ? "ESP32-CAM standby confirmed"
+                           : "Camera stop not confirmed; sensor state unknown");
 }
 
 // ============================================================
@@ -987,10 +1006,9 @@ size_t fetchJpegFrame(uint8_t *buf, size_t maxLen) {
   NetworkClient client;
   HTTPClient http;
 
-  // Local camera traffic should be fast. Short bounds prevent
-  // a broken camera/network connection from freezing the UI.
-  http.setConnectTimeout(1200);
-  http.setTimeout(2500);
+  // One camera frame wait can take four seconds in the driver.
+  http.setConnectTimeout(CAMERA_CONNECT_TIMEOUT_MS);
+  http.setTimeout(CAMERA_COMMAND_TIMEOUT_MS);
   http.useHTTP10(true);
 
   String url = cameraBaseUrl + "/capture";
@@ -1003,7 +1021,8 @@ size_t fetchJpegFrame(uint8_t *buf, size_t maxLen) {
   int code = http.GET();
 
   if (code != HTTP_CODE_OK) {
-    Serial.printf("Capture HTTP error: %d\n", code);
+    String detail = code > 0 ? http.getString() : HTTPClient::errorToString(code);
+    Serial.printf("Capture HTTP error: %d: %s\n", code, detail.c_str());
 
     http.end();
 
