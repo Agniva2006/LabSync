@@ -12,8 +12,11 @@ services:
       - NODE_ENV=production
       - JWT_SECRET=labsync_super_secure_jwt_secret_key_2026_production
       - SPREADSHEET_ID=1swE1x8y7xNFaPFZovR9BJ6usq7baM3gGkXqNI8cgWmI
-      - ENFORCE_DEVICE_AUTH=false
-      - REQUIRE_DEVICE_AUTH=false
+      # Google Sheets is the single durable database — no local db fallback.
+      # GOOGLE_CREDENTIALS must be provided (service-account JSON content).
+      - GOOGLE_CREDENTIALS=${GOOGLE_CREDENTIALS}
+      - FACE_DETECT_BUDGET_MS=4500
+      - ENFORCE_DEVICE_AUTH=true
+      - REQUIRE_DEVICE_AUTH=true
     volumes:
-      - ./backend/data:/app/data
       - ./backend/logs:/app/logs

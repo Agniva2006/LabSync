@@ -4,7 +4,9 @@ npm-debug.log
 .gitignore
 *.err
 *.log
+.env
 .env.local
 scratch
+data
 e2e-server.log
 e2e-server.err

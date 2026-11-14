@@ -1,5 +1,6 @@
 const { getSheetData, logAccessEvent } = require('./sheetsService');
 const { createNotification } = require('./notificationService');
+const faceService = require('./faceService');
 
 // In-memory store for tracking failed attempts per room
 // Format: { roomId: { count: Number, firstFailTime: Number } }
@@ -16,7 +17,11 @@ const FAILURE_WINDOW_MS = 2 * 60 * 1000; // 2 minutes
  */
 async function checkNightLockout(userId) {
   try {
-    const currentHour = new Date().getHours();
+    // Lockout window is evaluated in IST (Asia/Kolkata), the deployment region.
+    // Using raw server time made the policy depend on the host timezone —
+    // a UTC Cloud Run box would open the lab 5.5h too early.
+    const istHour = parseInt(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', hour: '2-digit', hour12: false }), 10);
+    const currentHour = isNaN(istHour) ? new Date().getHours() : istHour;
     
     // Check if current time is between 22:00 and 06:00
     const isNightTime = currentHour >= 22 || currentHour < 6;
@@ -25,11 +30,16 @@ async function checkNightLockout(userId) {
       return { lockedOut: false };
     }
 
-    // Fetch user role
-    const users = await getSheetData('USERS');
-    const user = users.find(u => u.userid === userId || u.userId === userId);
-    
-    const role = user && user.role ? user.role.toLowerCase() : 'user';
+    // Fetch user role from the in-memory face cache first (no Sheets round-trip
+    // in the door-access hot path), falling back to a sheet read.
+    const cached = faceService.faceDatabase?.get(userId) || faceService.faceDatabase?.get(String(userId).toLowerCase());
+    let role = cached?.role || '';
+    if (!role) {
+      const users = await getSheetData('USERS');
+      const user = users.find(u => u.userid === userId || u.userId === userId);
+      role = user && user.role ? user.role : '';
+    }
+    role = String(role).toLowerCase();
     
     // Admins and Professors bypass the lockout
     if (role === 'admin' || role === 'professor') {

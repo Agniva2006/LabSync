@@ -34,8 +34,10 @@ COPY . .
 # Set default environment variables
 ENV NODE_ENV=production
 ENV PORT=5000
-ENV ENFORCE_DEVICE_AUTH=false
-ENV REQUIRE_DEVICE_AUTH=false
+ENV FACE_DETECT_BUDGET_MS=4500
+# Explicitly disable the dev-only local-db fallback (Google Sheets is the DB)
+ENV ENFORCE_DEVICE_AUTH=true
+ENV REQUIRE_DEVICE_AUTH=true
 
 # Expose backend port
 EXPOSE 5000

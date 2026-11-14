@@ -252,7 +252,7 @@ router.post('/users/delete', async (req, res) => {
         console.warn(`⚠️ User not found in Sheets for deletion: ${userId}`);
       }
 
-      // Also clean up from memory face database and localDb
+      // Also clean up from in-memory face database (Google Sheets row deleted above)
       try {
         await faceService.deleteFace(userId);
       } catch (e) {}

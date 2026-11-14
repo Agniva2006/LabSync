@@ -1,16 +1,10 @@
 
-============================
-Hi, looks like you are running TensorFlow.js in Node.js. To speed things up dramatically, install our node backend, visit https://github.com/tensorflow/tfjs-node for more details. 
-============================
-🚨 [DEVICE-AUTH] Replay detected from test-esp32-01 (nonce 9eeaccd762b59c5c)
-⚠️  [DEVICE-AUTH] Stale timestamp from test-esp32-01 (1794656714069)
-🚨 [DEVICE-AUTH] Bad signature from test-esp32-01 for POST /api/esp32/send-command
-🚨 [DEVICE-AUTH] Replay detected from test-esp32-01 (nonce 9d017e395b0b511c)
-⚠️  [DEVICE-AUTH] Stale timestamp from test-esp32-01 (1794656726460)
-🚨 [DEVICE-AUTH] Bad signature from test-esp32-01 for POST /api/esp32/send-command
-🚨 [DEVICE-AUTH] Replay detected from test-esp32-01 (nonce 7aabf2fa564c0786)
-⚠️  [DEVICE-AUTH] Stale timestamp from test-esp32-01 (1794656738477)
-🚨 [DEVICE-AUTH] Bad signature from test-esp32-01 for POST /api/esp32/send-command
-🚨 [DEVICE-AUTH] Replay detected from test-esp32-01 (nonce 09e800f8eed7f09d)
-⚠️  [DEVICE-AUTH] Stale timestamp from test-esp32-01 (1794656769979)
-🚨 [DEVICE-AUTH] Bad signature from test-esp32-01 for POST /api/esp32/send-command
+❌ ========================================
+❌ UNCAUGHT EXCEPTION: listen EADDRINUSE: address already in use 0.0.0.0:5000
+❌ Stack: Error: listen EADDRINUSE: address already in use 0.0.0.0:5000
+    at Server.setupListenHandle [as _listen2] (node:net:2008:16)
+    at listenInCluster (node:net:2065:12)
+    at node:net:2274:7
+    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)
+❌ ========================================
+

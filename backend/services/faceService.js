@@ -73,16 +73,15 @@ const ENROLL_SAMPLE_CONSISTENCY_LIMIT = 0.48;
 // Minimum quality before we persist a template
 const ENROLL_QUALITY_FLOOR = 0.20;
 
-// Wall-clock ceiling for one detectFace() call. The ESP32 client aborts the
-// HTTP request after FACE_UPLOAD_TIMEOUT_MS (30s), so anything slower than this
-// is thrown away and the enrollment window closes empty. Detection must fail
-// fast and let the firmware re-post a fresh frame instead of stalling.
-const DETECT_BUDGET_MS = parseInt(process.env.FACE_DETECT_BUDGET_MS || '9000', 10);
+// Wall-clock ceiling for one detectFace() call. Cloud Run CPUs are throttled
+// (~1 vCPU on min instances), so the budget must be tighter than the local dev
+// default; a miss fails fast and the firmware re-posts a fresh frame.
+const DETECT_BUDGET_MS = parseInt(process.env.FACE_DETECT_BUDGET_MS || '4500', 10);
 
 // SSD MobileNet costs ~10s per pass on CPU — it must never run speculatively,
 // otherwise a single miss blows the whole budget and the ESP32 gives up.
 const SSD_MIN_CONFIDENCE = 0.30;
-const SSD_MIN_BUDGET_REMAINING_MS = 6000;
+const SSD_MIN_BUDGET_REMAINING_MS = 4000;
 
 // Bumped whenever the embedding model or preprocessing pipeline changes.
 // A template is only comparable to another captured with the same version.
@@ -92,8 +91,10 @@ class FaceRecognitionService {
   constructor() {
     this.modelsLoaded = false;
     this.faceDatabase = new Map(); // userId → { rawUserId, descriptor, enrolledAt, score, samplesUsed }
+    this._negativeFaceCache = new Set(); // userIds known to have no enrolled face
+    this._reloadPromise = null;       // single-flight full reload throttle
     this.modelUrl = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
-    console.log('🔧 [FACE-SERVICE] FaceRecognitionService initialized (dual-mode persistence + sharp preprocessing)');
+    console.log('🔧 [FACE-SERVICE] FaceRecognitionService initialized (cloud-only persistence + sharp preprocessing)');
   }
 
   // ==================== INITIALIZATION ====================
@@ -102,7 +103,12 @@ class FaceRecognitionService {
     if (this.modelsLoaded) {
       return;
     }
-
+    // Prevent concurrent cold-start calls (Cloud Run scales to zero; two
+    // simultaneous requests after a cold boot would each load 6MB of weights).
+    if (this._initPromise) {
+      return this._initPromise;
+    }
+    this._initPromise = (async () => {
     const startTime = Date.now();
     const localModelPath = path.resolve(__dirname, '../models');
     console.log(`\n========================================`);
@@ -147,6 +153,13 @@ class FaceRecognitionService {
         console.error('❌ [FACE-INIT-ERROR] Failed to load models from both local disk and CDN:', cdnError.message);
         throw cdnError;
       }
+    }
+    })();
+    try {
+      await this._initPromise;
+    } catch (e) {
+      this._initPromise = null;
+      throw e;
     }
   }
 
@@ -224,9 +237,12 @@ class FaceRecognitionService {
           try {
             const parsed = JSON.parse(descriptorStr);
             if (Array.isArray(parsed) && parsed.length === 128) {
+              const fingerprintId = (user.fingerprintid || user.fingerprintId || '').toString().trim();
               const faceEntry = {
                 rawUserId: userId,
                 userName: userName,
+                role: user.role || 'user',
+                fingerprintId: fingerprintId,
                 descriptor: parsed,
                 enrolledAt: user.faceenrolledat || user.faceEnrolledAt || new Date().toISOString(),
                 score: parseFloat(user.facescore || user.faceScore || '0.9'),
@@ -237,7 +253,7 @@ class FaceRecognitionService {
               this.faceDatabase.set(userId, faceEntry);
               this.faceDatabase.set(this._normalizeKey(userId), faceEntry);
               loaded++;
-              console.log(`   👤 Loaded enrolled face for ${userName} (${userId}) [128-d vector]`);
+              console.log(`   👤 Loaded enrolled face for ${userName} (${userId}) [fp: ${fingerprintId || 'none'}]`);
             } else {
               console.warn(`   ⚠️ Invalid descriptor format for ${userId} (length: ${parsed?.length})`);
             }
@@ -265,15 +281,10 @@ class FaceRecognitionService {
     try {
       console.log('🔄 [BIOMETRIC-SYNC] Running universal biometric sync across all users...');
       const users = cachedUsers || await getSheetData('USERS');
-      const localUsers = [];
 
-      // Build unified list of all unique user IDs
+      // Google Sheets is the single source of truth; no local fallback exists.
       const allUserIds = new Set();
       (users || []).forEach(u => {
-        const id = u.userid || u.userId;
-        if (id) allUserIds.add(id);
-      });
-      (localUsers || []).forEach(u => {
         const id = u.userid || u.userId;
         if (id) allUserIds.add(id);
       });
@@ -283,17 +294,12 @@ class FaceRecognitionService {
       for (const userId of allUserIds) {
         const normKey = this._normalizeKey(userId);
         const sheetUser = (users || []).find(u => this._normalizeKey(u.userid || u.userId) === normKey);
-        const localUser = (localUsers || []).find(u => this._normalizeKey(u.userid || u.userId) === normKey);
 
-        // Determine best available biometrics for this user
-        let faceDescStr = (sheetUser?.facedescriptor || sheetUser?.faceDescriptor || '').trim();
-        if (!faceDescStr || faceDescStr.length < 50) {
-          faceDescStr = (localUser?.facedescriptor || localUser?.faceDescriptor || '').trim();
-        }
-
-        const fingerprintId = (sheetUser?.fingerprintid || sheetUser?.fingerprintId || localUser?.fingerprintid || localUser?.fingerprintId || '').toString().trim();
-        const userName = sheetUser?.username || sheetUser?.name || localUser?.username || localUser?.name || userId;
-        const role = sheetUser?.role || localUser?.role || 'user';
+        // Best available biometrics come from the sheet only
+        const faceDescStr = (sheetUser?.facedescriptor || sheetUser?.faceDescriptor || '').trim();
+        const fingerprintId = (sheetUser?.fingerprintid || sheetUser?.fingerprintId || '').toString().trim();
+        const userName = sheetUser?.username || sheetUser?.name || userId;
+        const role = sheetUser?.role || 'user';
 
         // Load into in-memory faceDatabase if valid 128-d descriptor exists
         if (faceDescStr && faceDescStr.length >= 50) {
@@ -306,7 +312,7 @@ class FaceRecognitionService {
                 role: role,
                 fingerprintId: fingerprintId,
                 descriptor: parsed,
-                enrolledAt: sheetUser?.faceenrolledat || localUser?.faceenrolledat || new Date().toISOString(),
+                enrolledAt: sheetUser?.faceenrolledat || new Date().toISOString(),
                 score: 0.95,
                 samplesUsed: 1,
               };
@@ -316,48 +322,39 @@ class FaceRecognitionService {
           } catch (e) {}
         }
 
-        // If local has valid face descriptor or fingerprint that Google Sheets is missing, heal Sheets row!
-        const sheetHasFace = (sheetUser?.facestatus || sheetUser?.faceStatus) === 'ENROLLED' && (sheetUser?.facedescriptor || sheetUser?.faceDescriptor)?.length > 50;
-        const localHasFace = faceDescStr.length > 50;
+        // Quarantine broken rows: a malformed / shared descriptor is never healed
+        // back (that was the historical "everyone gets Agniva's face" bug).
+        const sheetDescriptorRaw = (sheetUser?.facedescriptor || sheetUser?.faceDescriptor || '').trim();
+        const sheetHasFace = (sheetUser?.facestatus || sheetUser?.faceStatus) === 'ENROLLED' && this._isValidDescriptor(sheetDescriptorRaw);
         const sheetHasFp = (sheetUser?.fingerprintid || sheetUser?.fingerprintId || '').trim().length > 0;
-        const localHasFp = fingerprintId.length > 0;
 
-        if (sheetUser && ((!sheetHasFace && localHasFace) || (!sheetHasFp && localHasFp))) {
+        if (!sheetUser) {
+          continue;
+        }
+
+        // If this row's faceStatus says ENROLLED but the descriptor is invalid,
+        // reset the status so verification can never use someone else's face.
+        if ((sheetUser?.facestatus || sheetUser?.faceStatus) === 'ENROLLED' && !sheetHasFace) {
           let rowIndex = sheetUser._rowNumber;
           if (!rowIndex) {
             rowIndex = await findRowIndex('USERS', 'userid', userId);
           }
           if (rowIndex !== -1) {
-            console.log(`✨ [BIOMETRIC-HEAL] Healing biometrics in Google Sheets for ${userName} (${userId}) at Row ${rowIndex}`);
+            console.log(`🧹 [BIOMETRIC-HEAL] Resetting invalid face descriptor in Google Sheets for ${userName} (${userId}) at Row ${rowIndex}`);
             await updateRow('USERS', rowIndex, [
               sheetUser.userid || sheetUser.userId || userId,
               userName,
-              sheetUser.email || localUser?.email || '',
-              sheetUser.password || localUser?.password || passwordService.getFallbackHash(),
+              sheetUser.email || '',
+              sheetUser.password || passwordService.getFallbackHash(),
               role,
-              sheetUser.department || localUser?.department || 'Laboratory',
-              sheetUser.authorized_rooms || localUser?.authorized_rooms || 'ROOM-001',
+              sheetUser.department || 'Laboratory',
+              sheetUser.authorized_rooms || 'ROOM-001',
               fingerprintId,
-              faceDescStr,
-              (faceDescStr.length > 50) ? 'ENROLLED' : (sheetUser.facestatus || 'NOT_ENROLLED')
+              '',
+              'NOT_ENROLLED'
             ]);
             healedCount++;
           }
-        } else if (!sheetUser && localUser) {
-          console.log(`✨ [BIOMETRIC-HEAL] Appending missing user ${userName} (${userId}) to Google Sheets`);
-          await appendRow('USERS', [
-            userId,
-            userName,
-            localUser.email || '',
-            localUser.password || passwordService.getFallbackHash(),
-            role,
-            localUser.department || 'Laboratory',
-            localUser.authorized_rooms || 'ROOM-001',
-            fingerprintId,
-            faceDescStr,
-            (faceDescStr.length > 50) ? 'ENROLLED' : (localUser.facestatus || 'NOT_ENROLLED')
-          ]);
-          healedCount++;
         }
       }
 
@@ -847,14 +844,30 @@ class FaceRecognitionService {
     const normKey = this._normalizeKey(userId);
 
     let entry = this.faceDatabase.get(userId) || this.faceDatabase.get(normKey);
+    if (entry) return entry;
 
-    // If not in cache, reload from storage
-    if (!entry) {
-      console.log(`ℹ️ [FACE-CACHE] User "${userId}" not in memory cache. Reloading from database...`);
-      await this.loadFacesFromSheet();
-      entry = this.faceDatabase.get(userId) || this.faceDatabase.get(normKey);
+    // Negative-cache: a user known to have no enrolled face must not trigger a
+    // full Google Sheets reload on every verification attempt (that used to add
+    // 1–2s of lag to every frame posted during enrollment-edge cases).
+    if (this._negativeFaceCache?.has(normKey)) return null;
+
+    // Throttle full reloads: concurrent verify calls for different unknown
+    // users share one reload instead of stampeding the Sheets API.
+    if (!this._reloadPromise) {
+      this._reloadPromise = this.loadFacesFromSheet().finally(() => {
+        this._reloadPromise = null;
+        // Expire the throttle so a later enrollment becomes visible.
+        setTimeout(() => { this._negativeFaceCache?.clear(); }, 15000);
+      });
     }
+    await this._reloadPromise;
 
+    entry = this.faceDatabase.get(userId) || this.faceDatabase.get(normKey);
+    if (!entry) {
+      if (!this._negativeFaceCache) this._negativeFaceCache = new Set();
+      this._negativeFaceCache.add(normKey);
+      console.log(`ℹ️ [FACE-CACHE] No enrolled face found for "${userId}" (cached negative lookup)`);
+    }
     return entry;
   }
 
@@ -1162,7 +1175,7 @@ class FaceRecognitionService {
       .then(ok => console.log(`💾 [BACKGROUND-SYNC] Cloud Google Sheets updated for ${userId} (success=${ok})`))
       .catch(err => console.warn(`⚠️ [BACKGROUND-SYNC] Cloud sync warning for ${userId}:`, err.message));
 
-    console.log(`✅ [HARDWARE-ENROLL-FINALIZED] User ${userId} biometrics enrolled and locked instantly in memory & local storage`);
+    console.log(`✅ [HARDWARE-ENROLL-FINALIZED] User ${userId} biometrics enrolled and locked instantly in memory & Google Sheets`);
 
     return {
       success: true,
@@ -1280,6 +1293,7 @@ class FaceRecognitionService {
     const normKey = this._normalizeKey(userId);
     this.faceDatabase.delete(userId);
     this.faceDatabase.delete(normKey);
+    if (this._negativeFaceCache) this._negativeFaceCache.delete(normKey);
     faceEnrollmentSessions.delete(userId);
     await this.clearFaceFromSheet(userId);
     return { success: true, message: 'Face deleted successfully' };

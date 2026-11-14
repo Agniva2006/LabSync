@@ -285,8 +285,8 @@ app.use((err, req, res, next) => {
 
 async function startServer() {
   try {
-    // Create necessary directories
-    const dirs = ['models', 'data', 'logs'];
+    // Create necessary directories ('data' removed — Google Sheets is the DB)
+    const dirs = ['models', 'logs'];
     dirs.forEach(dir => {
       const dirPath = path.join(__dirname, dir);
       if (!fs.existsSync(dirPath)) {
@@ -341,9 +341,10 @@ async function startServer() {
       console.log('');
     });
 
-    // Initialize Face Recognition Service AFTER server starts (non-blocking)
+    // Initialize Face Recognition Service AFTER server starts (non-blocking);
+    // initialize() is single-flight, so concurrent callers share one model load.
     console.log('📦 Initializing face recognition service in background...');
-    faceService.initialize().then(() => {
+    warmupFacePipeline().then(() => {
       console.log('✅ Face recognition service initialized successfully');
       console.log(`👥 Loaded ${faceService.getEnrolledCount()} enrolled faces`);
       reportStorageDurability();
@@ -375,7 +376,8 @@ function reportStorageDurability() {
   console.warn('\n╔══════════════════════════════════════════════════════════════╗');
   console.warn('║  ⚠️  NON-DURABLE BIOMETRIC STORAGE DETECTED                 ║');
   console.warn('╚══════════════════════════════════════════════════════════════╝');
-  console.warn(mode.warning.split('. ').map(l => '   • ' + l).join('\n'));
+  console.warn('   • Google Sheets is NOT configured — enrolled biometrics are memory-only.');
+  console.warn('   • Set GOOGLE_CREDENTIALS (or mount config/service-account.json) to persist to your Sheet.');
   console.warn('   Faces loaded at boot: ' + faceService.getEnrolledCount());
   console.warn('');
 }
@@ -393,6 +395,20 @@ function formatUptime(seconds) {
   parts.push(`${secs}s`);
   
   return parts.join(' ');
+}
+
+// ==================== COLD-START WARMUP ====================
+// Cloud Run scales to zero; the first door access after an idle period would
+// otherwise pay the full neural-model cold start. Warm the face pipeline the
+// moment the HTTP listener is up so the first user gets sub-second inference.
+async function warmupFacePipeline() {
+  const t = Date.now();
+  try {
+    await faceService.initialize();
+    console.log(`🔥 [WARMUP] Face pipeline hot in ${Date.now() - t}ms — first access will be fast.`);
+  } catch (e) {
+    console.warn(`⚠️ [WARMUP] Face pipeline warmup failed: ${e.message}`);
+  }
 }
 
 // ==================== GRACEFUL SHUTDOWN ====================

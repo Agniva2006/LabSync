@@ -396,11 +396,23 @@ router.get('/user-by-finger/:fingerId', async (req, res) => {
       return res.status(400).json({ found: false, message: 'Invalid fingerprint ID' });
     }
 
-    // 1. Search in Google Sheets
+    // GUARD: two different accounts claiming the same physical fingerprint slot
+    // is the historical "Welcome <wrong name>" bug. Prefer the most recently
+    // updated row and log loudly when a conflict exists.
     const users = await getSheetData('USERS');
-    let user = (users || []).find(u => fingerprintSlotsMatch(u.fingerprintid ?? u.fingerprintId, targetFp));
+    const matches = (users || []).filter(u => fingerprintSlotsMatch(u.fingerprintid ?? u.fingerprintId, targetFp));
+    let user = null;
 
-    // 2. Universal Fallback: Check in-memory faceService database
+    if (matches.length > 1) {
+      console.warn(`⚠️ [FP-CONFLICT] Slot ${targetFp} is claimed by ${matches.length} users: ${matches.map(m => `${m.userid}:${m.username}`).join(', ')}`);
+      console.warn(`⚠️ [FP-CONFLICT] Using most recently updated row (${matches[matches.length - 1].username}); re-enroll to fix permanently.`);
+      user = matches[matches.length - 1];
+    } else if (matches.length === 1) {
+      user = matches[0];
+    }
+
+    // 2. Fallback: in-memory faceService database (freshly enrolled users whose
+    //    Sheets row is still being flushed).
     if (!user) {
       const memoryUser = faceService.getUserByFingerprintId(targetFp);
       if (memoryUser) {
@@ -496,6 +508,10 @@ router.post('/enrollment-complete', async (req, res) => {
         faceStatus,                 // PRESERVED face status (not reset!)
       ]);
       console.log(`✅ Updated fingerprintId to ${fingerId} for user ${userId} [Role: ${role || user.role}] [Face: ${faceStatus}]`);
+
+      // Instantly refresh the in-memory fingerprint → user map so the TFT
+      // welcome shows the RIGHT name on the very first scan after enrollment.
+      await faceService.loadFacesFromSheet().catch(() => {});
     }
 
     // Send notification to user
@@ -724,7 +740,7 @@ router.post('/bind-fingerprint', async (req, res) => {
     }
 
     // Trigger universal sync so memory is instantly updated
-    await faceService.syncAndHealAllBiometrics();
+    await faceService.loadFacesFromSheet().catch(() => {});
 
     res.json({
       success: true,
