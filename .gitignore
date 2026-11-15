@@ -36,3 +36,4 @@ Thumbs.db
 
 # Secrets (IMPORTANT!)
 *.pem
+hardware/ESP32_TFT_Fingerprint_Client/Esp32_Fan_Control_OR_logic1.ino

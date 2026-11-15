@@ -7,6 +7,7 @@ const { verifyToken, verifyAdmin } = require('../middleware/authMiddleware');
 const deviceAuth = require('../middleware/deviceAuth');
 const { checkNightLockout, trackFailedAttempt, clearFailedAttempts } = require('../services/securityService');
 const { enrollmentStatus, pendingCommands } = require('../services/sharedState');
+const gcsPhotoService = require('../services/gcsPhotoService');
 
 // ==================== AUTHORIZATION HELPERS ====================
 
@@ -182,6 +183,22 @@ router.post('/enroll-hardware', deviceAuth.requireDeviceAuth, upload.single('fac
     // Process hardware face sample
     const result = await faceService.enrollFaceFromHardware(userId, imageBuffer);
 
+    // Archive the enrollment photo to Google Cloud Storage (best-effort,
+    // never blocks or fails the enrollment) so the exact image that produced
+    // the descriptor can be re-analysed later. Filename embeds userId,
+    // fingerprintId and a descriptor hash.
+    if (imageBuffer.length > 0) {
+      gcsPhotoService
+        .archiveFaceImage({
+          buffer: imageBuffer,
+          userId,
+          kind: 'enroll',
+          descriptor: result.descriptor || null,
+          meta: { samplesAccepted: result.samplesAccepted || 0, finalized: !!result.finalized },
+        })
+        .catch(() => {});
+    }
+
     if (result.finalized) {
       console.log(`🎉 [HARDWARE-FACE-ENROLL] Enrollment successfully FINALIZED for ${userId}`);
 
@@ -251,6 +268,21 @@ router.post('/verify', deviceAuth.requireDeviceAuth, upload.single('faceImage'),
 
     // Call face verification engine
     const result = await faceService.verifyFace(userId, imageBuffer);
+
+    // Archive the verification photo to GCS (best-effort, fire-and-forget) so
+    // access events are re-checkable later against the stored descriptor.
+    if (imageBuffer.length > 0) {
+      gcsPhotoService
+        .archiveFaceImage({
+          buffer: imageBuffer,
+          userId,
+          kind: 'verify',
+          matched: result.success === true ? true : (result.success === false ? false : null),
+          descriptor: result.descriptor || null,
+          meta: { roomId: roomId || '', distance: result.distance ?? '', similarityPercent: result.similarityPercent ?? '' },
+        })
+        .catch(() => {});
+    }
 
     // [NIGHT LOCKOUT ENFORCEMENT]
     if (result.success) {

@@ -638,6 +638,37 @@ bool ipIsZero(const IPAddress &ip) {
 
 // Forward declaration for dynamic camera resolution via backend
 String httpGet(const String &path);
+bool httpPostJson(const String &path, const String &body);
+
+// ============================================================
+// COMMAND ACKNOWLEDGEMENT
+// ============================================================
+// The backend keeps a command queued until the device explicitly ACKs it
+// (/api/esp32/command-ack). Without an ACK the command stays queued until its
+// TTL expires, so the SAME enrollment (or unlock) is delivered again on the
+// next poll and runs a second time. Always ACK after executing a command.
+// Last executed commandId — prevents re-running the same command if the ACK
+// post is lost and the backend re-delivers it before TTL expiry.
+String lastExecutedCommandId = "";
+
+void acknowledgeCommand(const String &commandId, bool ok, const String &detail) {
+  if (commandId.length() == 0) return;
+
+  StaticJsonDocument<256> ackDoc;
+  ackDoc["roomId"] = ROOM_ID;
+  ackDoc["commandId"] = commandId;
+  ackDoc["ok"] = ok;
+  if (detail.length() > 0) ackDoc["detail"] = detail;
+
+  String ackBody;
+  serializeJson(ackDoc, ackBody);
+
+  if (httpPostJson("/api/esp32/command-ack", ackBody)) {
+    Serial.println("[COMMAND-ACK] Backend acknowledged command execution");
+  } else {
+    Serial.println("[COMMAND-ACK] WARNING: ack post failed — command may be re-delivered");
+  }
+}
 
 void cacheCameraIp(const String &ip) {
   if (ip.length() == 0)
@@ -2658,6 +2689,17 @@ void checkForAdminCommands() {
 
   String command = doc["command"] | "";
 
+  String commandId = doc["commandId"] | "";
+
+  // Idempotency guard: if this exact commandId already ran (e.g. the ACK was
+  // lost and the backend re-delivered it), do NOT execute it again — just ACK
+  // it so it is dequeued. This is the hard fix for "enrollment ran twice".
+  if (commandId.length() > 0 && commandId == lastExecutedCommandId) {
+    Serial.println("[COMMAND] Duplicate commandId received — ACKing without re-executing");
+    acknowledgeCommand(commandId, true, "duplicate — already executed");
+    return;
+  }
+
   String commandUserName = doc["userName"] | "";
 
   if (command == "unlock") {
@@ -2669,6 +2711,9 @@ void checkForAdminCommands() {
 
     delay(1000);
 
+    lastExecutedCommandId = commandId;
+    acknowledgeCommand(commandId, true, "Door unlocked");
+
     enterIdleMode();
 
     return;
@@ -2677,8 +2722,10 @@ void checkForAdminCommands() {
   if (command.startsWith("ENROLL:")) {
     int separator = command.indexOf(':', 7);
 
-    if (separator <= 0)
+    if (separator <= 0) {
+      acknowledgeCommand(commandId, false, "Malformed ENROLL command");
       return;
+    }
 
     String userId = command.substring(7, separator);
 
@@ -2696,7 +2743,12 @@ void checkForAdminCommands() {
 
     wakeToActive("Enrollment");
 
-    runEnrollmentSequence(userId, userName, role);
+    bool enrollOk = runEnrollmentSequence(userId, userName, role);
+
+    // ACK only after execution so this command is NEVER delivered a second
+    // time (it used to stay queued and re-run the whole enrollment).
+    lastExecutedCommandId = commandId;
+    acknowledgeCommand(commandId, enrollOk, enrollOk ? "Enrollment completed" : "Enrollment failed on device");
 
     enterIdleMode();
 
