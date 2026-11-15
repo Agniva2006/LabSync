@@ -74,7 +74,7 @@ const char *WIFI_PASSWORD = "4064097a"; // ← Change to your WiFi password
 
 // Default Server URL (Can be changed dynamically via Preferences / Serial
 // without reflashing)
-const char *DEFAULT_SERVER_URL = "xyz";
+const char *DEFAULT_SERVER_URL = "https://labsync-460952407297.asia-south1.run.app";
 String activeServerUrl = DEFAULT_SERVER_URL;
 
 const char *CAMERA_MDNS_NAME = "esp32cam";
@@ -1461,6 +1461,23 @@ bool stopMjpegPreview() {
   return true;
 }
 
+// The two MJPEG frame buffers consume 32–48 KB of internal RAM. TLS needs a
+// large contiguous block on the ESP32, so release those buffers while an image
+// upload is in flight and recreate them before the next preview frame.
+void releaseMjpegBuffers() {
+  if (!previewMutex) return;
+  xSemaphoreTake(previewMutex, portMAX_DELAY);
+  uint8_t *receive = previewReceiveBuffer;
+  uint8_t *latest = previewLatestBuffer;
+  previewReceiveBuffer = nullptr;
+  previewLatestBuffer = nullptr;
+  previewCapacity = 0;
+  previewLatestLength = 0;
+  xSemaphoreGive(previewMutex);
+  free(receive);
+  free(latest);
+}
+
 size_t fetchJpegFrame(uint8_t *buf, size_t maxLen) {
   if (!cameraStreaming || !previewMutex) return 0;
   // Nonblocking UDP updates can carry a new DHCP address during a session.
@@ -2458,6 +2475,14 @@ void faceRequestWorker(void *parameter) {
   result.mode = job->mode;
   result.reply.acceptedSamples = -1;
   result.reply.requiredSamples = -1;
+  const bool resumeMjpeg = cameraStreaming && previewRequested.load();
+  if (resumeMjpeg && stopMjpegPreview()) {
+    releaseMjpegBuffers();
+    Serial.printf("[FACE] MJPEG paused for HTTPS upload; free heap=%u largest=%u\n",
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  } else if (resumeMjpeg) {
+    Serial.println("[FACE] MJPEG did not stop cleanly; continuing upload with current buffers");
+  }
   if (activeFaceSession.load() == job->session) {
     if (job->mode == FACE_REQUEST_VERIFY)
       result.success = postFaceVerify(job->userId, job->roomId, job->jpeg, job->length,
@@ -2467,6 +2492,14 @@ void faceRequestWorker(void *parameter) {
   }
   free(job->jpeg);
   delete job;
+  if (resumeMjpeg && cameraStreaming) {
+    if (startMjpegPreview()) {
+      Serial.printf("[FACE] MJPEG resumed after HTTPS upload; free heap=%u largest=%u\n",
+                    ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    } else {
+      Serial.println("[FACE] Upload finished, but MJPEG preview could not restart; retry camera session");
+    }
+  }
   // Queue publication copies the entire result atomically between tasks.
   if (activeFaceSession.load() == result.session && faceResults) {
     xQueueOverwrite(faceResults, &result);
