@@ -7,6 +7,7 @@ const { validateRequest, schemas } = require('../middleware/validationMiddleware
 const { getSheetData, appendRow, findRowIndex, updateRow } = require('../services/sheetsService');
 const { createNotification } = require('../services/notificationService');
 const rateLimit = require('express-rate-limit');
+const { randomUUID } = require('crypto');
 
 // ==================== RATE LIMITER ====================
 const authLimiter = rateLimit({
@@ -19,7 +20,10 @@ const authLimiter = rateLimit({
 
 // ==================== HELPER ====================
 function generateUserId() {
-  return `USR-${Date.now().toString().slice(-6)}`;
+  // The last-six-digit timestamp wrapped every ~16m40s and could assign an
+  // existing user's ID to a new registration. Biometric writes resolve by ID,
+  // so a collision could update the previous account's row.
+  return `USR-${Date.now()}-${randomUUID().slice(0, 8)}`;
 }
 
 // ==================== POST /api/auth/register ====================
@@ -49,7 +53,7 @@ router.post('/register', authLimiter, validateRequest(schemas.register), async (
 
     // Save to USERS sheet
     // Columns: userId | username | email | password | role | department | authorized_rooms | fingerprintId | faceDescriptor | faceStatus
-    await appendRow('USERS', [
+    const savedUser = await appendRow('USERS', [
       userId,
       name,
       email,
@@ -61,6 +65,9 @@ router.post('/register', authLimiter, validateRequest(schemas.register), async (
       '',           // faceDescriptor
       'NOT_ENROLLED', // faceStatus
     ]);
+    if (!savedUser?.success) {
+      return res.status(503).json({ success: false, message: 'Could not save the new user to Google Sheets. Please retry.' });
+    }
 
     // Issue JWT with assignedRole
     const token = jwt.sign(

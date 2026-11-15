@@ -188,19 +188,21 @@ async function appendRow(sheetName, rowData) {
     return { success: false, error: 'Google Sheets not configured' };
   }
 
-  // NOTE: insertDataOption must stay 'OVERWRITE' (the default). 'INSERT_ROWS'
-  // physically shifts every existing row down, which invalidates every cached
-  // _rowNumber and makes a later updateRow() write a user's face descriptor
-  // onto a DIFFERENT user's row. Appending after the last populated row keeps
-  // row numbers stable.
+  // Insert a physical row at the append point instead of allowing the Sheets
+  // API to overwrite cells when it mistakes a blank/formatted region for the
+  // end of the table. This protects existing users even when the sheet has
+  // gaps or a stale table boundary. Invalidate row-number caches both before
+  // and after the structural change.
   try {
     const response = await withRetry(() => sheets.spreadsheets.values.append({
       spreadsheetId,
       range: `${sheetName}!A1`,
+      insertDataOption: 'INSERT_ROWS',
       valueInputOption: 'USER_ENTERED',
       resource: { values: [rowData] }
     }));
-    console.log(`✅ [DATABASE-WRITE] (Google Sheets) Row appended to "${sheetName}" (${Date.now() - startTime}ms)`);
+    sheetDataCache.delete(cacheKey);
+    console.log(`✅ [DATABASE-WRITE] (Google Sheets) Row appended to "${sheetName}" at ${response.data.updates?.updatedRange || 'unknown range'} (${Date.now() - startTime}ms)`);
     return { success: true, updates: response.data.updates };
   } catch (sheetErr) {
     console.error(`❌ [DATABASE-WRITE] Sheets append failed for "${sheetName}" (${sheetErr.message}).`);
