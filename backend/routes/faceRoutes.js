@@ -5,7 +5,7 @@ const faceService = require('../services/faceService');
 const { getSheetData, findRowIndex, updateRow, appendRow, logAccessEvent } = require('../services/sheetsService');
 const { verifyToken, verifyAdmin } = require('../middleware/authMiddleware');
 const deviceAuth = require('../middleware/deviceAuth');
-const { checkNightLockout, trackFailedAttempt, clearFailedAttempts } = require('../services/securityService');
+const { trackFailedAttempt, clearFailedAttempts } = require('../services/securityService');
 const { enrollmentStatus, pendingCommands } = require('../services/sharedState');
 const gcsPhotoService = require('../services/gcsPhotoService');
 
@@ -282,16 +282,6 @@ router.post('/verify', deviceAuth.requireDeviceAuth, upload.single('faceImage'),
           meta: { roomId: roomId || '', distance: result.distance ?? '', similarityPercent: result.similarityPercent ?? '' },
         })
         .catch(() => {});
-    }
-
-    // [NIGHT LOCKOUT ENFORCEMENT]
-    if (result.success) {
-      const { lockedOut, message } = await checkNightLockout(userId);
-      if (lockedOut) {
-        console.warn(`🌙 [NIGHT-LOCKOUT] Access blocked for ${userId}: ${message}`);
-        result.success = false;
-        result.message = message;
-      }
     }
 
     // [INTRUSION DETECTION SYSTEM TRACKING]

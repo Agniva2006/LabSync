@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { getSheetData, appendRow, findRowIndex, updateRow, logAccessEvent } = require('../services/sheetsService');
 const { createNotification } = require('../services/notificationService');
-const { checkNightLockout, trackFailedAttempt, clearFailedAttempts } = require('../services/securityService');
+const { trackFailedAttempt, clearFailedAttempts } = require('../services/securityService');
 const faceService = require('../services/faceService');
 
 const { pendingCommands, deviceStatus, enrollmentStatus, pendingFaceAuth, cameraRegistry, heartbeatCounters, stateSize } = require('../services/sharedState');
@@ -20,21 +20,6 @@ router.post('/fingerprint-verified', async (req, res) => {
     console.log(`\n============================================================`);
     console.log(`🖐️ [BIOMETRIC-STEP 1] FINGERPRINT SCAN MATCHED`);
     console.log(`   Room ID: ${roomId} | User ID: ${userId} | DSP Slot: ${fingerId}`);
-
-    // [NIGHT LOCKOUT CHECK]
-    const { lockedOut, message } = await checkNightLockout(userId);
-    if (lockedOut) {
-      console.warn(`🌙 [NIGHT-LOCKOUT] Blocked access for ${userId}: ${message}`);
-      await logAccessEvent({
-        action: 'ENTRY',
-        authMethod: 'FINGERPRINT',
-        status: 'NIGHT_LOCKOUT',
-        userId: userId,
-        roomId: roomId,
-        details: message
-      });
-      return res.json({ success: false, message });
-    }
 
     // Clear failed attempts since fingerprint passed
     clearFailedAttempts(roomId);
