@@ -27,6 +27,9 @@ ESP32-CAM on same WiFi
 #include <WiFiUdp.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include "mbedtls/md.h"
+#include "mbedtls/sha256.h"
+#include "esp_random.h"
 
 // ============================================================
 // ⚠️  CHANGE THESE — WiFi and lab configuration
@@ -51,6 +54,24 @@ const char *CAMERA_IP_FALLBACK =
     "esp32cam"; // ← Set to CAM IP if mDNS fails (e.g. "192.168.1.100")
 
 const char *ROOM_ID = "ROOM-001";
+
+// ============================================================
+// DEVICE HMAC AUTHENTICATION
+// Must match backend .env: DEVICE_ID / DEVICE_SECRET.
+// Regenerate with: node scripts/generate_device_secret.js
+// ============================================================
+const char *DEVICE_ID = "test-esp32-01";          // ← must match .env DEVICE_ID
+const char *DEVICE_SECRET = "test-device-secret"; // ← must match .env DEVICE_SECRET
+
+// Working storage for the signature helper (set by deviceSignature()).
+String lastSigTs = "";
+String lastSigNonce = "";
+String lastSigSig = "";
+
+// Milliseconds since boot used as the timestamp source. The backend only
+// checks |now - ts| < REPLAY_WINDOW_MS (currently generous), and ntp sync is
+// not guaranteed at boot, so we anchor to boot-time epoch if available.
+unsigned long bootEpochOffset = 0;   // millis() at boot converted to a coarse ms timestamp
 
 // ============================================================
 // ESP32-CAM UDP DISCOVERY - RETAINED FROM esp32v2
@@ -1368,6 +1389,76 @@ String normalizeServerUrl(String url) {
 // HTTP GET
 // ============================================================
 
+// ============================================================
+// DEVICE HMAC SIGNATURE HELPERS
+// Canonical string: METHOD\npath\nts\nnonce\nsha256(body)
+// Matches backend deviceAuth.computeSignature() exactly.
+// ============================================================
+
+String deviceSha256Hex(const String &data) {
+  uint8_t hash[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  String hex = "";
+  if (info && mbedtls_md_setup(&ctx, info, 0) == 0 &&
+      mbedtls_md_starts(&ctx) == 0 &&
+      mbedtls_md_update(&ctx, (const unsigned char *)data.c_str(), data.length()) == 0 &&
+      mbedtls_md_finish(&ctx, hash) == 0) {
+    for (int i = 0; i < 32; i++) {
+      char b[3];
+      sprintf(b, "%02x", hash[i]);
+      hex += b;
+    }
+  }
+  mbedtls_md_free(&ctx);
+  return hex;
+}
+
+String deviceHmacHex(const String &canonical) {
+  uint8_t hash[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  String hex = "";
+  if (info && mbedtls_md_setup(&ctx, info, 1) == 0 &&
+      mbedtls_md_hmac_starts(&ctx, (const unsigned char *)DEVICE_SECRET,
+                             strlen(DEVICE_SECRET), 0) == 0 &&
+      mbedtls_md_hmac_update(&ctx, (const unsigned char *)canonical.c_str(),
+                             canonical.length()) == 0 &&
+      mbedtls_md_hmac_finish(&ctx, hash) == 0) {
+    for (int i = 0; i < 32; i++) {
+      char b[3];
+      sprintf(b, "%02x", hash[i]);
+      hex += b;
+    }
+  }
+  mbedtls_md_free(&ctx);
+  return hex;
+}
+
+// Compute the signature for a request. path must be the API path only
+// (e.g. "/api/esp32/get-commands/ROOM-001"), NOT the full URL.
+void deviceSignature(const String &method, const String &path,
+                     const String &body) {
+  String ts = String((unsigned long)(millis() + bootEpochOffset));
+  String nonce = String((unsigned long)esp_random(), 16);
+  String bodyHash = deviceSha256Hex(body);
+  String canonical = method + "\n" + path + "\n" + ts + "\n" + nonce + "\n" + bodyHash;
+  lastSigTs = ts;
+  lastSigNonce = nonce;
+  lastSigSig = deviceHmacHex(canonical);
+}
+
+void applyDeviceHeaders(HTTPClient &http, const String &method,
+                        const String &path, const String &body) {
+  deviceSignature(method, path, body);
+  http.addHeader("X-Device-Id", DEVICE_ID);
+  http.addHeader("X-Device-Ts", lastSigTs);
+  http.addHeader("X-Device-Nonce", lastSigNonce);
+  http.addHeader("X-Device-Sig", lastSigSig);
+}
+
 String httpGet(const String &path) {
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi(systemState == STATE_ACTIVE);
@@ -1400,6 +1491,8 @@ String httpGet(const String &path) {
       return "";
     }
 
+    applyDeviceHeaders(http, "GET", path, "");
+
     int code = http.GET();
 
     if (code == HTTP_CODE_OK) {
@@ -1414,6 +1507,8 @@ String httpGet(const String &path) {
     if (!http.begin(client, url)) {
       return "";
     }
+
+    applyDeviceHeaders(http, "GET", path, "");
 
     int code = http.GET();
 
@@ -1465,6 +1560,8 @@ String httpPostJson(const String &path, const String &jsonBody) {
 
     http.addHeader("Content-Type", "application/json");
 
+    applyDeviceHeaders(http, "POST", path, jsonBody);
+
     int code = http.POST(jsonBody);
 
     if (code > 0) {
@@ -1481,6 +1578,8 @@ String httpPostJson(const String &path, const String &jsonBody) {
     }
 
     http.addHeader("Content-Type", "application/json");
+
+    applyDeviceHeaders(http, "POST", path, jsonBody);
 
     int code = http.POST(jsonBody);
 
@@ -1557,9 +1656,19 @@ bool postMultipartStreaming(const String &path, const String &part1,
     Serial.printf("[HTTPS] Uploading %s (%u bytes)...\n", path.c_str(),
                   (unsigned int)totalLength);
 
+    deviceSignature("POST", path, "");
+
     client.printf("POST %s HTTP/1.1\r\n", path.c_str());
 
     client.printf("Host: %s\r\n", host.c_str());
+
+    client.printf("X-Device-Id: %s\r\n", DEVICE_ID);
+
+    client.printf("X-Device-Ts: %s\r\n", lastSigTs.c_str());
+
+    client.printf("X-Device-Nonce: %s\r\n", lastSigNonce.c_str());
+
+    client.printf("X-Device-Sig: %s\r\n", lastSigSig.c_str());
 
     client.printf("Content-Type: multipart/form-data; boundary=%s\r\n",
                   boundary.c_str());
@@ -1626,9 +1735,19 @@ bool postMultipartStreaming(const String &path, const String &part1,
       return false;
     }
 
+    deviceSignature("POST", path, "");
+
     client.printf("POST %s HTTP/1.1\r\n", path.c_str());
 
     client.printf("Host: %s:%d\r\n", host.c_str(), port);
+
+    client.printf("X-Device-Id: %s\r\n", DEVICE_ID);
+
+    client.printf("X-Device-Ts: %s\r\n", lastSigTs.c_str());
+
+    client.printf("X-Device-Nonce: %s\r\n", lastSigNonce.c_str());
+
+    client.printf("X-Device-Sig: %s\r\n", lastSigSig.c_str());
 
     client.printf("Content-Type: multipart/form-data; boundary=%s\r\n",
                   boundary.c_str());
@@ -2716,6 +2835,34 @@ void checkForAdminCommands() {
 
     enterIdleMode();
 
+    return;
+  }
+
+  if (command.startsWith("DELETE_FP:")) {
+    // Free the DSP slot of a deleted user so the finger stops matching.
+    int slot = command.substring(10).toInt();
+
+    wakeToActive("Sensor cleanup");
+
+    bool ok = false;
+    if (slot >= 1 && slot <= (int)finger.capacity) {
+      uint8_t delResult = finger.deleteModel(slot);
+      ok = (delResult == FINGERPRINT_OK);
+      Serial.printf("[FP-DELETE] Slot %d delete result: 0x%02X (%s)\n", slot,
+                    delResult, ok ? "freed" : "failed");
+    } else {
+      Serial.printf("[FP-DELETE] Invalid slot %d requested\n", slot);
+    }
+
+    tftShowFullScreen(ok ? "SENSOR CLEANED" : "CLEANUP FAILED",
+                      "Slot #" + String(slot), ok ? COLOR_GREEN : COLOR_RED);
+    delay(1200);
+
+    lastExecutedCommandId = commandId;
+    acknowledgeCommand(commandId, ok,
+                       ok ? "Fingerprint slot freed" : "Slot delete failed");
+
+    enterIdleMode();
     return;
   }
 

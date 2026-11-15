@@ -358,7 +358,23 @@ class FaceRecognitionService {
         }
       }
 
-      console.log(`✅ [BIOMETRIC-SYNC] Completed universal sync. Loaded ${Math.floor(this.faceDatabase.size / 2)} face templates in memory, healed ${healedCount} user(s).`);
+      // PRUNE step: Google Sheets is the single source of truth. Any userId
+      // still present in memory but absent from the sheet (deleted user) must
+      // be dropped here — otherwise a removed user keeps verifying forever.
+      let prunedCount = 0;
+      for (const [key, entry] of Array.from(this.faceDatabase.entries())) {
+        const memId = entry?.rawUserId || key;
+        const normMemId = this._normalizeKey(memId);
+        const stillExists = normMemId && (users || []).some(u => this._normalizeKey(u.userid || u.userId) === normMemId);
+        if (!stillExists) {
+          this.faceDatabase.delete(key);
+          if (this._negativeFaceCache) this._negativeFaceCache.add(normMemId);
+          prunedCount++;
+          console.log(`🧹 [BIOMETRIC-SYNC] Pruned deleted user "${memId}" from in-memory face database`);
+        }
+      }
+
+      console.log(`✅ [BIOMETRIC-SYNC] Completed universal sync. Loaded ${Math.floor(this.faceDatabase.size / 2)} face templates in memory, healed ${healedCount} user(s), pruned ${prunedCount} deleted user(s).`);
       return true;
     } catch (error) {
       console.error('❌ [BIOMETRIC-SYNC-ERROR]:', error.message);

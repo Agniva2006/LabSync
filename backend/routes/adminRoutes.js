@@ -240,9 +240,18 @@ router.post('/users/delete', async (req, res) => {
     }
 
     let deletedCount = 0;
+    const { enrollmentStatus, faceEnrollmentSessions, pendingCommands } = require('../services/sharedState');
     for (const userId of userIds) {
       let rowIndex = await findRowIndex('USERS', 'userid', userId);
       if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', userId);
+
+      // Capture the fingerprint slot BEFORE deleting the row, so we can tell
+      // the hardware to free the DSP slot too (otherwise the finger keeps
+      // matching after the account is gone).
+      const users = await getSheetData('USERS');
+      const normId = String(userId).trim().toLowerCase();
+      const user = (users || []).find(u => String(u.userid || u.userId || '').trim().toLowerCase() === normId);
+      const fpId = user ? (user.fingerprintid || user.fingerprintId || '').toString().trim() : '';
 
       if (rowIndex !== -1) {
         await deleteRow('USERS', rowIndex);
@@ -252,11 +261,43 @@ router.post('/users/delete', async (req, res) => {
         console.warn(`⚠️ User not found in Sheets for deletion: ${userId}`);
       }
 
-      // Also clean up from in-memory face database (Google Sheets row deleted above)
+      // Clean up from in-memory face database (Google Sheets row deleted above)
       try {
         await faceService.deleteFace(userId);
       } catch (e) {}
+
+      // Invalidate every enrollment-status cache entry for this user —
+      // otherwise /enrollment-status keeps reporting them as enrolled.
+      try {
+        enrollmentStatus.delete(userId);
+        enrollmentStatus.delete(normId);
+        faceEnrollmentSessions.delete(userId);
+      } catch (e) {}
+
+      // Ask the ESP32 to delete the fingerprint template from sensor flash.
+      // The device frees slot fpId and ACKs; harmless if already free.
+      if (fpId) {
+        try {
+          for (const room of String(user?.authorized_rooms || 'ROOM-001').split(',')) {
+            const roomId = room.trim();
+            if (!roomId) continue;
+            pendingCommands.set(roomId, {
+              command: `DELETE_FP:${fpId}`,
+              userName: 'System',
+              adminId: 'SYSTEM',
+              timestamp: new Date().toISOString(),
+            });
+            console.log(`🗑️ [FP-DELETE] Queued DELETE_FP:${fpId} for sensor in ${roomId}`);
+          }
+        } catch (e) {
+          console.warn('⚠️ Could not queue fingerprint deletion:', e.message);
+        }
+      }
     }
+
+    // Force the face service to reload from Sheets so deleted users can never
+    // be resolved from a stale in-memory template again.
+    try { await faceService.loadFacesFromSheet(); } catch (e) {}
 
     res.json({ success: true, message: `Deleted ${deletedCount} of ${userIds.length} users` });
   } catch (error) {

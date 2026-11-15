@@ -34,13 +34,13 @@ router.post('/register', authLimiter, validateRequest(schemas.register), async (
       return res.status(400).json({ success: false, message: 'Email already registered' });
     }
 
-    // Auto-calculate next available fingerprint slot ID (1, 2, 3...)
-    let maxFpId = 0;
-    users.forEach(u => {
-      const idNum = parseInt(u.fingerprintId || u.fingerprintid || '0');
-      if (!isNaN(idNum) && idNum > maxFpId) maxFpId = idNum;
-    });
-    const nextFpId = String(maxFpId + 1);
+    // NOTE: We no longer pre-reserve a fingerprint slot at registration.
+    // Reserving "maxFpId + 1" here was the root cause of "wrong user matched":
+    // the slot number was never actually loaded on the physical sensor, and
+    // later the sensor matching that slot resolved to this unrelated account.
+    // The real slot is assigned by the hardware during enrollment
+    // (enrollment-complete) and written to Sheets there.
+    const nextFpId = ''; // assigned by hardware during ESP32 enrollment
 
     // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -57,7 +57,7 @@ router.post('/register', authLimiter, validateRequest(schemas.register), async (
       assignedRole,
       department,
       'ROOM-001',   // default authorized_rooms
-      nextFpId,     // fingerprintId
+      '',           // fingerprintId — assigned by hardware during ESP32 enrollment
       '',           // faceDescriptor
       'NOT_ENROLLED', // faceStatus
     ]);
@@ -70,9 +70,9 @@ router.post('/register', authLimiter, validateRequest(schemas.register), async (
     );
 
     // Welcome notification
-    await createNotification(userId, '👋 Welcome to LabSync!', `Your account has been created as ${assignedRole.toUpperCase()}. Fingerprint slot #${nextFpId} reserved.`, 'info');
+    await createNotification(userId, '👋 Welcome to LabSync!', `Your account has been created as ${assignedRole.toUpperCase()}. Enroll your fingerprint & face on the lab terminal to enable door access.`, 'info');
 
-    console.log(`✅ User registered: ${name} (${userId}) [role: ${assignedRole}, fpSlot: #${nextFpId}]`);
+    console.log(`✅ User registered: ${name} (${userId}) [role: ${assignedRole}]`);
 
     res.status(201).json({
       success: true,
@@ -84,7 +84,7 @@ router.post('/register', authLimiter, validateRequest(schemas.register), async (
         email,
         role: assignedRole,
         department,
-        fingerprintId: nextFpId,
+        fingerprintId: '', // assigned by hardware during enrollment
         faceStatus: 'NOT_ENROLLED',
       },
     });

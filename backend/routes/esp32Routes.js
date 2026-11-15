@@ -454,10 +454,12 @@ router.post('/enrollment-complete', async (req, res) => {
     console.log(`\n📝 ENROLLMENT COMPLETE (FINGERPRINT)`);
     console.log(`   Finger ID: ${fingerId} | User: ${userName} (${userId}) | Role: ${role || 'N/A'}`);
 
-    // Update USERS sheet fingerprintId column — PRESERVE face data
+    // Update USERS sheet fingerprintId column — PRESERVE face data.
+    // Reads must be FRESH: a biometric write must never target a stale
+    // physical row number (that wrote one user's data onto another's row).
     const users = await getSheetData('USERS');
-    let rowIndex = await findRowIndex('USERS', 'userid', userId);
-    if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', userId);
+    let rowIndex = await findRowIndex('USERS', 'userid', userId, { fresh: true });
+    if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', userId, { fresh: true });
 
     const normId = String(userId).toLowerCase();
     const user = (users || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId) || {};
@@ -717,8 +719,8 @@ router.post('/bind-fingerprint', async (req, res) => {
 
     console.log(`🔗 [BIND-FINGERPRINT] Remotely binding Slot ${targetFp} to User: ${userId}`);
 
-    let rowIndex = await findRowIndex('USERS', 'userid', userId);
-    if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', userId);
+    let rowIndex = await findRowIndex('USERS', 'userid', userId, { fresh: true });
+    if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', userId, { fresh: true });
 
     const users = await getSheetData('USERS');
     const normId = String(userId).toLowerCase();
