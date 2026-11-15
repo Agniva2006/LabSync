@@ -1,13 +1,40 @@
 /*
 
-LabSync Main ESP32 Client v3.6 - Camera Wake Handshake + Async Face Processing
+LabSync Main ESP32 Client v3.10 - Cooling Fan + Timed Push Button Door OR Logic
 
 Hardware:
 ESP32 DevKit / WROOM
 R307 / AS608 fingerprint sensor
 ILI9341 TFT
-Relay
+Door relay on GPIO 26
+Cooling fan relay on GPIO 27
+Normally-open push button between GPIO 25 and GND
 ESP32-CAM on same WiFi
+
+Door control:
+- A debounced button press starts or restarts a 5-second unlock timer.
+- Releasing the button does not cancel that timer. Holding the button
+  still keeps the door unlocked, preserving the original held-button logic.
+- Access grants from biometrics or admin unlock remain active for 5 seconds.
+- buttonUnlockRequest = buttonPressed || buttonUnlockActive.
+- doorUnlocked = buttonUnlockRequest || accessGranted.
+- The door locks only when BOTH inputs are 0.
+- INPUT_PULLDOWN wiring: GPIO 25 -- normally-open button -- 3.3 V.
+  A physical HIGH is converted to logical pressed = true.
+- A separate task checks the button during camera, enrollment, and HTTP waits.
+- Backend door-closed reporting follows the relay's lock command, not a
+  physical door-position sensor. Reports are sent by the main task when idle.
+
+Cooling fan:
+- OFF at startup. First scheduled ON cycle after 15 minutes.
+- Scheduled ON every 15 minutes, for 3 minutes.
+- Fingerprint activity, enrollment, camera start/stop, and door opening
+  also start or restart the 3-minute ON period. Button presses do too.
+- Activity does not move the independent 15-minute schedule.
+- A separate FreeRTOS task handles fan timing during blocking operations.
+- Fan relay defaults to active-HIGH. Set FAN_RELAY_ACTIVE_HIGH to false
+  for an active-LOW relay module. Use a 3.3 V-compatible relay input;
+  GPIO 27 controls the module input, not the fan or bare relay coil.
 
 */
 
@@ -28,8 +55,9 @@ ESP32-CAM on same WiFi
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "mbedtls/md.h"
-#include "mbedtls/sha256.h"
 #include "esp_random.h"
+#include <time.h>
+#include <sys/time.h>
 
 // ============================================================
 // ⚠️  CHANGE THESE — WiFi and lab configuration
@@ -40,8 +68,7 @@ const char *WIFI_PASSWORD = "4064097a"; // ← Change to your WiFi password
 
 // Default Server URL (Can be changed dynamically via Preferences / Serial
 // without reflashing)
-const char *DEFAULT_SERVER_URL =
-    "https://labsync-460952407297.asia-south1.run.app";
+const char *DEFAULT_SERVER_URL = "https://labsync-460952407297.asia-south1.run.app";
 String activeServerUrl = DEFAULT_SERVER_URL;
 
 const char *CAMERA_MDNS_NAME = "esp32cam";
@@ -50,8 +77,9 @@ const char *CAMERA_MDNS_NAME = "esp32cam";
 CAMERA_IP_FALLBACK:
 Used only if mDNS, Backend Registry, and NVS Cache all fail.
 */
-const char *CAMERA_IP_FALLBACK =
-    "esp32cam"; // ← Set to CAM IP if mDNS fails (e.g. "192.168.1.100")
+// Manual fallback requires a numeric IP, e.g. "192.168.1.100".
+// The existing "esp32cam" value is retained; mDNS uses CAMERA_MDNS_NAME.
+const char *CAMERA_IP_FALLBACK = "esp32cam";
 
 const char *ROOM_ID = "ROOM-001";
 
@@ -63,15 +91,31 @@ const char *ROOM_ID = "ROOM-001";
 const char *DEVICE_ID = "test-esp32-01";          // ← must match .env DEVICE_ID
 const char *DEVICE_SECRET = "test-device-secret"; // ← must match .env DEVICE_SECRET
 
-// Working storage for the signature helper (set by deviceSignature()).
-String lastSigTs = "";
-String lastSigNonce = "";
-String lastSigSig = "";
+// Authentication requires wall-clock epoch milliseconds. Wait for NTP rather
+// than signing requests with uptime. gettimeofday keeps seconds and fractions
+// from the same clock, unlike time(nullptr) + millis() % 1000.
+unsigned long long epochMs() {
+  struct timeval now = {};
+  if (gettimeofday(&now, nullptr) != 0 || now.tv_sec <= 1600000000) {
+    return 0;
+  }
+  return static_cast<unsigned long long>(now.tv_sec) * 1000ULL +
+         static_cast<unsigned long long>(now.tv_usec) / 1000ULL;
+}
 
-// Milliseconds since boot used as the timestamp source. The backend only
-// checks |now - ts| < REPLAY_WINDOW_MS (currently generous), and ntp sync is
-// not guaranteed at boot, so we anchor to boot-time epoch if available.
-unsigned long bootEpochOffset = 0;   // millis() at boot converted to a coarse ms timestamp
+void ensureDeviceTimeSync() {
+  static bool configured = false;
+  if (!configured && WiFi.status() == WL_CONNECTED) {
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    configured = true;
+    Serial.println("NTP sync requested (pool.ntp.org)");
+  }
+}
+
+// Command idempotency: an ACKed command re-delivered by the backend must not
+// run a second time (that used to re-run enrollments).
+String lastExecutedCommandId = "";
+bool lastExecutedCommandOk = false;
 
 // ============================================================
 // ESP32-CAM UDP DISCOVERY - RETAINED FROM esp32v2
@@ -100,11 +144,11 @@ constexpr int TFT_DC = 2;
 constexpr int TFT_MOSI = 23;
 constexpr int TFT_SCLK = 18;
 constexpr int TFT_MISO = 19;
-constexpr int TFT_LED = 21; // Connect TFT 'LED'/'BL' pin to GPIO 21 (or wire
-                            // directly to 3.3V rail for always-on)
+// Connect TFT LED/BL to GPIO 21, or directly to 3.3 V for always-on.
+constexpr int TFT_LED = 21;
 
-constexpr uint8_t TFT_ROTATION =
-    2; // Portrait 240 x 320 (180-degree portrait orientation)
+// Portrait 240 x 320 (180-degree portrait orientation).
+constexpr uint8_t TFT_ROTATION = 2;
 
 // ============================================================
 // FINGERPRINT
@@ -122,6 +166,28 @@ constexpr uint32_t FP_BAUD = 57600;
 constexpr int RELAY_PIN = 26;
 
 constexpr unsigned long RELAY_OPEN_MS = 5000;
+constexpr bool DOOR_RELAY_ACTIVE_HIGH = true;
+constexpr int DOOR_RELAY_ON_LEVEL = DOOR_RELAY_ACTIVE_HIGH ? HIGH : LOW;
+constexpr int DOOR_RELAY_OFF_LEVEL = DOOR_RELAY_ACTIVE_HIGH ? LOW : HIGH;
+
+// Normally-open button between GPIO 25 and GND. Pressed is logical 1.
+constexpr int DOOR_BUTTON_PIN = 25;
+constexpr uint32_t DOOR_BUTTON_DEBOUNCE_MS = 30;
+constexpr uint32_t DOOR_BUTTON_UNLOCK_MS = 5000;
+constexpr uint32_t DOOR_TASK_POLL_MS = 10;
+
+// Cooling fan relay. Independent of the existing door relay above.
+constexpr int FAN_RELAY_PIN = 27;
+constexpr bool FAN_RELAY_ACTIVE_HIGH = true;
+constexpr int FAN_RELAY_ON_LEVEL = FAN_RELAY_ACTIVE_HIGH ? HIGH : LOW;
+constexpr int FAN_RELAY_OFF_LEVEL = FAN_RELAY_ACTIVE_HIGH ? LOW : HIGH;
+constexpr uint32_t FAN_RUN_MS = 3UL * 60UL * 1000UL;
+constexpr uint32_t FAN_INTERVAL_MS = 15UL * 60UL * 1000UL;
+constexpr uint32_t FAN_TASK_POLL_MS = 50;
+
+static_assert(FAN_RELAY_PIN != RELAY_PIN, "Fan and door require separate GPIOs");
+static_assert(DOOR_BUTTON_PIN != RELAY_PIN && DOOR_BUTTON_PIN != FAN_RELAY_PIN, "Button and relays require separate GPIOs");
+static_assert(FAN_RUN_MS < FAN_INTERVAL_MS, "Fan run must be shorter than interval");
 
 // ============================================================
 // TIMING
@@ -145,7 +211,6 @@ constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 5000;
 constexpr size_t JPEG_BUFFER_PRIMARY_BYTES = 45000;
 constexpr size_t JPEG_BUFFER_FALLBACK_1_BYTES = 38000;
 constexpr size_t JPEG_BUFFER_FALLBACK_2_BYTES = 32000;
-constexpr size_t MIN_FACE_JPEG_BYTES = 7500; // Human face + clothing in QVGA produces >= 7.5KB; filters out empty walls
 
 // ============================================================
 // TFT LAYOUT
@@ -221,20 +286,215 @@ int16_t previousIdleX = -1;
 int16_t previousIdleY = -1;
 
 // ============================================================
+// COOLING FAN CONTROL
+// ============================================================
+
+TaskHandle_t coolingFanTaskHandle = nullptr;
+
+// Only this worker writes the fan output after initialization. Notifications
+// let activity restart its timer without sharing mutable timing variables.
+void coolingFanWorker(void *parameter) {
+  (void)parameter;
+
+  uint32_t lastPeriodicAt = millis();
+  uint32_t lastTriggeredAt = 0;
+  bool fanOn = false;
+
+  for (;;) {
+    bool trigger = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(FAN_TASK_POLL_MS)) > 0;
+    const uint32_t now = millis();
+    const uint32_t periodicElapsed = now - lastPeriodicAt;
+
+    if (periodicElapsed >= FAN_INTERVAL_MS) {
+      // Retain the original cadence, even if this task was scheduled late.
+      lastPeriodicAt += (periodicElapsed / FAN_INTERVAL_MS) * FAN_INTERVAL_MS;
+      trigger = true;
+    }
+
+    if (trigger) {
+      lastTriggeredAt = now;
+      if (!fanOn) {
+        digitalWrite(FAN_RELAY_PIN, FAN_RELAY_ON_LEVEL);
+        fanOn = true;
+      }
+    }
+
+    // Unsigned subtraction also handles the millis() counter wrapping.
+    if (fanOn && static_cast<uint32_t>(now - lastTriggeredAt) >= FAN_RUN_MS) {
+      digitalWrite(FAN_RELAY_PIN, FAN_RELAY_OFF_LEVEL);
+      fanOn = false;
+    }
+  }
+}
+
+bool initCoolingFan() {
+  if (coolingFanTaskHandle != nullptr) {
+    return true;
+  }
+
+  // Preload OFF before enabling the output to reduce switching glitches.
+  digitalWrite(FAN_RELAY_PIN, FAN_RELAY_OFF_LEVEL);
+  pinMode(FAN_RELAY_PIN, OUTPUT);
+  digitalWrite(FAN_RELAY_PIN, FAN_RELAY_OFF_LEVEL);
+
+  const BaseType_t created =
+      xTaskCreate(coolingFanWorker, "coolingFan", 2048, nullptr, 1, &coolingFanTaskHandle);
+  if (created != pdPASS) {
+    coolingFanTaskHandle = nullptr;
+    digitalWrite(FAN_RELAY_PIN, FAN_RELAY_OFF_LEVEL);
+    Serial.println("ERROR: Cooling fan task creation failed; fan remains OFF.");
+    return false;
+  }
+
+  Serial.println("Cooling fan ready: GPIO 27, 3 minutes ON, 15-minute schedule.");
+  return true;
+}
+
+void requestCoolingFan() {
+  if (coolingFanTaskHandle != nullptr) {
+    xTaskNotifyGive(coolingFanTaskHandle);
+  }
+}
+
+// ============================================================
+// DOOR BUTTON / ACCESS OR CONTROLLER
+// ============================================================
+
+TaskHandle_t doorControlTaskHandle = nullptr;
+portMUX_TYPE doorStateMux = portMUX_INITIALIZER_UNLOCKED;
+bool doorRelayUnlocked = false;
+bool doorClosedReportPending = false;
+
+// The worker owns the door output. Only these status flags cross tasks.
+void publishDoorRelayState(bool unlocked) {
+  portENTER_CRITICAL(&doorStateMux);
+  doorRelayUnlocked = unlocked;
+  // A new opening cancels an obsolete, unsent closed-state report.
+  doorClosedReportPending = !unlocked;
+  portEXIT_CRITICAL(&doorStateMux);
+}
+
+bool takeDoorClosedReport() {
+  portENTER_CRITICAL(&doorStateMux);
+  const bool pending = doorClosedReportPending && !doorRelayUnlocked;
+  if (pending) {
+    doorClosedReportPending = false;
+  }
+  portEXIT_CRITICAL(&doorStateMux);
+  return pending;
+}
+
+void doorControlWorker(void *parameter) {
+  (void)parameter;
+
+  // Start with a released logical button; even a button held at boot must
+  // remain stable for the debounce period before it can unlock the door.
+  bool lastRawPressed = false;
+  bool buttonPressed = false;
+  uint32_t rawChangedAt = millis();
+  bool buttonUnlockActive = false;
+  uint32_t buttonUnlockStartedAt = 0;
+  bool accessGranted = false;
+  uint32_t accessGrantedAt = 0;
+  bool unlocked = false;
+
+  for (;;) {
+    const bool newAccessGrant = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(DOOR_TASK_POLL_MS)) > 0;
+    const uint32_t now = millis();
+    const bool rawPressed = digitalRead(DOOR_BUTTON_PIN) == HIGH;
+
+    if (rawPressed != lastRawPressed) {
+      lastRawPressed = rawPressed;
+      rawChangedAt = now;
+    }
+
+    if (buttonPressed != lastRawPressed &&
+        static_cast<uint32_t>(now - rawChangedAt) >= DOOR_BUTTON_DEBOUNCE_MS) {
+      buttonPressed = lastRawPressed;
+      if (buttonPressed) {
+        buttonUnlockActive = true;
+        buttonUnlockStartedAt = now;
+        requestCoolingFan();
+      }
+    }
+
+    if (newAccessGrant) {
+      accessGranted = true;
+      accessGrantedAt = now;
+      requestCoolingFan();
+    }
+
+    if (buttonUnlockActive &&
+        static_cast<uint32_t>(now - buttonUnlockStartedAt) >= DOOR_BUTTON_UNLOCK_MS) {
+      buttonUnlockActive = false;
+    }
+
+    if (accessGranted && static_cast<uint32_t>(now - accessGrantedAt) >= RELAY_OPEN_MS) {
+      accessGranted = false;
+    }
+
+    // A quick tap remains active for 5 seconds. A held button remains active
+    // until released, even if its timer has already expired.
+    const bool buttonUnlockRequest = buttonPressed || buttonUnlockActive;
+    const bool shouldUnlock = buttonUnlockRequest || accessGranted;
+    if (shouldUnlock != unlocked) {
+      digitalWrite(RELAY_PIN, shouldUnlock ? DOOR_RELAY_ON_LEVEL : DOOR_RELAY_OFF_LEVEL);
+      unlocked = shouldUnlock;
+      publishDoorRelayState(unlocked);
+    }
+  }
+}
+
+bool initDoorControl() {
+  if (doorControlTaskHandle != nullptr) {
+    return true;
+  }
+
+  digitalWrite(RELAY_PIN, DOOR_RELAY_OFF_LEVEL);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, DOOR_RELAY_OFF_LEVEL);
+  pinMode(DOOR_BUTTON_PIN, INPUT_PULLDOWN);
+
+  portENTER_CRITICAL(&doorStateMux);
+  doorRelayUnlocked = false;
+  doorClosedReportPending = false;
+  portEXIT_CRITICAL(&doorStateMux);
+
+  const BaseType_t created =
+      xTaskCreate(doorControlWorker, "doorControl", 2048, nullptr, 1, &doorControlTaskHandle);
+  if (created != pdPASS) {
+    doorControlTaskHandle = nullptr;
+    digitalWrite(RELAY_PIN, DOOR_RELAY_OFF_LEVEL);
+    Serial.println("ERROR: Door control task creation failed; door output remains locked.");
+    return false;
+  }
+
+  Serial.println("Door ready: GPIO 25 button OR 5-second access grant; relay GPIO 26.");
+  return true;
+}
+
+bool requestDoorAccess() {
+  if (doorControlTaskHandle == nullptr) {
+    return false;
+  }
+
+  // Notifications restart the worker's access timer, independent of the UI.
+  xTaskNotifyGive(doorControlTaskHandle);
+  return true;
+}
+
+// ============================================================
 // JPEG BUFFER ALLOCATION
 // ============================================================
 
 bool allocateJpegBuffer() {
-  const size_t candidates[] = {JPEG_BUFFER_PRIMARY_BYTES,
-                               JPEG_BUFFER_FALLBACK_1_BYTES,
+  const size_t candidates[] = {JPEG_BUFFER_PRIMARY_BYTES, JPEG_BUFFER_FALLBACK_1_BYTES,
                                JPEG_BUFFER_FALLBACK_2_BYTES};
 
   Serial.println();
   Serial.println("Allocating JPEG buffer...");
-  Serial.printf("Free heap before JPEG buffer: %u bytes\n",
-                (unsigned int)ESP.getFreeHeap());
-  Serial.printf("Largest allocatable heap block: %u bytes\n",
-                (unsigned int)ESP.getMaxAllocHeap());
+  Serial.printf("Free heap before JPEG buffer: %u bytes\n", (unsigned int)ESP.getFreeHeap());
+  Serial.printf("Largest allocatable heap block: %u bytes\n", (unsigned int)ESP.getMaxAllocHeap());
 
   for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
     const size_t requested = candidates[i];
@@ -246,10 +506,8 @@ bool allocateJpegBuffer() {
     if (jpegBuffer != nullptr) {
       jpegBufferCapacity = requested;
 
-      Serial.printf("JPEG buffer allocated: %u bytes\n",
-                    (unsigned int)jpegBufferCapacity);
-      Serial.printf("Free heap after JPEG buffer: %u bytes\n",
-                    (unsigned int)ESP.getFreeHeap());
+      Serial.printf("JPEG buffer allocated: %u bytes\n", (unsigned int)jpegBufferCapacity);
+      Serial.printf("Free heap after JPEG buffer: %u bytes\n", (unsigned int)ESP.getFreeHeap());
 
       return true;
     }
@@ -259,8 +517,7 @@ bool allocateJpegBuffer() {
 
   Serial.println("ERROR: Unable to allocate JPEG buffer.");
   Serial.printf("Free heap: %u bytes\n", (unsigned int)ESP.getFreeHeap());
-  Serial.printf("Largest allocatable heap block: %u bytes\n",
-                (unsigned int)ESP.getMaxAllocHeap());
+  Serial.printf("Largest allocatable heap block: %u bytes\n", (unsigned int)ESP.getMaxAllocHeap());
 
   return false;
 }
@@ -269,8 +526,7 @@ bool allocateJpegBuffer() {
 // TFT STATUS
 // ============================================================
 
-void tftShowStatus(const String &line1, const String &line2,
-                   uint16_t color = COLOR_WHITE) {
+void tftShowStatus(const String &line1, const String &line2, uint16_t color = COLOR_WHITE) {
   int16_t y = tft.height() - STATUS_HEIGHT;
 
   tft.fillRect(0, y, tft.width(), STATUS_HEIGHT, COLOR_BG);
@@ -296,8 +552,7 @@ void tftShowStatus(const String &line1, const String &line2,
 // TFT FULL SCREEN
 // ============================================================
 
-void tftShowFullScreen(const String &title, const String &subtitle,
-                       uint16_t titleColor) {
+void tftShowFullScreen(const String &title, const String &subtitle, uint16_t titleColor) {
   tft.fillScreen(COLOR_BG);
 
   tft.fillRect(0, 0, tft.width(), 32, titleColor);
@@ -481,6 +736,8 @@ void enterIdleMode() {
 // ============================================================
 
 void wakeToActive(const String &reason) {
+  requestCoolingFan();
+
   systemState = STATE_ACTIVE;
 
   tft.fillScreen(COLOR_BG);
@@ -488,8 +745,8 @@ void wakeToActive(const String &reason) {
   for (int i = 0; i < 4; i++) {
     int margin = 25 - (i * 5);
 
-    tft.drawRect(margin, margin, tft.width() - (margin * 2),
-                 tft.height() - (margin * 2), COLOR_CYAN);
+    tft.drawRect(margin, margin, tft.width() - (margin * 2), tft.height() - (margin * 2),
+                 COLOR_CYAN);
 
     delay(45);
   }
@@ -503,6 +760,7 @@ void wakeToActive(const String &reason) {
 
 void connectWiFi(bool showOnDisplay = true) {
   if (WiFi.status() == WL_CONNECTED) {
+    ensureDeviceTimeSync();
     return;
   }
 
@@ -533,6 +791,8 @@ void connectWiFi(bool showOnDisplay = true) {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("WiFi connected");
     Serial.println("Main ESP32 IP: " + WiFi.localIP().toString());
+
+    ensureDeviceTimeSync();
 
     if (showOnDisplay) {
       tftShowStatus("WiFi connected", WiFi.localIP().toString(), COLOR_GREEN);
@@ -613,8 +873,7 @@ void initFingerprint() {
     if (verifyFingerprintSensor()) {
       fingerprintReady = true;
 
-      tftShowStatus("Fingerprint READY", String(finger.capacity) + " slots",
-                    COLOR_GREEN);
+      tftShowStatus("Fingerprint READY", String(finger.capacity) + " slots", COLOR_GREEN);
 
       return;
     }
@@ -624,8 +883,7 @@ void initFingerprint() {
 
   fingerprintReady = false;
 
-  tftShowStatus("Fingerprint unavailable", "Background retry active",
-                COLOR_YELLOW);
+  tftShowStatus("Fingerprint unavailable", "Background retry active", COLOR_YELLOW);
 
   Serial.println("Fingerprint not ready at boot; background retry enabled");
 }
@@ -659,37 +917,6 @@ bool ipIsZero(const IPAddress &ip) {
 
 // Forward declaration for dynamic camera resolution via backend
 String httpGet(const String &path);
-bool httpPostJson(const String &path, const String &body);
-
-// ============================================================
-// COMMAND ACKNOWLEDGEMENT
-// ============================================================
-// The backend keeps a command queued until the device explicitly ACKs it
-// (/api/esp32/command-ack). Without an ACK the command stays queued until its
-// TTL expires, so the SAME enrollment (or unlock) is delivered again on the
-// next poll and runs a second time. Always ACK after executing a command.
-// Last executed commandId — prevents re-running the same command if the ACK
-// post is lost and the backend re-delivers it before TTL expiry.
-String lastExecutedCommandId = "";
-
-void acknowledgeCommand(const String &commandId, bool ok, const String &detail) {
-  if (commandId.length() == 0) return;
-
-  StaticJsonDocument<256> ackDoc;
-  ackDoc["roomId"] = ROOM_ID;
-  ackDoc["commandId"] = commandId;
-  ackDoc["ok"] = ok;
-  if (detail.length() > 0) ackDoc["detail"] = detail;
-
-  String ackBody;
-  serializeJson(ackDoc, ackBody);
-
-  if (httpPostJson("/api/esp32/command-ack", ackBody)) {
-    Serial.println("[COMMAND-ACK] Backend acknowledged command execution");
-  } else {
-    Serial.println("[COMMAND-ACK] WARNING: ack post failed — command may be re-delivered");
-  }
-}
 
 void cacheCameraIp(const String &ip) {
   if (ip.length() == 0)
@@ -799,8 +1026,7 @@ bool resolveCamera(const String &excludedBaseUrl = "") {
   // =========================================================
   Serial.println("Trying ESP32-CAM UDP discovery...");
 
-  if (processCameraUdpAnnouncement(CAMERA_UDP_WAIT_MS) &&
-      cameraBaseUrl != excludedBaseUrl) {
+  if (processCameraUdpAnnouncement(CAMERA_UDP_WAIT_MS) && cameraBaseUrl != excludedBaseUrl) {
     return true;
   }
 
@@ -816,8 +1042,7 @@ bool resolveCamera(const String &excludedBaseUrl = "") {
 
     IPAddress camIp = MDNS.queryHost(CAMERA_MDNS_NAME, 900);
 
-    if (!ipIsZero(camIp) &&
-        "http://" + camIp.toString() != excludedBaseUrl) {
+    if (!ipIsZero(camIp) && "http://" + camIp.toString() != excludedBaseUrl) {
       setCameraIp(camIp.toString(), "mDNS", true);
 
       return true;
@@ -837,8 +1062,7 @@ bool resolveCamera(const String &excludedBaseUrl = "") {
   if (cachedIp.length() > 0) {
     IPAddress parsed;
 
-    if (parsed.fromString(cachedIp) &&
-        "http://" + cachedIp != excludedBaseUrl) {
+    if (parsed.fromString(cachedIp) && "http://" + cachedIp != excludedBaseUrl) {
       setCameraIp(cachedIp, "NVS cache", false);
 
       return true;
@@ -879,8 +1103,7 @@ bool resolveCamera(const String &excludedBaseUrl = "") {
 
     IPAddress parsed;
 
-    if (parsed.fromString(fallback) &&
-        "http://" + fallback != excludedBaseUrl) {
+    if (parsed.fromString(fallback) && "http://" + fallback != excludedBaseUrl) {
       setCameraIp(fallback, "manual fallback", false);
 
       return true;
@@ -937,8 +1160,8 @@ bool sendCameraCmd(const char *path) {
   }
   http.end();
 
-  Serial.printf("Camera HTTP %d after %lu ms: %s\n", cameraLastHttpCode,
-                millis() - startedAt, cameraLastResponse.c_str());
+  Serial.printf("Camera HTTP %d after %lu ms: %s\n", cameraLastHttpCode, millis() - startedAt,
+                cameraLastResponse.c_str());
   if (cameraLastHttpCode != HTTP_CODE_OK) {
     // Keep the address. An HTTP 500 is a reachable camera with an error.
     return false;
@@ -946,9 +1169,12 @@ bool sendCameraCmd(const char *path) {
 
   // Reject another device or a stale IP that happens to return HTTP 200.
   const char *expected = nullptr;
-  if (waking) expected = "CAMERA_ON";
-  else if (strcmp(path, "/status") == 0) expected = "ACTIVE";
-  else if (strcmp(path, "/stop") == 0) expected = "CAMERA_SLEEP";
+  if (waking)
+    expected = "CAMERA_ON";
+  else if (strcmp(path, "/status") == 0)
+    expected = "ACTIVE";
+  else if (strcmp(path, "/stop") == 0)
+    expected = "CAMERA_SLEEP";
 
   if (expected != nullptr && cameraLastResponse != expected) {
     Serial.println("Unexpected camera reply; command not confirmed");
@@ -962,6 +1188,8 @@ bool sendCameraCmd(const char *path) {
 // ============================================================
 
 bool startCamera() {
+  requestCoolingFan();
+
   Serial.println("Waking ESP32-CAM camera...");
   cameraStreaming = false;
   if (WiFi.status() != WL_CONNECTED) {
@@ -985,9 +1213,8 @@ bool startCamera() {
         return true;
       }
 
-      if (cameraLastHttpCode >= 500 &&
-          (cameraLastResponse == "CAMERA_INIT_FAILED" ||
-           cameraLastResponse == "CAMERA_FRAME_FAILED")) {
+      if (cameraLastHttpCode >= 500 && (cameraLastResponse == "CAMERA_INIT_FAILED" ||
+                                        cameraLastResponse == "CAMERA_FRAME_FAILED")) {
         Serial.println("Camera reached, but sensor failed. Check camera Serial log.");
         return false;
       }
@@ -1013,7 +1240,9 @@ bool startCamera() {
 // ============================================================
 
 void stopCamera() {
-  if (!cameraStreaming) return;
+  if (!cameraStreaming)
+    return;
+  requestCoolingFan(); // Continue cooling for 3 minutes after camera use.
   Serial.println("Putting camera into standby...");
   const bool confirmed = sendCameraCmd("/stop");
   cameraStreaming = false;
@@ -1025,13 +1254,11 @@ void stopCamera() {
 // JPEG CALLBACK
 // ============================================================
 
-bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h,
-                   uint16_t *bitmap) {
+bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
   // In portrait mode the QVGA image is intentionally center-cropped
   // from 320 px wide to the 240 px TFT width. Blocks completely
   // outside the screen are ignored WITHOUT stopping JPEG decoding.
-  if (x >= tft.width() || y >= tft.height() || x + (int16_t)w <= 0 ||
-      y + (int16_t)h <= 0) {
+  if (x >= tft.width() || y >= tft.height() || x + (int16_t)w <= 0 || y + (int16_t)h <= 0) {
     return true;
   }
 
@@ -1089,8 +1316,7 @@ size_t fetchJpegFrame(uint8_t *buf, size_t maxLen) {
   }
 
   if ((size_t)len > maxLen) {
-    Serial.printf("JPEG too large: %d bytes (buffer %u)\n", len,
-                  (unsigned int)maxLen);
+    Serial.printf("JPEG too large: %d bytes (buffer %u)\n", len, (unsigned int)maxLen);
 
     http.end();
 
@@ -1137,8 +1363,7 @@ size_t fetchJpegFrame(uint8_t *buf, size_t maxLen) {
   http.end();
 
   if (received != (size_t)len) {
-    Serial.printf("Incomplete JPEG: %u/%d bytes\n", (unsigned int)received,
-                  len);
+    Serial.printf("Incomplete JPEG: %u/%d bytes\n", (unsigned int)received, len);
 
     return 0;
   }
@@ -1192,11 +1417,10 @@ struct FaceBox {
 // invalid auto-prototypes before FaceBox is declared.
 void drawDynamicFaceBox(int x, int y, int w, int h, uint16_t color);
 
-bool postFaceVerify(const String &userId, const String &roomId,
-                    uint8_t *jpegBuf, size_t jpegLen, FaceBox *outBox);
-
-bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen,
+bool postFaceVerify(const String &userId, const String &roomId, uint8_t *jpegBuf, size_t jpegLen,
                     FaceBox *outBox);
+
+bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen, FaceBox *outBox);
 
 void drawCameraFaceBox(const FaceBox &box, uint16_t color);
 
@@ -1293,8 +1517,7 @@ bool displayJpegOnTFT(uint8_t *buf, size_t len) {
                                (jpegWidth > (uint16_t)availableWidth);
 
   if (!usePortraitCenterCrop) {
-    while (((jpegWidth / scale) > availableWidth ||
-            (jpegHeight / scale) > availableHeight) &&
+    while (((jpegWidth / scale) > availableWidth || (jpegHeight / scale) > availableHeight) &&
            scale < 8) {
       scale *= 2;
     }
@@ -1386,12 +1609,8 @@ String normalizeServerUrl(String url) {
 }
 
 // ============================================================
-// HTTP GET
-// ============================================================
-
-// ============================================================
 // DEVICE HMAC SIGNATURE HELPERS
-// Canonical string: METHOD\npath\nts\nnonce\nsha256(body)
+// Canonical: METHOD\npath\nts\nnonce\nsha256(body)
 // Matches backend deviceAuth.computeSignature() exactly.
 // ============================================================
 
@@ -1405,10 +1624,10 @@ String deviceSha256Hex(const String &data) {
       mbedtls_md_starts(&ctx) == 0 &&
       mbedtls_md_update(&ctx, (const unsigned char *)data.c_str(), data.length()) == 0 &&
       mbedtls_md_finish(&ctx, hash) == 0) {
+    char buf[3];
     for (int i = 0; i < 32; i++) {
-      char b[3];
-      sprintf(b, "%02x", hash[i]);
-      hex += b;
+      sprintf(buf, "%02x", hash[i]);
+      hex += buf;
     }
   }
   mbedtls_md_free(&ctx);
@@ -1423,41 +1642,46 @@ String deviceHmacHex(const String &canonical) {
   String hex = "";
   if (info && mbedtls_md_setup(&ctx, info, 1) == 0 &&
       mbedtls_md_hmac_starts(&ctx, (const unsigned char *)DEVICE_SECRET,
-                             strlen(DEVICE_SECRET), 0) == 0 &&
+                             strlen(DEVICE_SECRET)) == 0 &&
       mbedtls_md_hmac_update(&ctx, (const unsigned char *)canonical.c_str(),
                              canonical.length()) == 0 &&
       mbedtls_md_hmac_finish(&ctx, hash) == 0) {
+    char buf[3];
     for (int i = 0; i < 32; i++) {
-      char b[3];
-      sprintf(b, "%02x", hash[i]);
-      hex += b;
+      sprintf(buf, "%02x", hash[i]);
+      hex += buf;
     }
   }
   mbedtls_md_free(&ctx);
   return hex;
 }
 
-// Compute the signature for a request. path must be the API path only
-// (e.g. "/api/esp32/get-commands/ROOM-001"), NOT the full URL.
-void deviceSignature(const String &method, const String &path,
-                     const String &body) {
-  String ts = String((unsigned long)(millis() + bootEpochOffset));
-  String nonce = String((unsigned long)esp_random(), 16);
+void deviceSignature(const String &method, const String &path, const String &body,
+                     String &ts, String &nonce, String &signature) {
+  unsigned long long tsMs = epochMs();
+  char tsBuf[24];
+  snprintf(tsBuf, sizeof(tsBuf), "%llu", tsMs);
+  ts = String(tsBuf);
+  nonce = String((unsigned long)esp_random(), 16);
   String bodyHash = deviceSha256Hex(body);
   String canonical = method + "\n" + path + "\n" + ts + "\n" + nonce + "\n" + bodyHash;
-  lastSigTs = ts;
-  lastSigNonce = nonce;
-  lastSigSig = deviceHmacHex(canonical);
+  signature = deviceHmacHex(canonical);
 }
 
-void applyDeviceHeaders(HTTPClient &http, const String &method,
-                        const String &path, const String &body) {
-  deviceSignature(method, path, body);
+void applyDeviceHeaders(HTTPClient &http, const String &method, const String &path,
+                        const String &body) {
+  // Keep each request's signature local: face uploads run in another task.
+  String ts, nonce, signature;
+  deviceSignature(method, path, body, ts, nonce, signature);
   http.addHeader("X-Device-Id", DEVICE_ID);
-  http.addHeader("X-Device-Ts", lastSigTs);
-  http.addHeader("X-Device-Nonce", lastSigNonce);
-  http.addHeader("X-Device-Sig", lastSigSig);
+  http.addHeader("X-Device-Ts", ts);
+  http.addHeader("X-Device-Nonce", nonce);
+  http.addHeader("X-Device-Sig", signature);
 }
+
+// ============================================================
+// HTTP GET
+// ============================================================
 
 String httpGet(const String &path) {
   if (WiFi.status() != WL_CONNECTED) {
@@ -1465,6 +1689,12 @@ String httpGet(const String &path) {
   }
 
   if (WiFi.status() != WL_CONNECTED) {
+    return "";
+  }
+
+  ensureDeviceTimeSync();
+  if (epochMs() == 0) {
+    Serial.println("[AUTH] Waiting for NTP time before GET.");
     return "";
   }
 
@@ -1526,12 +1756,21 @@ String httpGet(const String &path) {
 // HTTP POST JSON
 // ============================================================
 
-String httpPostJson(const String &path, const String &jsonBody) {
+String httpPostJson(const String &path, const String &jsonBody, int *outStatus = nullptr) {
+  if (outStatus != nullptr) {
+    *outStatus = 0;
+  }
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi(systemState == STATE_ACTIVE);
   }
 
   if (WiFi.status() != WL_CONNECTED) {
+    return "";
+  }
+
+  ensureDeviceTimeSync();
+  if (epochMs() == 0) {
+    Serial.println("[AUTH] Waiting for NTP time before POST.");
     return "";
   }
 
@@ -1563,6 +1802,9 @@ String httpPostJson(const String &path, const String &jsonBody) {
     applyDeviceHeaders(http, "POST", path, jsonBody);
 
     int code = http.POST(jsonBody);
+    if (outStatus != nullptr) {
+      *outStatus = code;
+    }
 
     if (code > 0) {
       body = http.getString();
@@ -1582,6 +1824,9 @@ String httpPostJson(const String &path, const String &jsonBody) {
     applyDeviceHeaders(http, "POST", path, jsonBody);
 
     int code = http.POST(jsonBody);
+    if (outStatus != nullptr) {
+      *outStatus = code;
+    }
 
     if (code > 0) {
       body = http.getString();
@@ -1597,14 +1842,19 @@ String httpPostJson(const String &path, const String &jsonBody) {
 // MULTIPART UPLOAD
 // ============================================================
 
-bool postMultipartStreaming(const String &path, const String &part1,
-                            uint8_t *jpegBuf, size_t jpegLen,
-                            const String &part3, String &outResp) {
+bool postMultipartStreaming(const String &path, const String &part1, uint8_t *jpegBuf,
+                            size_t jpegLen, const String &part3, String &outResp) {
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi(false);
   }
 
   if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  ensureDeviceTimeSync();
+  if (epochMs() == 0) {
+    Serial.println("[AUTH] Waiting for NTP time before face upload.");
     return false;
   }
 
@@ -1614,8 +1864,7 @@ bool postMultipartStreaming(const String &path, const String &part1,
 
   int protocolPos = server.indexOf("://");
 
-  String hostPort =
-      protocolPos >= 0 ? server.substring(protocolPos + 3) : server;
+  String hostPort = protocolPos >= 0 ? server.substring(protocolPos + 3) : server;
 
   while (hostPort.endsWith("/")) {
     hostPort.remove(hostPort.length() - 1);
@@ -1653,10 +1902,10 @@ bool postMultipartStreaming(const String &path, const String &part1,
       return false;
     }
 
-    Serial.printf("[HTTPS] Uploading %s (%u bytes)...\n", path.c_str(),
-                  (unsigned int)totalLength);
+    Serial.printf("[HTTPS] Uploading %s (%u bytes)...\n", path.c_str(), (unsigned int)totalLength);
 
-    deviceSignature("POST", path, "");
+    String ts, nonce, signature;
+    deviceSignature("POST", path, "", ts, nonce, signature);
 
     client.printf("POST %s HTTP/1.1\r\n", path.c_str());
 
@@ -1664,14 +1913,13 @@ bool postMultipartStreaming(const String &path, const String &part1,
 
     client.printf("X-Device-Id: %s\r\n", DEVICE_ID);
 
-    client.printf("X-Device-Ts: %s\r\n", lastSigTs.c_str());
+    client.printf("X-Device-Ts: %s\r\n", ts.c_str());
 
-    client.printf("X-Device-Nonce: %s\r\n", lastSigNonce.c_str());
+    client.printf("X-Device-Nonce: %s\r\n", nonce.c_str());
 
-    client.printf("X-Device-Sig: %s\r\n", lastSigSig.c_str());
+    client.printf("X-Device-Sig: %s\r\n", signature.c_str());
 
-    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n",
-                  boundary.c_str());
+    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
 
     client.printf("Content-Length: %u\r\n", (unsigned int)totalLength);
 
@@ -1700,8 +1948,7 @@ bool postMultipartStreaming(const String &path, const String &part1,
 
     unsigned long start = millis();
 
-    while (!client.available() && client.connected() &&
-           millis() - start < FACE_UPLOAD_TIMEOUT_MS) {
+    while (!client.available() && client.connected() && millis() - start < FACE_UPLOAD_TIMEOUT_MS) {
       delay(5);
     }
 
@@ -1735,7 +1982,8 @@ bool postMultipartStreaming(const String &path, const String &part1,
       return false;
     }
 
-    deviceSignature("POST", path, "");
+    String ts, nonce, signature;
+    deviceSignature("POST", path, "", ts, nonce, signature);
 
     client.printf("POST %s HTTP/1.1\r\n", path.c_str());
 
@@ -1743,14 +1991,13 @@ bool postMultipartStreaming(const String &path, const String &part1,
 
     client.printf("X-Device-Id: %s\r\n", DEVICE_ID);
 
-    client.printf("X-Device-Ts: %s\r\n", lastSigTs.c_str());
+    client.printf("X-Device-Ts: %s\r\n", ts.c_str());
 
-    client.printf("X-Device-Nonce: %s\r\n", lastSigNonce.c_str());
+    client.printf("X-Device-Nonce: %s\r\n", nonce.c_str());
 
-    client.printf("X-Device-Sig: %s\r\n", lastSigSig.c_str());
+    client.printf("X-Device-Sig: %s\r\n", signature.c_str());
 
-    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n",
-                  boundary.c_str());
+    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
 
     client.printf("Content-Length: %u\r\n", (unsigned int)totalLength);
 
@@ -1779,8 +2026,7 @@ bool postMultipartStreaming(const String &path, const String &part1,
 
     unsigned long start = millis();
 
-    while (!client.available() && client.connected() &&
-           millis() - start < FACE_UPLOAD_TIMEOUT_MS) {
+    while (!client.available() && client.connected() && millis() - start < FACE_UPLOAD_TIMEOUT_MS) {
       delay(5);
     }
 
@@ -1811,8 +2057,7 @@ bool postMultipartStreaming(const String &path, const String &part1,
     outResp = response.substring(bodyStart + 4);
   }
 
-  bool httpSuccess =
-      response.startsWith("HTTP/1.1 2") || response.startsWith("HTTP/1.0 2");
+  bool httpSuccess = response.startsWith("HTTP/1.1 2") || response.startsWith("HTTP/1.0 2");
 
   return httpSuccess;
 }
@@ -1821,21 +2066,19 @@ bool postMultipartStreaming(const String &path, const String &part1,
 // FACE VERIFY
 // ============================================================
 
-bool postFaceVerify(const String &userId, const String &roomId,
-                    uint8_t *jpegBuf, size_t jpegLen, FaceBox *outBox) {
+bool postFaceVerify(const String &userId, const String &roomId, uint8_t *jpegBuf, size_t jpegLen,
+                    FaceBox *outBox) {
   const String boundary = "----LabSyncBoundary7344";
 
   const String CRLF = "\r\n";
 
   String part1 = "--" + boundary + CRLF +
 
-                 "Content-Disposition: form-data; name=\"userId\"" + CRLF +
-                 CRLF + userId + CRLF +
+                 "Content-Disposition: form-data; name=\"userId\"" + CRLF + CRLF + userId + CRLF +
 
                  "--" + boundary + CRLF +
 
-                 "Content-Disposition: form-data; name=\"roomId\"" + CRLF +
-                 CRLF + roomId + CRLF +
+                 "Content-Disposition: form-data; name=\"roomId\"" + CRLF + CRLF + roomId + CRLF +
 
                  "--" + boundary + CRLF +
 
@@ -1849,10 +2092,9 @@ bool postFaceVerify(const String &userId, const String &roomId,
 
   String response;
 
-  bool ok = postMultipartStreaming("/api/face/verify", part1, jpegBuf, jpegLen,
-                                   part3, response);
+  bool ok = postMultipartStreaming("/api/face/verify", part1, jpegBuf, jpegLen, part3, response);
 
-  if (!ok && response.indexOf("\"success\"") < 0)
+  if (!ok)
     return false;
 
   DynamicJsonDocument doc(1024);
@@ -1895,16 +2137,14 @@ bool postFaceVerify(const String &userId, const String &roomId,
 // FACE ENROLL
 // ============================================================
 
-bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen,
-                    FaceBox *outBox) {
+bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen, FaceBox *outBox) {
   const String boundary = "----LabSyncBoundary7344";
 
   const String CRLF = "\r\n";
 
   String part1 = "--" + boundary + CRLF +
 
-                 "Content-Disposition: form-data; name=\"userId\"" + CRLF +
-                 CRLF + userId + CRLF +
+                 "Content-Disposition: form-data; name=\"userId\"" + CRLF + CRLF + userId + CRLF +
 
                  "--" + boundary + CRLF +
 
@@ -1918,12 +2158,11 @@ bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen,
 
   String response;
 
-  bool ok = postMultipartStreaming("/api/face/enroll-hardware", part1, jpegBuf,
-                                   jpegLen, part3, response);
+  bool ok =
+      postMultipartStreaming("/api/face/enroll-hardware", part1, jpegBuf, jpegLen, part3, response);
 
-  if (!ok && response.indexOf("\"success\"") < 0) {
-    Serial.printf("[FACE-ENROLL] Network/HTTP error. Response len: %d\n",
-                  response.length());
+  if (!ok) {
+    Serial.printf("[FACE-ENROLL] Network/HTTP error. Response len: %d\n", response.length());
     return false;
   }
 
@@ -1936,17 +2175,15 @@ bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen,
   DynamicJsonDocument doc(1024);
 
   if (deserializeJson(doc, jsonBody) != DeserializationError::Ok) {
-    Serial.printf("[FACE-ENROLL] JSON parse error: %s\n",
-                  jsonBody.substring(0, 100).c_str());
+    Serial.printf("[FACE-ENROLL] JSON parse error: %s\n", jsonBody.substring(0, 100).c_str());
     return false;
   }
 
   bool success = (doc["success"] | false) || (doc["finalized"] | false);
   const char *serverMsg = doc["message"] | "";
-  Serial.printf(
-      "[FACE-ENROLL] Server Result: success=%s, finalized=%s, msg=\"%s\"\n",
-      (doc["success"] | false) ? "true" : "false",
-      (doc["finalized"] | false) ? "true" : "false", serverMsg);
+  Serial.printf("[FACE-ENROLL] Server Result: success=%s, finalized=%s, msg=\"%s\"\n",
+                (doc["success"] | false) ? "true" : "false",
+                (doc["finalized"] | false) ? "true" : "false", serverMsg);
 
   if (outBox != nullptr) {
     if (doc.containsKey("box") && !doc["box"].isNull()) {
@@ -1972,11 +2209,7 @@ bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen,
 // from waiting for the backend response.
 // ============================================================
 
-enum FaceRequestMode {
-  FACE_REQUEST_NONE,
-  FACE_REQUEST_VERIFY,
-  FACE_REQUEST_ENROLL
-};
+enum FaceRequestMode { FACE_REQUEST_NONE, FACE_REQUEST_VERIFY, FACE_REQUEST_ENROLL };
 
 // Explicit prototypes for functions that use FaceRequestMode.
 // This avoids Arduino's auto-prototype generator placing declarations
@@ -1984,12 +2217,13 @@ enum FaceRequestMode {
 uint32_t beginFaceSession();
 void faceRequestWorker(void *parameter);
 
-bool startFaceRequestAsync(FaceRequestMode mode, uint32_t session,
-                           const String &userId, const String &roomId,
-                           const uint8_t *jpeg, size_t jpegLen);
+bool startFaceRequestAsync(FaceRequestMode mode, uint32_t session, const String &userId,
+                           const String &roomId, const uint8_t *jpeg, size_t jpegLen);
 
-bool takeFaceResult(uint32_t session, FaceRequestMode expectedMode,
-                    bool &success, FaceBox &box);
+bool takeFaceResult(uint32_t session, FaceRequestMode expectedMode, bool &success, FaceBox &box);
+
+bool finishPendingFaceRequest(uint32_t session, FaceRequestMode mode, bool &success, FaceBox &box,
+                              uint16_t reticleColor);
 
 volatile bool faceRequestBusy = false;
 volatile bool faceResultReady = false;
@@ -2037,11 +2271,10 @@ void faceRequestWorker(void *parameter) {
 
   if (faceRequestJpeg != nullptr && faceRequestJpegLen > 0) {
     if (mode == FACE_REQUEST_VERIFY) {
-      success = postFaceVerify(faceRequestUserId, faceRequestRoomId,
-                               faceRequestJpeg, faceRequestJpegLen, &box);
-    } else if (mode == FACE_REQUEST_ENROLL) {
-      success = postFaceEnroll(faceRequestUserId, faceRequestJpeg,
+      success = postFaceVerify(faceRequestUserId, faceRequestRoomId, faceRequestJpeg,
                                faceRequestJpegLen, &box);
+    } else if (mode == FACE_REQUEST_ENROLL) {
+      success = postFaceEnroll(faceRequestUserId, faceRequestJpeg, faceRequestJpegLen, &box);
     }
   }
 
@@ -2065,11 +2298,15 @@ void faceRequestWorker(void *parameter) {
   vTaskDelete(nullptr);
 }
 
-bool startFaceRequestAsync(FaceRequestMode mode, uint32_t session,
-                           const String &userId, const String &roomId,
-                           const uint8_t *jpeg, size_t jpegLen) {
-  if (faceRequestBusy || faceResultReady || jpeg == nullptr ||
-      jpegLen <= MIN_FACE_JPEG_BYTES) {
+// Check JPEG boundary markers only. The backend decodes and detects faces.
+bool hasJpegMarkers(const uint8_t *jpeg, size_t jpegLen) {
+  return jpeg != nullptr && jpegLen >= 4 && jpeg[0] == 0xFF && jpeg[1] == 0xD8 &&
+         jpeg[jpegLen - 2] == 0xFF && jpeg[jpegLen - 1] == 0xD9;
+}
+
+bool startFaceRequestAsync(FaceRequestMode mode, uint32_t session, const String &userId,
+                           const String &roomId, const uint8_t *jpeg, size_t jpegLen) {
+  if (faceRequestBusy || faceResultReady || !hasJpegMarkers(jpeg, jpegLen)) {
     return false;
   }
 
@@ -2092,8 +2329,8 @@ bool startFaceRequestAsync(FaceRequestMode mode, uint32_t session,
   faceRequestJpegLen = jpegLen;
   faceRequestBusy = true;
 
-  BaseType_t created = xTaskCreate(faceRequestWorker, "faceHttp", 16384,
-                                   nullptr, 1, &faceRequestTaskHandle);
+  BaseType_t created =
+      xTaskCreate(faceRequestWorker, "faceHttp", 16384, nullptr, 1, &faceRequestTaskHandle);
 
   if (created != pdPASS) {
     free(faceRequestJpeg);
@@ -2110,8 +2347,7 @@ bool startFaceRequestAsync(FaceRequestMode mode, uint32_t session,
   return true;
 }
 
-bool takeFaceResult(uint32_t session, FaceRequestMode expectedMode,
-                    bool &success, FaceBox &box) {
+bool takeFaceResult(uint32_t session, FaceRequestMode expectedMode, bool &success, FaceBox &box) {
   if (!faceResultReady) {
     return false;
   }
@@ -2133,6 +2369,55 @@ bool takeFaceResult(uint32_t session, FaceRequestMode expectedMode,
   return true;
 }
 
+// Drain pending work before ending either face session. A ready result must
+// be consumed even when the worker has already cleared faceRequestBusy.
+bool finishPendingFaceRequest(uint32_t session, FaceRequestMode mode, bool &success, FaceBox &box,
+                              uint16_t reticleColor) {
+  const unsigned long waitingSince = millis();
+
+  while (true) {
+    bool resultSuccess = false;
+    FaceBox resultBox = {0, 0, 0, 0, false};
+    if (takeFaceResult(session, mode, resultSuccess, resultBox)) {
+      success = resultSuccess;
+      box = resultBox;
+      return true;
+    }
+
+    // Use the existing upload timeout, replacing the separate 15-second cap.
+    if (!faceRequestBusy || millis() - waitingSince >= FACE_UPLOAD_TIMEOUT_MS) {
+      break;
+    }
+
+    // Keep the preview moving while the request finishes. No new uploads here.
+    size_t jpegLen = fetchJpegFrame(jpegBuffer, jpegBufferCapacity);
+    if (jpegLen > 0) {
+      displayJpegOnTFT(jpegBuffer, jpegLen);
+      drawFaceReticle(reticleColor);
+      if (box.valid) {
+        drawCameraFaceBox(box, COLOR_YELLOW);
+      }
+    }
+    tftShowStatus("Look at camera", "Waiting for server...", COLOR_CYAN);
+    delay(10);
+  }
+
+  // The worker may have published between the first result check and the
+  // busy/deadline check. Always consume once more before reporting failure.
+  bool resultSuccess = false;
+  FaceBox resultBox = {0, 0, 0, 0, false};
+  if (takeFaceResult(session, mode, resultSuccess, resultBox)) {
+    success = resultSuccess;
+    box = resultBox;
+    return true;
+  }
+
+  if (faceRequestBusy) {
+    Serial.println("Face request still pending after completion wait timed out");
+  }
+  return false;
+}
+
 void drawCameraFaceBox(const FaceBox &box, uint16_t color) {
   if (!box.valid) {
     return;
@@ -2150,11 +2435,78 @@ void drawCameraFaceBox(const FaceBox &box, uint16_t color) {
 }
 
 // ============================================================
+// COMPLETED ENROLLMENTS (PERSISTENT, ONE RECORD PER SENSOR SLOT)
+// ============================================================
+// Save only after face enrollment succeeds. Scope records to the server,
+// room and user, so another account cannot inherit a completed enrollment.
+// These records suppress enrollment prompts; face verification still runs.
+String completedEnrollmentIdentity(const String &userId) {
+  return normalizeServerUrl(activeServerUrl) + "\n" + String(ROOM_ID) + "\n" + userId;
+}
+
+bool hasCompletedEnrollment(const String &userId, int fingerId = 0) {
+  if (!fingerprintReady || userId.length() == 0 || fingerId < 0 ||
+      fingerId > finger.capacity) {
+    return false;
+  }
+
+  Preferences prefs;
+  if (!prefs.begin("ls_enroll", true)) {
+    return false;
+  }
+
+  const String identity = completedEnrollmentIdentity(userId);
+  const int firstId = fingerId > 0 ? fingerId : 1;
+  const int lastId = fingerId > 0 ? fingerId : finger.capacity;
+  bool completed = false;
+  for (int id = firstId; id <= lastId; id++) {
+    const String key = "f" + String(id);
+    if (prefs.getString(key.c_str(), "") == identity &&
+        finger.loadModel(id) == FINGERPRINT_OK) {
+      completed = true;
+      break;
+    }
+  }
+  prefs.end();
+  return completed;
+}
+
+void clearCompletedEnrollment(int fingerId) {
+  Preferences prefs;
+  if (!prefs.begin("ls_enroll", false)) {
+    Serial.println("ERROR: Cannot clear previous enrollment record.");
+    return;
+  }
+  const String key = "f" + String(fingerId);
+  prefs.putString(key.c_str(), "");
+  prefs.end();
+}
+
+void rememberCompletedEnrollment(const String &userId, int fingerId) {
+  if (fingerId < 1 || fingerId > finger.capacity || userId.length() == 0) {
+    return;
+  }
+
+  Preferences prefs;
+  if (!prefs.begin("ls_enroll", false)) {
+    Serial.println("ERROR: Cannot save completed enrollment record.");
+    return;
+  }
+  const String key = "f" + String(fingerId);
+  const String identity = completedEnrollmentIdentity(userId);
+  const size_t written = prefs.putString(key.c_str(), identity);
+  prefs.end();
+  if (written != identity.length()) {
+    Serial.println("ERROR: Enrollment completed, but completion record was not saved.");
+  }
+}
+
+// ============================================================
 // USER LOOKUP
 // ============================================================
 
-bool getUserByFingerId(int fingerId, String &outUserId, String &outUserName,
-                       String &outRole, bool &outFaceEnrolled) {
+bool getUserByFingerId(int fingerId, String &outUserId, String &outUserName, String &outRole,
+                       bool &outFaceEnrolled) {
   String response = httpGet("/api/esp32/user-by-finger/" + String(fingerId));
 
   if (response.length() == 0) {
@@ -2179,30 +2531,32 @@ bool getUserByFingerId(int fingerId, String &outUserId, String &outUserName,
 
   outFaceEnrolled = doc["faceEnrolled"] | false;
 
+  // A delayed backend flag must not restart a successfully completed task.
+  if (!outFaceEnrolled && hasCompletedEnrollment(outUserId, fingerId)) {
+    outFaceEnrolled = true;
+  }
+
   return outUserId.length() > 0;
 }
 
 // Overload for backward compatibility
-bool getUserByFingerId(int fingerId, String &outUserId, String &outUserName,
-                       String &outRole) {
+bool getUserByFingerId(int fingerId, String &outUserId, String &outUserName, String &outRole) {
   bool dummyFace = false;
-  return getUserByFingerId(fingerId, outUserId, outUserName, outRole,
-                           dummyFace);
+  return getUserByFingerId(fingerId, outUserId, outUserName, outRole, dummyFace);
 }
 
 bool getUserByFingerId(int fingerId, String &outUserId, String &outUserName) {
   String dummyRole = "user";
   bool dummyFace = false;
-  return getUserByFingerId(fingerId, outUserId, outUserName, dummyRole,
-                           dummyFace);
+  return getUserByFingerId(fingerId, outUserId, outUserName, dummyRole, dummyFace);
 }
 
 // ============================================================
 // NEXT AVAILABLE USER FOR HARDWARE ENROLLMENT
 // ============================================================
 
-bool getNextAvailableUser(String &outUserId, String &outUserName,
-                          String &outRole, const String &requestedRole = "") {
+bool getNextAvailableUser(String &outUserId, String &outUserName, String &outRole,
+                          const String &requestedRole = "") {
   String path = "/api/esp32/next-available-user";
   if (requestedRole.length() > 0) {
     path += "?role=" + requestedRole;
@@ -2253,12 +2607,25 @@ void notifyFingerprintVerified(const String &userId, int fingerId) {
 // ============================================================
 
 void openDoor() {
-  tftShowFullScreen("ACCESS GRANTED", "Door opening", COLOR_GREEN);
-  tftShowStatus("Door unlocked", "5 seconds", COLOR_GREEN);
+  if (!requestDoorAccess()) {
+    tftShowFullScreen("DOOR ERROR", "Controller unavailable", COLOR_RED);
+    return;
+  }
 
-  digitalWrite(RELAY_PIN, HIGH);
+  tftShowFullScreen("ACCESS GRANTED", "Door opening", COLOR_GREEN);
+  tftShowStatus("Door unlocked", "Access grant: 5 seconds", COLOR_GREEN);
+
+  // Keep the existing display pause. Door OR logic and fan timing continue
+  // in their own tasks, so this delay does not block the push button.
   delay(RELAY_OPEN_MS);
-  digitalWrite(RELAY_PIN, LOW);
+}
+
+void reportDoorClosedIfPending() {
+  // Network work stays out of the door task so a slow server cannot delay
+  // button response or locking. There is no physical door-position sensor.
+  if (WiFi.status() != WL_CONNECTED || !takeDoorClosedReport()) {
+    return;
+  }
 
   StaticJsonDocument<128> doc;
   doc["roomId"] = ROOM_ID;
@@ -2342,8 +2709,8 @@ String getFingerprintErrorString(int p) {
   }
 }
 
-void reportEnrollmentFailure(const String &userId, const String &userName,
-                             int errorCode, const String &stage) {
+void reportEnrollmentFailure(const String &userId, const String &userName, int errorCode,
+                             const String &stage) {
   StaticJsonDocument<512> doc;
   doc["userId"] = userId;
   doc["userName"] = userName;
@@ -2360,7 +2727,7 @@ void reportEnrollmentFailure(const String &userId, const String &userName,
 // ============================================================
 
 bool runFaceRegistrationOnly(const String &userId, const String &userName,
-                             const String &role = "user") {
+                             const String &role = "user", int fingerId = 0) {
   tftShowFullScreen("ENROLL STEP 2/2", "Waking camera...", COLOR_CYAN);
 
   if (!startCamera()) {
@@ -2383,8 +2750,7 @@ bool runFaceRegistrationOnly(const String &userId, const String &userName,
     bool resultSuccess = false;
     FaceBox resultBox = {0, 0, 0, 0, false};
 
-    if (takeFaceResult(faceSession, FACE_REQUEST_ENROLL, resultSuccess,
-                       resultBox)) {
+    if (takeFaceResult(faceSession, FACE_REQUEST_ENROLL, resultSuccess, resultBox)) {
       overlayBox = resultBox;
       faceEnrolled = resultSuccess;
       overlayColor = faceEnrolled ? COLOR_GREEN : COLOR_RED;
@@ -2413,22 +2779,22 @@ bool runFaceRegistrationOnly(const String &userId, const String &userName,
       }
 
       unsigned long now = millis();
-      bool hasHumanPresence = (jpegLen >= MIN_FACE_JPEG_BYTES);
+      bool validJpeg = hasJpegMarkers(jpegBuffer, jpegLen);
 
       if (faceRequestBusy) {
         tftShowStatus("Enrolling face...", "Extracting template", COLOR_CYAN);
-      } else if (!hasHumanPresence) {
-        tftShowStatus("Position Face", "Center face in reticle", COLOR_YELLOW);
+      } else if (!validJpeg) {
+        tftShowStatus("Camera image error", "Waiting for JPEG...", COLOR_YELLOW);
       } else {
-        tftShowStatus("Face Detected", "Hold still for capture", COLOR_GREEN);
+        tftShowStatus("Look at camera", "Hold still for capture", COLOR_CYAN);
       }
 
       uint32_t adaptiveInterval = overlayBox.valid ? 700 : 1200;
 
-      if (!faceRequestBusy && !faceResultReady && hasHumanPresence &&
+      if (!faceRequestBusy && !faceResultReady && validJpeg &&
           now - lastFaceRequest >= adaptiveInterval) {
-        if (startFaceRequestAsync(FACE_REQUEST_ENROLL, faceSession, userId, "",
-                                  jpegBuffer, jpegLen)) {
+        if (startFaceRequestAsync(FACE_REQUEST_ENROLL, faceSession, userId, "", jpegBuffer,
+                                  jpegLen)) {
           lastFaceRequest = now;
           reticleColor = COLOR_YELLOW;
         }
@@ -2437,38 +2803,17 @@ bool runFaceRegistrationOnly(const String &userId, const String &userName,
     delay(10);
   }
 
-  // Grace period while candidate is being evaluated on server (up to 15s)
-  unsigned long enrollGraceStart = millis();
-  while (!faceEnrolled && faceRequestBusy &&
-         millis() - enrollGraceStart < 15000) {
-    size_t jpegLen = fetchJpegFrame(jpegBuffer, jpegBufferCapacity);
-    if (jpegLen > 0) {
-      displayJpegOnTFT(jpegBuffer, jpegLen);
-      drawFaceReticle(COLOR_YELLOW);
-      if (overlayBox.valid) {
-        drawCameraFaceBox(overlayBox, overlayColor);
-      }
-      tftShowStatus("Align face in frame", "Finishing capture...", COLOR_CYAN);
-    }
-
-    bool resultSuccess = false;
-    FaceBox resultBox = {0, 0, 0, 0, false};
-    if (takeFaceResult(faceSession, FACE_REQUEST_ENROLL, resultSuccess,
-                       resultBox)) {
-      faceEnrolled = resultSuccess;
-      overlayBox = resultBox;
-      overlayColor = faceEnrolled ? COLOR_GREEN : COLOR_RED;
-      break;
-    }
-    delay(10);
+  if (!faceEnrolled) {
+    finishPendingFaceRequest(faceSession, FACE_REQUEST_ENROLL, faceEnrolled, overlayBox,
+                             COLOR_YELLOW);
   }
 
   stopCamera();
 
   if (faceEnrolled) {
-    tftShowFullScreen(role.equalsIgnoreCase("admin") ? "ADMIN ENROLLED"
-                                                     : "USER ENROLLED",
-                      userName, COLOR_GREEN);
+    rememberCompletedEnrollment(userId, fingerId);
+    tftShowFullScreen(role.equalsIgnoreCase("admin") ? "ADMIN ENROLLED" : "USER ENROLLED", userName,
+                      COLOR_GREEN);
     tftShowStatus("Biometrics Active", "Google Sheets Synced", COLOR_GREEN);
   } else {
     tftShowFullScreen("FACE INCOMPLETE", "Retry from admin menu", COLOR_RED);
@@ -2486,6 +2831,8 @@ bool runEnrollmentSequence(const String &userId, const String &userName,
                            const String &role = "user") {
   if (!fingerprintReady)
     return false;
+
+  requestCoolingFan();
 
   // ------------------------------------------------------------
   // STEP 0: LOCATE NEXT AVAILABLE SENSOR SLOT BEFORE SCANNING
@@ -2519,8 +2866,8 @@ bool runEnrollmentSequence(const String &userId, const String &userName,
   bool firstScanOk = false;
 
   for (int attempt = 1; attempt <= 4; attempt++) {
-    tftShowStatus("Place finger on sensor",
-                  "Scan 1/2 (Att " + String(attempt) + "/4)", COLOR_YELLOW);
+    tftShowStatus("Place finger on sensor", "Scan 1/2 (Att " + String(attempt) + "/4)",
+                  COLOR_YELLOW);
 
     p = -1;
     while (p != FINGERPRINT_OK) {
@@ -2528,8 +2875,9 @@ bool runEnrollmentSequence(const String &userId, const String &userName,
       delay(100);
     }
 
-    delay(120);        // allow finger contact pressure to stabilize on prism
-    finger.getImage(); // refresh image with firm contact pressure
+    delay(120);          // allow finger contact pressure to stabilize on prism
+    finger.getImage();   // refresh image with firm contact pressure
+    requestCoolingFan(); // A new enrollment scan restarts cooling.
     p = finger.image2Tz(1);
 
     if (p == FINGERPRINT_OK) {
@@ -2565,8 +2913,7 @@ bool runEnrollmentSequence(const String &userId, const String &userName,
   bool modelCreated = false;
 
   for (int attempt = 1; attempt <= 4; attempt++) {
-    tftShowStatus("Place SAME finger",
-                  "Scan 2/2 (Att " + String(attempt) + "/4)", COLOR_YELLOW);
+    tftShowStatus("Place SAME finger", "Scan 2/2 (Att " + String(attempt) + "/4)", COLOR_YELLOW);
 
     p = -1;
 
@@ -2576,13 +2923,14 @@ bool runEnrollmentSequence(const String &userId, const String &userName,
       delay(100);
     }
 
-    delay(120);        // allow finger contact pressure to stabilize on prism
-    finger.getImage(); // refresh image with firm contact pressure
+    delay(120);          // allow finger contact pressure to stabilize on prism
+    finger.getImage();   // refresh image with firm contact pressure
+    requestCoolingFan(); // A new enrollment scan restarts cooling.
     p = finger.image2Tz(2);
 
     if (p != FINGERPRINT_OK) {
-      Serial.printf("Enrollment Scan 2 attempt %d failed: %s (0x%02X)\n",
-                    attempt, getFingerprintErrorString(p).c_str(), p);
+      Serial.printf("Enrollment Scan 2 attempt %d failed: %s (0x%02X)\n", attempt,
+                    getFingerprintErrorString(p).c_str(), p);
       tftShowStatus("Press firmly & hold", "Retrying...", COLOR_YELLOW);
       while (finger.getImage() != FINGERPRINT_NOFINGER) {
         delay(100);
@@ -2613,6 +2961,8 @@ bool runEnrollmentSequence(const String &userId, const String &userName,
   }
 
   // Store newly created model (safely in CharBuffer 1) directly into nextId!
+  // A reused sensor slot must not retain the previous user's completion.
+  clearCompletedEnrollment(nextId);
   p = finger.storeModel(nextId);
 
   if (p != FINGERPRINT_OK) {
@@ -2639,7 +2989,7 @@ bool runEnrollmentSequence(const String &userId, const String &userName,
   // ------------------------------------------------------------
   // STEP 2/2: FACE REGISTRATION (LIVE TFT PREVIEW)
   // ------------------------------------------------------------
-  return runFaceRegistrationOnly(userId, userName, role);
+  return runFaceRegistrationOnly(userId, userName, role, nextId);
 }
 
 // ============================================================
@@ -2649,22 +2999,24 @@ bool runEnrollmentSequence(const String &userId, const String &userName,
 bool runAutonomousHardwareEnrollment(const String &requestedRole = "user") {
   wakeToActive("Hardware Enrollment");
 
-  tftShowFullScreen("NEW ENROLLMENT", "Fetching " + requestedRole + " slot...",
-                    COLOR_CYAN);
+  tftShowFullScreen("NEW ENROLLMENT", "Fetching " + requestedRole + " slot...", COLOR_CYAN);
 
   String userId = "";
   String userName = "";
   String role = requestedRole;
 
   if (!getNextAvailableUser(userId, userName, role, requestedRole)) {
-    tftShowFullScreen("FETCH ERROR", "Could not load " + requestedRole,
-                      COLOR_RED);
+    tftShowFullScreen("FETCH ERROR", "Could not load " + requestedRole, COLOR_RED);
     delay(2000);
     return false;
   }
 
-  tftShowFullScreen(role.equalsIgnoreCase("admin") ? "ENROLLING ADMIN"
-                                                   : "ENROLLING USER",
+  if (hasCompletedEnrollment(userId)) {
+    Serial.println("Skipping already completed hardware enrollment.");
+    return true;
+  }
+
+  tftShowFullScreen(role.equalsIgnoreCase("admin") ? "ENROLLING ADMIN" : "ENROLLING USER",
                     userName + " (" + userId + ")", COLOR_YELLOW);
   delay(1200);
 
@@ -2738,8 +3090,7 @@ void showAdminHardwareMenu(const String &adminName) {
     uint8_t r = finger.getImage();
     if (r == FINGERPRINT_OK) {
       unsigned long touchStart = millis();
-      while (finger.getImage() == FINGERPRINT_OK &&
-             (millis() - touchStart < 2500)) {
+      while (finger.getImage() == FINGERPRINT_OK && (millis() - touchStart < 2500)) {
         delay(50);
       }
       unsigned long touchDuration = millis() - touchStart;
@@ -2772,6 +3123,31 @@ void showAdminHardwareMenu(const String &adminName) {
 // ============================================================
 // ADMIN COMMANDS (CLOUD / POLLING FALLBACK)
 // ============================================================
+
+// Tell the backend a command has been executed. Without this the command
+// stays queued until its TTL expires, and gets re-delivered/re-executed.
+void acknowledgeCommand(const String &commandId, bool ok, const String &detail) {
+  if (commandId.length() == 0) {
+    Serial.println("[COMMAND-ACK] No commandId supplied; cannot acknowledge.");
+    return;
+  }
+  StaticJsonDocument<256> doc;
+  doc["roomId"] = ROOM_ID;
+  doc["commandId"] = commandId;
+  doc["ok"] = ok;
+  doc["detail"] = detail;
+
+  String body;
+  serializeJson(doc, body);
+
+  int status = 0;
+  httpPostJson("/api/esp32/command-ack", body, &status);
+  if (status >= 200 && status < 300) {
+    Serial.println("[COMMAND-ACK] Backend acknowledged command execution");
+  } else {
+    Serial.printf("[COMMAND-ACK] Not confirmed; HTTP status: %d\n", status);
+  }
+}
 
 void checkForAdminCommands() {
   if (systemState != STATE_IDLE) {
@@ -2814,8 +3190,8 @@ void checkForAdminCommands() {
   // lost and the backend re-delivered it), do NOT execute it again — just ACK
   // it so it is dequeued. This is the hard fix for "enrollment ran twice".
   if (commandId.length() > 0 && commandId == lastExecutedCommandId) {
-    Serial.println("[COMMAND] Duplicate commandId received — ACKing without re-executing");
-    acknowledgeCommand(commandId, true, "duplicate — already executed");
+    Serial.println("[COMMAND] Duplicate commandId received - ACKing without re-executing");
+    acknowledgeCommand(commandId, lastExecutedCommandOk, "duplicate - already executed");
     return;
   }
 
@@ -2831,6 +3207,7 @@ void checkForAdminCommands() {
     delay(1000);
 
     lastExecutedCommandId = commandId;
+    lastExecutedCommandOk = true;
     acknowledgeCommand(commandId, true, "Door unlocked");
 
     enterIdleMode();
@@ -2845,20 +3222,24 @@ void checkForAdminCommands() {
     wakeToActive("Sensor cleanup");
 
     bool ok = false;
-    if (slot >= 1 && slot <= (int)finger.capacity) {
+    if (fingerprintReady && slot >= 1 && slot <= (int)finger.capacity) {
       uint8_t delResult = finger.deleteModel(slot);
       ok = (delResult == FINGERPRINT_OK);
-      Serial.printf("[FP-DELETE] Slot %d delete result: 0x%02X (%s)\n", slot,
-                    delResult, ok ? "freed" : "failed");
+      Serial.printf("[FP-DELETE] Slot %d delete result: 0x%02X (%s)\n", slot, delResult,
+                    ok ? "freed" : "failed");
+      if (ok) {
+        clearCompletedEnrollment(slot);
+      }
     } else {
       Serial.printf("[FP-DELETE] Invalid slot %d requested\n", slot);
     }
 
-    tftShowFullScreen(ok ? "SENSOR CLEANED" : "CLEANUP FAILED",
-                      "Slot #" + String(slot), ok ? COLOR_GREEN : COLOR_RED);
+    tftShowFullScreen(ok ? "SENSOR CLEANED" : "CLEANUP FAILED", "Slot #" + String(slot),
+                      ok ? COLOR_GREEN : COLOR_RED);
     delay(1200);
 
     lastExecutedCommandId = commandId;
+    lastExecutedCommandOk = ok;
     acknowledgeCommand(commandId, ok,
                        ok ? "Fingerprint slot freed" : "Slot delete failed");
 
@@ -2869,10 +3250,8 @@ void checkForAdminCommands() {
   if (command.startsWith("ENROLL:")) {
     int separator = command.indexOf(':', 7);
 
-    if (separator <= 0) {
-      acknowledgeCommand(commandId, false, "Malformed ENROLL command");
+    if (separator <= 0)
       return;
-    }
 
     String userId = command.substring(7, separator);
 
@@ -2888,6 +3267,15 @@ void checkForAdminCommands() {
       role.trim();
     }
 
+    // Ignore a stale/repeated backend task BEFORE waking the display.
+    if (hasCompletedEnrollment(userId)) {
+      Serial.println("Ignoring already completed enrollment command.");
+      lastExecutedCommandId = commandId;
+      lastExecutedCommandOk = true;
+      acknowledgeCommand(commandId, true, "Enrollment already completed");
+      return;
+    }
+
     wakeToActive("Enrollment");
 
     bool enrollOk = runEnrollmentSequence(userId, userName, role);
@@ -2895,7 +3283,9 @@ void checkForAdminCommands() {
     // ACK only after execution so this command is NEVER delivered a second
     // time (it used to stay queued and re-run the whole enrollment).
     lastExecutedCommandId = commandId;
-    acknowledgeCommand(commandId, enrollOk, enrollOk ? "Enrollment completed" : "Enrollment failed on device");
+    lastExecutedCommandOk = enrollOk;
+    acknowledgeCommand(commandId, enrollOk,
+                       enrollOk ? "Enrollment completed" : "Enrollment failed on device");
 
     enterIdleMode();
 
@@ -2965,7 +3355,7 @@ void runAccessFlow(int fingerId) {
     tftShowFullScreen("ENROLL FACE", "Step 2: Register Face", COLOR_CYAN);
     delay(1200);
 
-    if (runFaceRegistrationOnly(userId, userName, userRole)) {
+    if (runFaceRegistrationOnly(userId, userName, userRole, fingerId)) {
       openDoor();
       tftShowFullScreen("WELCOME", userName, COLOR_GREEN);
       delay(1800);
@@ -3011,8 +3401,7 @@ void runAccessFlow(int fingerId) {
     bool resultSuccess = false;
     FaceBox resultBox = {0, 0, 0, 0, false};
 
-    if (takeFaceResult(faceSession, FACE_REQUEST_VERIFY, resultSuccess,
-                       resultBox)) {
+    if (takeFaceResult(faceSession, FACE_REQUEST_VERIFY, resultSuccess, resultBox)) {
       overlayBox = resultBox;
       faceVerified = resultSuccess;
       overlayColor = faceVerified ? COLOR_GREEN : COLOR_RED;
@@ -3035,28 +3424,26 @@ void runAccessFlow(int fingerId) {
         break;
       }
 
-      // Smart Presence Detection:
-      // When human face enters the frame, JPEG size rises above MIN_FACE_JPEG_BYTES (7500 B)
-      bool hasHumanPresence = (jpegLen >= MIN_FACE_JPEG_BYTES);
+      // Send valid JPEGs; the backend decides whether a face is present.
+      bool validJpeg = hasJpegMarkers(jpegBuffer, jpegLen);
 
       if (faceRequestBusy) {
         tftShowStatus("Verifying face...", "AI matching in cloud", COLOR_CYAN);
-      } else if (!hasHumanPresence) {
-        tftShowStatus("Position Face", "Waiting for face...", COLOR_YELLOW);
+      } else if (!validJpeg) {
+        tftShowStatus("Camera image error", "Waiting for JPEG...", COLOR_YELLOW);
       } else {
-        tftShowStatus("Face Detected", "Hold still...", COLOR_GREEN);
+        tftShowStatus("Look at camera", "Hold still...", COLOR_CYAN);
       }
 
       unsigned long now = millis();
       // Adaptive timing: fast 600ms when face candidate was found, calm 1200ms when waiting
       uint32_t adaptiveInterval = overlayBox.valid ? 600 : 1200;
 
-      // Only dispatch to cloud when human presence is confirmed and attempts remain
-      if (!faceRequestBusy && !faceResultReady && hasHumanPresence &&
-          verifyAttempts < MAX_VERIFY_ATTEMPTS &&
-          now - lastFaceRequest >= adaptiveInterval) {
-        if (startFaceRequestAsync(FACE_REQUEST_VERIFY, faceSession, userId,
-                                  String(ROOM_ID), jpegBuffer, jpegLen)) {
+      // Dispatch valid images at the existing interval while attempts remain
+      if (!faceRequestBusy && !faceResultReady && validJpeg &&
+          verifyAttempts < MAX_VERIFY_ATTEMPTS && now - lastFaceRequest >= adaptiveInterval) {
+        if (startFaceRequestAsync(FACE_REQUEST_VERIFY, faceSession, userId, String(ROOM_ID),
+                                  jpegBuffer, jpegLen)) {
           lastFaceRequest = now;
           verifyAttempts++;
           reticleColor = COLOR_CYAN;
@@ -3067,41 +3454,9 @@ void runAccessFlow(int fingerId) {
     delay(10);
   }
 
-  // If the last candidate is still being processed, allow a small
-  // grace period while CONTINUING the preview instead of freezing.
-  unsigned long graceStart = millis();
-
-  while (!faceVerified && faceRequestBusy && millis() - graceStart < 15000) {
-    size_t jpegLen = fetchJpegFrame(jpegBuffer, jpegBufferCapacity);
-
-    if (jpegLen > 0) {
-      displayJpegOnTFT(jpegBuffer, jpegLen);
-
-      drawFaceReticle(COLOR_CYAN);
-
-      if (overlayBox.valid) {
-        drawCameraFaceBox(overlayBox, overlayColor);
-      }
-
-      tftShowStatus("Look at camera", "Finishing check...", COLOR_CYAN);
-    }
-
-    bool resultSuccess = false;
-
-    FaceBox resultBox = {0, 0, 0, 0, false};
-
-    if (takeFaceResult(faceSession, FACE_REQUEST_VERIFY, resultSuccess,
-                       resultBox)) {
-      faceVerified = resultSuccess;
-
-      overlayBox = resultBox;
-
-      overlayColor = faceVerified ? COLOR_GREEN : COLOR_RED;
-
-      break;
-    }
-
-    delay(10);
+  if (!faceVerified) {
+    finishPendingFaceRequest(faceSession, FACE_REQUEST_VERIFY, faceVerified, overlayBox,
+                             COLOR_CYAN);
   }
 
   stopCamera();
@@ -3160,11 +3515,8 @@ bool processFingerprintIfPresent() {
 
   if (tzResult != FINGERPRINT_OK) {
     String errDesc = getFingerprintErrorString(tzResult);
-    Serial.printf("Fingerprint capture failed: %s (0x%02X)\n", errDesc.c_str(),
-                  tzResult);
-    tftShowFullScreen("SCAN ERROR",
-                      errDesc.length() > 0 ? errDesc : "Press firmly",
-                      COLOR_YELLOW);
+    Serial.printf("Fingerprint capture failed: %s (0x%02X)\n", errDesc.c_str(), tzResult);
+    tftShowFullScreen("SCAN ERROR", errDesc.length() > 0 ? errDesc : "Press firmly", COLOR_YELLOW);
 
     while (finger.getImage() != FINGERPRINT_NOFINGER) {
       delay(75);
@@ -3180,8 +3532,7 @@ bool processFingerprintIfPresent() {
   int searchResult = finger.fingerSearch();
   if (searchResult != FINGERPRINT_OK) {
     Serial.printf("fingerSearch failed: %s (0x%02X)\n",
-                  getFingerprintErrorString(searchResult).c_str(),
-                  searchResult);
+                  getFingerprintErrorString(searchResult).c_str(), searchResult);
     tftShowFullScreen("NO MATCH", "Not registered", COLOR_RED);
 
     while (finger.getImage() != FINGERPRINT_NOFINGER) {
@@ -3241,9 +3592,9 @@ void setup() {
 
   if (savedServer.length() > 0) {
     activeServerUrl = savedServer;
-    Serial.println("🌐 Dynamic Server URL loaded from NVS: " + activeServerUrl);
+    Serial.println("[BOOT] Dynamic Server URL loaded from NVS: " + activeServerUrl);
   } else {
-    Serial.println("🌐 Using default Server URL: " + activeServerUrl);
+    Serial.println("[BOOT] Using default Server URL: " + activeServerUrl);
   }
 
   // Sanitize against /api double-prefix and trailing slashes
@@ -3253,9 +3604,25 @@ void setup() {
   // RELAY
   // =========================================================
 
+  // Establish the locked command before starting either controller task.
+  digitalWrite(RELAY_PIN, DOOR_RELAY_OFF_LEVEL);
   pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, DOOR_RELAY_OFF_LEVEL);
 
-  digitalWrite(RELAY_PIN, LOW);
+  if (!initCoolingFan()) {
+    // Do not silently run the access system without its fan controller.
+    Serial.println("Startup halted. Restart ESP32 and check available memory.");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  if (!initDoorControl()) {
+    Serial.println("Startup halted. Restart ESP32 and check available memory.");
+    while (true) {
+      delay(1000);
+    }
+  }
 
   // =========================================================
   // TFT BACKLIGHT (ALWAYS ON)
@@ -3374,8 +3741,7 @@ void loop() {
         p.begin("labsync", false);
         p.putString("server_url", activeServerUrl);
         p.end();
-        Serial.println("✅ Dynamic Server URL updated and saved: " +
-                       activeServerUrl);
+        Serial.println("[OK] Dynamic Server URL updated and saved: " + activeServerUrl);
       }
     } else if (line == "RESET_SERVER") {
       activeServerUrl = DEFAULT_SERVER_URL;
@@ -3383,15 +3749,13 @@ void loop() {
       p.begin("labsync", false);
       p.remove("server_url");
       p.end();
-      Serial.println("✅ Server URL reset to GCP Cloud Run: " + activeServerUrl);
+      Serial.println("[OK] Server URL reset to GCP Cloud Run: " + activeServerUrl);
     } else if (line == "IP_STATUS") {
       Serial.println("=== LABSYNC DYNAMIC IP STATUS ===");
       Serial.println("ESP32 Local IP: " + WiFi.localIP().toString());
-      Serial.println("Camera Base URL: " + (cameraBaseUrl.length() > 0
-                                                ? cameraBaseUrl
-                                                : "NOT RESOLVED"));
-      Serial.println("Camera UDP:      " +
-                     String(cameraUdpStarted ? "LISTENING" : "STOPPED"));
+      Serial.println("Camera Base URL: " +
+                     (cameraBaseUrl.length() > 0 ? cameraBaseUrl : "NOT RESOLVED"));
+      Serial.println("Camera UDP:      " + String(cameraUdpStarted ? "LISTENING" : "STOPPED"));
       Serial.println("Server URL:      " + activeServerUrl);
       Serial.println("================================");
     }
@@ -3437,6 +3801,7 @@ void loop() {
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     }
   } else {
+    ensureDeviceTimeSync();
     if (!cameraUdpStarted) {
       startCameraDiscoveryUDP();
     }
@@ -3457,6 +3822,8 @@ void loop() {
   // =========================================================
 
   if (systemState == STATE_IDLE) {
+    reportDoorClosedIfPending();
+
     sendHeartbeat();
 
     checkForAdminCommands();
