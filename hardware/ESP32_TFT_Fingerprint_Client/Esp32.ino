@@ -1276,99 +1276,75 @@ size_t fetchJpegFrame(uint8_t *buf, size_t maxLen) {
     return 0;
   }
 
-  if (cameraBaseUrl.length() == 0) {
-    if (!resolveCamera()) {
+  // Camera HTTP can briefly drop a connection while the OV2640/frame buffer
+  // wakes. Retry once and allow slow Wi-Fi transfers more than the old 1.2s
+  // inter-chunk gap before treating a JPEG as truncated.
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (cameraBaseUrl.length() == 0 && !resolveCamera()) {
+      delay(150);
+      continue;
+    }
+
+    NetworkClient client;
+    HTTPClient http;
+    http.setConnectTimeout(CAMERA_CONNECT_TIMEOUT_MS);
+    http.setTimeout(CAMERA_COMMAND_TIMEOUT_MS);
+    http.useHTTP10(true);
+    http.setReuse(false);
+
+    String url = cameraBaseUrl + "/capture";
+    if (!http.begin(client, url)) {
+      cameraBaseUrl = "";
+      delay(150);
+      continue;
+    }
+
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+      String detail = code > 0 ? http.getString() : HTTPClient::errorToString(code);
+      Serial.printf("Capture HTTP error: %d: %s (attempt %d/2)\n", code, detail.c_str(), attempt + 1);
+      http.end();
+      if (code < 0) cameraBaseUrl = ""; // rediscover if the camera IP/server changed
+      delay(150);
+      continue;
+    }
+
+    int len = http.getSize();
+    if (len <= 0 || (size_t)len > maxLen) {
+      if (len > 0) Serial.printf("JPEG too large: %d bytes (buffer %u)\n", len, (unsigned int)maxLen);
+      http.end();
       return 0;
     }
-  }
 
-  NetworkClient client;
-  HTTPClient http;
-
-  // One camera frame wait can take four seconds in the driver.
-  http.setConnectTimeout(CAMERA_CONNECT_TIMEOUT_MS);
-  http.setTimeout(CAMERA_COMMAND_TIMEOUT_MS);
-  http.useHTTP10(true);
-
-  String url = cameraBaseUrl + "/capture";
-
-  if (!http.begin(client, url)) {
-    cameraBaseUrl = "";
-    return 0;
-  }
-
-  int code = http.GET();
-
-  if (code != HTTP_CODE_OK) {
-    String detail = code > 0 ? http.getString() : HTTPClient::errorToString(code);
-    Serial.printf("Capture HTTP error: %d: %s\n", code, detail.c_str());
-
-    http.end();
-
-    return 0;
-  }
-
-  int len = http.getSize();
-
-  if (len <= 0) {
-    http.end();
-    return 0;
-  }
-
-  if ((size_t)len > maxLen) {
-    Serial.printf("JPEG too large: %d bytes (buffer %u)\n", len, (unsigned int)maxLen);
-
-    http.end();
-
-    return 0;
-  }
-
-  NetworkClient *stream = http.getStreamPtr();
-
-  size_t received = 0;
-  unsigned long lastData = millis();
-
-  while (received < (size_t)len) {
-    int available = stream->available();
-
-    if (available > 0) {
-      size_t remaining = (size_t)len - received;
-
-      size_t toRead = (size_t)available;
-
-      if (toRead > remaining) {
-        toRead = remaining;
-      }
-
-      if (toRead > 4096) {
-        toRead = 4096;
-      }
-
-      int got = stream->read(buf + received, toRead);
-
-      if (got > 0) {
-        received += (size_t)got;
-
-        lastData = millis();
-      }
-    } else {
-      if (millis() - lastData > 1200) {
+    NetworkClient *stream = http.getStreamPtr();
+    size_t received = 0;
+    unsigned long lastData = millis();
+    while (received < (size_t)len) {
+      int available = stream->available();
+      if (available > 0) {
+        size_t toRead = min((size_t)available, (size_t)len - received);
+        toRead = min(toRead, (size_t)4096);
+        int got = stream->read(buf + received, toRead);
+        if (got > 0) {
+          received += (size_t)got;
+          lastData = millis();
+        }
+      } else if (!stream->connected() || millis() - lastData > CAMERA_COMMAND_TIMEOUT_MS) {
         break;
+      } else {
+        delay(1);
       }
-
-      delay(1);
     }
+    http.end();
+
+    if (received == (size_t)len) return received;
+
+    Serial.printf("Incomplete JPEG: %u/%d bytes (attempt %d/2)\n",
+                  (unsigned int)received, len, attempt + 1);
+    delay(150);
   }
 
-  http.end();
-
-  if (received != (size_t)len) {
-    Serial.printf("Incomplete JPEG: %u/%d bytes\n", (unsigned int)received, len);
-
-    return 0;
-  }
-
-  return received;
+  return 0;
 }
 
 // ============================================================

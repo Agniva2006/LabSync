@@ -65,8 +65,10 @@ const VERIFY_CONFIDENCE_FALLBACK = 0.10;// Fallback for low-light verification
 const VERIFY_DISTANCE_THRESHOLD = 0.70; // Euclidean distance threshold for match (calibrated for hardware OV2640)
 const VERIFY_RELAXED_THRESHOLD = 0.80;  // Accepted for a marginal match, reported but not granted
 
-// Enrollment quality. Set to 1 high-quality sample for fast hardware response (<1s).
-const SAMPLES_NEEDED_FOR_ENROLLMENT = 1;
+// Enrollment quality. Average several consistent frames so one noisy capture does not become the
+// entire enrolled template. This also makes enrollment less sensitive to
+// small beard, lighting, and pose differences between individual frames.
+const SAMPLES_NEEDED_FOR_ENROLLMENT = 3;
 const SAMPLES_MAX = 3;
 // Consistency limit if multiple frames are submitted
 const ENROLL_SAMPLE_CONSISTENCY_LIMIT = 0.48;

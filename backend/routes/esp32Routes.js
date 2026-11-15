@@ -155,8 +155,25 @@ router.post('/send-command', async (req, res) => {
           console.log(`✅ Created user ${targetUserName} (${targetUserId}) in USERS sheet [Role: ${targetRole}]`);
         } else {
           // Update existing user details if role/email/department/authorizedRooms changed
-          const existingUser = users[userIndex];
-          const rowIndex = userIndex + 2; // 1-indexed + header
+          // getSheetData omits blank rows, so its array index is not the row
+          // number in Google Sheets. Resolve the physical row from a fresh
+          // read before writing, otherwise an enrollment can overwrite a
+          // different user's record when the sheet contains gaps.
+          let rowIndex = await findRowIndex('USERS', 'userid', targetUserId, { fresh: true });
+          if (rowIndex === -1 && email) {
+            rowIndex = await findRowIndex('USERS', 'email', email, { fresh: true });
+          }
+          if (rowIndex === -1) {
+            throw new Error(`Could not locate the existing USERS row for ${targetUserId}`);
+          }
+          const freshUsers = await getSheetData('USERS');
+          const existingUser = freshUsers.find(u =>
+            String(u.userid || u.userId || '').trim() === String(targetUserId).trim() ||
+            (email && String(u.email || '').trim().toLowerCase() === email.toLowerCase())
+          );
+          if (!existingUser) {
+            throw new Error(`Existing USERS row disappeared during enrollment for ${targetUserId}`);
+          }
           await updateRow('USERS', rowIndex, [
             existingUser.userid || existingUser.userId || targetUserId,
             targetUserName,
@@ -457,9 +474,13 @@ router.post('/enrollment-complete', async (req, res) => {
     // Update USERS sheet fingerprintId column — PRESERVE face data.
     // Reads must be FRESH: a biometric write must never target a stale
     // physical row number (that wrote one user's data onto another's row).
-    const users = await getSheetData('USERS');
     let rowIndex = await findRowIndex('USERS', 'userid', userId, { fresh: true });
     if (rowIndex === -1) rowIndex = await findRowIndex('USERS', 'userId', userId, { fresh: true });
+
+    // findRowIndex(fresh) refreshes the sheet cache; read the corresponding
+    // record only after that so the fields preserved below are from the same
+    // snapshot as the physical row number.
+    const users = await getSheetData('USERS');
 
     const normId = String(userId).toLowerCase();
     const user = (users || []).find(u => String(u.userid || u.userId || '').toLowerCase() === normId) || {};

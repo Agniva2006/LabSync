@@ -46,6 +46,22 @@ const globalLimiter = rateLimit({
   },
   standardHeaders: true,
   legacyHeaders: false,
+  // Hardware face samples use a dedicated device-keyed limiter below. Keep
+  // the IP-wide API limit for every other endpoint.
+  skip: (req) => req.path === '/api/face/enroll-hardware' && Boolean(req.device),
+});
+
+const hardwareFaceEnrollLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  keyGenerator: (req) => `device:${req.device.id}`,
+  message: {
+    success: false,
+    error: 'face_enrollment_rate_limited',
+    message: 'Too many face enrollment samples from this device. Wait before trying again.',
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
 // Auth-specific stricter rate limiter for Brute Force protection
@@ -199,6 +215,11 @@ app.use('/api/auth', authLimiter, authRoutes);
 // host that could reach the server could queue an unlock command, enrol a face
 // for an arbitrary userId, or wipe the biometric database.
 app.use('/api/esp32', deviceAuth.verifyDeviceSignature, esp32Routes);
+
+// Authenticate the camera before applying its per-device upload quota. This
+// route then passes through globalLimiter, which skips only authenticated
+// hardware enrollment uploads.
+app.post('/api/face/enroll-hardware', deviceAuth.requireDeviceAuth, hardwareFaceEnrollLimiter);
 
 // Apply global rate limiter to all other non-auth API routes
 app.use('/api/', globalLimiter);
