@@ -1,7 +1,0 @@
-
-╔══════════════════════════════════════════════════════════════╗
-║  🔴 FATAL: JWT_SECRET missing or shorter than 16 characters  ║
-╚══════════════════════════════════════════════════════════════╝
-Set a strong secret in backend/.env or Render Environment Variables.
-Generate one with:  node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
-
