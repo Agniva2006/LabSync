@@ -44,7 +44,6 @@ if (canvasModule) {
 // Import sheets service for persistent storage (Google Sheets, cloud-only)
 const {
   getSheetData,
-  appendRow,
   findRowIndex,
   updateRow,
 } = require('./sheetsService');
@@ -431,41 +430,23 @@ class FaceRecognitionService {
   async saveFaceToSheet(userId, descriptor, score, meta = {}) {
     try {
       console.log(`💾 [DATABASE-SAVE] Saving face descriptor for user: ${userId}`);
-      const users = await getSheetData('USERS');
-
       // Always resolve against a fresh read: biometric writes must never target
       // a cached physical row number.
       let rowIndex = await findRowIndex('USERS', 'userid', userId, { fresh: true });
       if (rowIndex === -1) {
         rowIndex = await findRowIndex('USERS', 'userId', userId, { fresh: true });
       }
-
-      const normTarget = this._normalizeKey(userId);
-      let user = (users || []).find(u => this._normalizeKey(u.userid || u.userId) === normTarget);
-
-      // Quarantine a stored template that cannot be parsed as a 128-d vector,
-      // so it is never handed to a comparison that would always mismatch.
-      const storedDescriptor = user ? (user.facedescriptor || user.faceDescriptor || '') : '';
-      if (storedDescriptor && !this._isValidDescriptor(storedDescriptor)) {
-        console.warn(`⚠️ [DATABASE-SAVE] Existing descriptor for ${userId} is malformed — replacing it`);
+      if (rowIndex === -1) {
+        console.error(`[DATABASE-SAVE] Refusing face enrollment for unknown user ${userId}; create the account through registration first.`);
+        return false;
       }
 
-      if (rowIndex === -1) {
-        console.log(`ℹ️ [DATABASE-SAVE] User ${userId} not yet in Google Sheets. Appending row...`);
-        await appendRow('USERS', [
-          userId,
-          user?.username || user?.name || 'User',
-          user?.email || '',
-          user?.password || require('./passwordService').getFallbackHash(),
-          user?.role || 'user',
-          user?.department || 'Laboratory',
-          user?.authorized_rooms || 'ROOM-001',
-          user?.fingerprintid || user?.fingerprintId || '',
-          JSON.stringify(descriptor),
-          'ENROLLED'
-        ]);
-        console.log(`✅ [DATABASE-SAVE] Successfully appended enrolled user ${userId} to USERS table!`);
-        return true;
+      const users = await getSheetData('USERS');
+      const normTarget = this._normalizeKey(userId);
+      const user = users.find(u => this._normalizeKey(u.userid || u.userId) === normTarget);
+      const storedDescriptor = user ? (user.facedescriptor || user.faceDescriptor || '') : '';
+      if (storedDescriptor && !this._isValidDescriptor(storedDescriptor)) {
+        console.warn(`[DATABASE-SAVE] Existing descriptor for ${userId} is malformed; replacing it.`);
       }
 
       const updateResult = await updateRow('USERS', rowIndex, [

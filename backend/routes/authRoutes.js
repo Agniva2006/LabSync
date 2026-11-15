@@ -4,10 +4,9 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { JWT_SECRET } = require('../middleware/authMiddleware');
 const { validateRequest, schemas } = require('../middleware/validationMiddleware');
-const { getSheetData, appendRow, findRowIndex, updateRow } = require('../services/sheetsService');
+const { getSheetData, appendRow, findRowIndex, updateRow, allocateUserId } = require('../services/sheetsService');
 const { createNotification } = require('../services/notificationService');
 const rateLimit = require('express-rate-limit');
-const { randomUUID } = require('crypto');
 
 // ==================== RATE LIMITER ====================
 const authLimiter = rateLimit({
@@ -17,14 +16,6 @@ const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
-
-// ==================== HELPER ====================
-function generateUserId() {
-  // The last-six-digit timestamp wrapped every ~16m40s and could assign an
-  // existing user's ID to a new registration. Biometric writes resolve by ID,
-  // so a collision could update the previous account's row.
-  return `USR-${Date.now()}-${randomUUID().slice(0, 8)}`;
-}
 
 // ==================== POST /api/auth/register ====================
 router.post('/register', authLimiter, validateRequest(schemas.register), async (req, res) => {
@@ -48,7 +39,7 @@ router.post('/register', authLimiter, validateRequest(schemas.register), async (
 
     // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
-    const userId = generateUserId();
+    const userId = await allocateUserId();
     const assignedRole = (role || 'user').toLowerCase() === 'admin' ? 'admin' : 'user';
 
     // Save to USERS sheet

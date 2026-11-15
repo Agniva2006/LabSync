@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
-const { getSheetData, appendRow, appendRows, findRowIndex, updateRow, deleteRow } = require('../services/sheetsService');
+const { getSheetData, appendRow, appendRows, findRowIndex, updateRow, deleteRow, allocateUserId } = require('../services/sheetsService');
 const { createNotification } = require('../services/notificationService');
 const { validateRequest, schemas } = require('../middleware/validationMiddleware');
 const faceService = require('../services/faceService');
@@ -174,14 +174,11 @@ router.post('/users/bulk-import', async (req, res) => {
 
     const defaultHash = await bcrypt.hash('LabSync@123', 10);
     const rowsToInsert = [];
-    const baseTimestamp = Date.now();
-
-    for (let i = 0; i < users.length; i++) {
-      const user = users[i];
+    for (const user of users) {
       if (!user.name || !user.email) continue;
 
       const userHash = user.password ? await bcrypt.hash(user.password, 10) : defaultHash;
-      const userId = `USR-${baseTimestamp + i}-${Math.floor(Math.random() * 1000)}`;
+      const userId = await allocateUserId();
 
       rowsToInsert.push([
         userId,
@@ -201,13 +198,16 @@ router.post('/users/bulk-import', async (req, res) => {
       return res.status(400).json({ success: false, message: 'No valid user rows to import' });
     }
 
-    // Execute single batch append API call
+    // Append sequentially so each Sheets write can report its own success.
     const result = await appendRows('USERS', rowsToInsert);
+    if (!result.success) {
+      return res.status(503).json({ success: false, message: 'Some users could not be saved to Google Sheets.', importedCount: result.count, failedCount: result.failedCount });
+    }
 
     res.json({
       success: true,
-      message: `Imported ${rowsToInsert.length} users successfully in 1 batch operation`,
-      importedCount: rowsToInsert.length,
+      message: `Imported ${result.count} users successfully`,
+      importedCount: result.count,
     });
   } catch (error) {
     console.error('❌ Bulk import error:', error);

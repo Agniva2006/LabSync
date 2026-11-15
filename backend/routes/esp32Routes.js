@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { getSheetData, appendRow, findRowIndex, updateRow, logAccessEvent } = require('../services/sheetsService');
+const { getSheetData, appendRow, findRowIndex, updateRow, logAccessEvent, allocateUserId } = require('../services/sheetsService');
 const { createNotification } = require('../services/notificationService');
 const { trackFailedAttempt, clearFailedAttempts } = require('../services/securityService');
 const faceService = require('../services/faceService');
@@ -113,32 +113,19 @@ router.post('/send-command', async (req, res) => {
     // If command is an ENROLL command, ensure user exists in USERS sheet
     if (typeof command === 'string' && command.startsWith('ENROLL:')) {
       const parts = command.split(':');
-      const targetUserId = parts[1] || userId;
+      let targetUserId = parts[1] || userId;
       const targetUserName = parts[2] || userName || 'New User';
       const targetRole = (parts[3] || role || 'user').trim().toLowerCase();
 
       try {
-        const bcrypt = require('bcryptjs');
         const users = await getSheetData('USERS');
         let userIndex = users.findIndex(u => (u.userid || u.userId) === targetUserId || (email && u.email && u.email.toLowerCase() === email.toLowerCase()));
 
         if (userIndex === -1) {
-          // Create new user record in USERS sheet
-          const defaultHash = await bcrypt.hash('user123', 10);
-          await appendRow('USERS', [
-            targetUserId,
-            targetUserName,
-            email || '',
-            defaultHash,
-            targetRole,
-            department || '',
-            authorizedRooms || roomId,
-            '',   // fingerprintId
-            '',   // faceDescriptor
-            'NOT_ENROLLED'
-          ]);
-          console.log(`✅ Created user ${targetUserName} (${targetUserId}) in USERS sheet [Role: ${targetRole}]`);
+          return res.status(404).json({ success: false, message: 'Register the user in the app before starting hardware enrollment.' });
         } else {
+          targetUserId = users[userIndex].userid || users[userIndex].userId;
+          command = `ENROLL:${targetUserId}:${targetUserName}:${targetRole}`;
           // Update existing user details if role/email/department/authorizedRooms changed
           // getSheetData omits blank rows, so its array index is not the row
           // number in Google Sheets. Resolve the physical row from a fresh
@@ -159,7 +146,7 @@ router.post('/send-command', async (req, res) => {
           if (!existingUser) {
             throw new Error(`Existing USERS row disappeared during enrollment for ${targetUserId}`);
           }
-          await updateRow('USERS', rowIndex, [
+          const updateResult = await updateRow('USERS', rowIndex, [
             existingUser.userid || existingUser.userId || targetUserId,
             targetUserName,
             email || existingUser.email || '',
@@ -171,10 +158,14 @@ router.post('/send-command', async (req, res) => {
             existingUser.facedescriptor || existingUser.faceDescriptor || '',
             existingUser.facestatus || existingUser.faceStatus || 'NOT_ENROLLED'
           ]);
+          if (!updateResult?.success) {
+            return res.status(503).json({ success: false, message: 'Could not update the user record before hardware enrollment.' });
+          }
           console.log(`🔄 Updated user details for ${targetUserName} (${targetUserId}) in USERS sheet [Role: ${targetRole || existingUser.role}]`);
         }
       } catch (dbErr) {
         console.error('❌ Error syncing user to USERS sheet during enroll:', dbErr.message);
+        return res.status(500).json({ success: false, message: 'Could not prepare the user record for hardware enrollment.' });
       }
     }
 
@@ -334,27 +325,15 @@ router.get('/next-available-user', async (req, res) => {
 
     // 2. If no pending user, auto-generate next sequential User/Admin ID
     const prefix = isAdmin ? 'ADMIN' : 'USER';
-    const regex = new RegExp(`^${prefix}-(\\d+)`, 'i');
-    let maxNum = 100;
-    users.forEach(u => {
-      const id = (u.userid || u.userId || '');
-      const match = id.match(regex);
-      if (match) {
-        const num = parseInt(match[1], 10);
-        if (num > maxNum) maxNum = num;
-      }
-    });
-
-    const nextNum = maxNum + 1;
-    const newUserId = `${prefix}-${nextNum}`;
-    const newUserName = isAdmin ? `Admin ${nextNum}` : `User ${nextNum}`;
+    const newUserId = await allocateUserId();
+    const newUserName = isAdmin ? `Admin ${newUserId.slice(4)}` : `User ${newUserId.slice(4)}`;
     const defaultHash = await bcrypt.hash('user123', 10);
 
     // Create entry in Google Sheets
-    await appendRow('USERS', [
+    const savedUser = await appendRow('USERS', [
       newUserId,
       newUserName,
-      `${prefix.toLowerCase()}${nextNum}@iitkgp.ac.in`,
+      `${prefix.toLowerCase()}-${newUserId.slice(4)}@iitkgp.ac.in`,
       defaultHash,
       requestedRole,
       'Laboratory',
@@ -363,6 +342,9 @@ router.get('/next-available-user', async (req, res) => {
       '',   // faceDescriptor (will be updated after camera scan)
       'NOT_ENROLLED'
     ]);
+    if (!savedUser?.success) {
+      return res.status(503).json({ success: false, message: 'Could not save the new user to Google Sheets.' });
+    }
 
     console.log(`✨ Auto-generated new ${requestedRole} for hardware enrollment: ${newUserName} (${newUserId})`);
 

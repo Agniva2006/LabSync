@@ -69,6 +69,7 @@ try {
 const sheetIdCache = new Map();
 // Memory cache for sheet data (5 seconds TTL) to prevent API rate limit on sequential calls
 const sheetDataCache = new Map();
+const USER_ID_SEQUENCE_SHEET = 'USER_ID_SEQUENCE';
 
 /**
  * Get Sheet ID for a given Sheet Name (required for batchUpdate structural changes)
@@ -211,16 +212,80 @@ async function appendRow(sheetName, rowData) {
 }
 
 /**
+ * Allocate a globally shared, sequential ID for a new user.
+ * Google Sheets is the durable source of truth; every allocation appends one
+ * token to a dedicated ledger tab and derives the number from Sheets' actual
+ * updatedRange. This works across Cloud Run instances without local state.
+ */
+async function allocateUserId() {
+  if (!sheets) throw new Error('Google Sheets is not configured; cannot allocate user ID');
+
+  // Create the append-only ledger tab on demand. If another instance creates
+  // it at the same time, re-read the spreadsheet and continue if it exists.
+  let spreadsheet = await withRetry(() => sheets.spreadsheets.get({ spreadsheetId }));
+  let sequenceSheet = (spreadsheet.data.sheets || []).find(
+    sheet => sheet.properties.title === USER_ID_SEQUENCE_SHEET
+  );
+  if (!sequenceSheet) {
+    try {
+      await withRetry(() => sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        resource: { requests: [{ addSheet: { properties: { title: USER_ID_SEQUENCE_SHEET } } }] }
+      }));
+    } catch (createError) {
+      spreadsheet = await withRetry(() => sheets.spreadsheets.get({ spreadsheetId }));
+      sequenceSheet = (spreadsheet.data.sheets || []).find(
+        sheet => sheet.properties.title === USER_ID_SEQUENCE_SHEET
+      );
+      if (!sequenceSheet) throw createError;
+    }
+  }
+
+  // Burn a sequence number if it collides with an existing historical ID.
+  // Existing account IDs are never rewritten or renumbered.
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const token = `${Date.now()}-${require('crypto').randomUUID()}`;
+    const response = await withRetry(() => sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: `${USER_ID_SEQUENCE_SHEET}!A:A`,
+      insertDataOption: 'INSERT_ROWS',
+      valueInputOption: 'RAW',
+      resource: { values: [[token]] }
+    }));
+    const updatedRange = response.data.updates?.updatedRange || '';
+    const match = updatedRange.match(/![A-Z]+(\d+)(?::|$)/i);
+    if (!match) throw new Error(`Could not determine allocated sequence row from ${updatedRange || 'empty updatedRange'}`);
+
+    const sequence = Number(match[1]);
+    if (!Number.isSafeInteger(sequence) || sequence < 1) {
+      throw new Error(`Invalid user ID sequence row: ${match[1]}`);
+    }
+    const userId = `USR-${String(sequence).padStart(3, '0')}`;
+    sheetDataCache.delete('USERS');
+    const currentUsers = await getSheetData('USERS');
+    if (!currentUsers.some(user => String(user.userid || user.userId || '').trim().toUpperCase() === userId)) {
+      return userId;
+    }
+    console.warn(`[USER-ID] ${userId} already exists; reserved sequence row ${sequence} and retrying`);
+  }
+
+  throw new Error('Could not allocate a unique user ID after 100 attempts');
+}
+
+/**
  * Append multiple rows to a sheet
  */
 async function appendRows(sheetName, rowsArray) {
   if (!Array.isArray(rowsArray) || rowsArray.length === 0) {
     return { success: true, count: 0 };
   }
+  let count = 0;
   for (const row of rowsArray) {
-    await appendRow(sheetName, row);
+    const result = await appendRow(sheetName, row);
+    if (!result?.success) return { success: false, count, failedCount: rowsArray.length - count };
+    count++;
   }
-  return { success: true, count: rowsArray.length };
+  return { success: true, count, failedCount: 0 };
 }
 
 /**
@@ -478,6 +543,7 @@ function getStorageMode() {
 module.exports = {
   getSheetData,
   sheetDataCache,
+  allocateUserId,
   appendRow,
   appendRows,
   updateRow,
