@@ -30,6 +30,9 @@
 
     GET /capture
         Return one JPEG
+
+    GET :81/stream
+        MJPEG preview; control requests remain available on port 80
         If camera is asleep, automatically wake it first
 
     GET /stop
@@ -61,6 +64,10 @@
 #include "esp_camera.h"
 #include "esp_err.h"
 #include "esp_http_server.h"
+#include <atomic>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 // ============================================================
 // WIFI SETTINGS
@@ -76,7 +83,7 @@ const char *WIFI_PASSWORD = "4064097a"; // REQUIRED: must match Main ESP32
 // The camera will POST its current DHCP IP to the backend.
 // ============================================================
 
-const char *SERVER_URL = "https://labsync-460952407297.asia-south1.run.app";
+const char *SERVER_URL = "xyz";
 const char *ROOM_ID = "ROOM-001";
 
 // Optional. Invalid SERVER_URL values are skipped.
@@ -150,8 +157,8 @@ bool mdnsRunning = false;
 // CAMERA / HTTP STATE
 // ============================================================
 
-volatile bool cameraEnabled = false;
-bool cameraInitialized = false;
+std::atomic<bool> cameraEnabled{false};
+std::atomic<bool> cameraInitialized{false};
 
 httpd_handle_t cameraServer = nullptr;
 
@@ -188,6 +195,107 @@ void connectWiFi();
 void registerCameraWithBackend();
 
 bool startMDNS();
+
+// Port 80 remains available for /start, /status, /capture and /stop while
+// port 81 serves the long-running MJPEG request. Camera frames are serialized.
+SemaphoreHandle_t cameraMutex = nullptr;
+httpd_handle_t streamServer = nullptr;
+httpd_uri_t streamUri = {};
+std::atomic<bool> streamStopRequested{true};
+std::atomic<bool> streamClientActive{false};
+std::atomic<uint32_t> cameraStreamGeneration{0};
+constexpr uint32_t MJPEG_FRAME_INTERVAL_MS = 80; // Upper pacing target, not a measured FPS.
+
+class CameraGuard {
+public:
+  explicit CameraGuard(uint32_t timeoutMs = 7000)
+      : locked_(cameraMutex && xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(timeoutMs)) == pdTRUE) {}
+  ~CameraGuard() { if (locked_) xSemaphoreGive(cameraMutex); }
+  bool locked() const { return locked_; }
+private:
+  bool locked_;
+};
+
+esp_err_t streamHandler(httpd_req_t *req);
+bool startStreamServer();
+
+esp_err_t streamHandler(httpd_req_t *req) {
+  if (!cameraEnabled.load() || streamStopRequested.load()) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return sendText(req, "CAMERA_SLEEP");
+  }
+  streamClientActive.store(true);
+  const uint32_t generation = cameraStreamGeneration.load();
+  httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=LabSyncFrameBoundary");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  esp_err_t result = ESP_OK;
+  uint32_t frames = 0, statsAt = millis();
+  while (cameraEnabled.load() && !streamStopRequested.load() &&
+         generation == cameraStreamGeneration.load() && WiFi.status() == WL_CONNECTED) {
+    const uint32_t startedAt = millis();
+    {
+      CameraGuard guard;
+      if (!guard.locked()) { result = ESP_ERR_TIMEOUT; break; }
+      if (!cameraEnabled.load() || streamStopRequested.load() ||
+          generation != cameraStreamGeneration.load()) break;
+      camera_fb_t *frame = esp_camera_fb_get();
+      if (!frame) { result = ESP_FAIL; Serial.println("[MJPEG] Frame acquisition failed"); break; }
+      char part[128];
+      const int count = snprintf(part, sizeof(part),
+          "\r\n--LabSyncFrameBoundary\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+          static_cast<unsigned>(frame->len));
+      result = httpd_resp_send_chunk(req, part, count);
+      if (result == ESP_OK)
+        result = httpd_resp_send_chunk(req, reinterpret_cast<const char *>(frame->buf), frame->len);
+      esp_camera_fb_return(frame); // Also returned on send failure.
+    }
+    if (result != ESP_OK) break;
+    ++frames;
+    const uint32_t now = millis();
+    if (now - statsAt >= 5000) {
+      Serial.printf("[MJPEG] send=%.1f fps last-frame=%lu ms RSSI=%d heap=%u\n",
+                    frames * 1000.0f / (now - statsAt), now - startedAt,
+                    WiFi.RSSI(), ESP.getFreeHeap());
+      frames = 0;
+      statsAt = now;
+    }
+    const uint32_t elapsed = millis() - startedAt;
+    if (elapsed < MJPEG_FRAME_INTERVAL_MS) vTaskDelay(pdMS_TO_TICKS(MJPEG_FRAME_INTERVAL_MS - elapsed));
+    else taskYIELD();
+  }
+  if (result == ESP_OK) httpd_resp_send_chunk(req, nullptr, 0);
+  else Serial.printf("[MJPEG] Send ended: %s (0x%X)\n", esp_err_to_name(result), result);
+  streamClientActive.store(false);
+  return result;
+}
+
+bool startStreamServer() {
+  if (streamServer) return true;
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 81;
+  config.ctrl_port = 32769;
+  config.max_uri_handlers = 2;
+  config.max_open_sockets = 2;
+  config.lru_purge_enable = true;
+  // MJPEG is an intentionally long-lived response. Give each multipart frame
+  // enough time to cross a congested Wi-Fi link instead of dropping the stream
+  // mid-JPEG and forcing the main ESP32 to reconnect repeatedly.
+  config.send_wait_timeout = 10;
+  config.recv_wait_timeout = 10;
+  config.stack_size = 6144;
+  if (httpd_start(&streamServer, &config) != ESP_OK) return false;
+  streamUri.uri = "/stream";
+  streamUri.method = HTTP_GET;
+  streamUri.handler = streamHandler;
+  if (httpd_register_uri_handler(streamServer, &streamUri) != ESP_OK) {
+    httpd_stop(streamServer);
+    streamServer = nullptr;
+    return false;
+  }
+  Serial.println("MJPEG server ready on port 81; controls stay on port 80");
+  return true;
+}
 
 // ============================================================
 // SEND TEXT RESPONSE
@@ -501,6 +609,7 @@ esp_err_t rootHandler(httpd_req_t *req)
       "\n"
       "GET /start\n"
       "GET /capture\n"
+      "MJPEG http://<camera-ip>:81/stream\n"
       "GET /stop\n"
       "GET /status\n");
 }
@@ -511,6 +620,12 @@ esp_err_t rootHandler(httpd_req_t *req)
 
 esp_err_t startHandler(httpd_req_t *req)
 {
+  CameraGuard guard;
+  if (!guard.locked()) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return sendText(req, "CAMERA_BUSY");
+  }
+  streamStopRequested.store(false);
   Serial.println("Received /start");
   const unsigned long startedAt = millis();
 
@@ -547,21 +662,18 @@ esp_err_t startHandler(httpd_req_t *req)
 // STOP HANDLER
 // ============================================================
 
-esp_err_t stopHandler(httpd_req_t *req)
-{
-  Serial.println();
-  Serial.println("Received /stop");
-
-  esp_err_t result = sendText(
-      req,
-      "CAMERA_SLEEP");
-
-  // Let the response leave before deinitializing the camera.
-  delay(20);
-
+esp_err_t stopHandler(httpd_req_t *req) {
+  // Signal the streaming task first; it exits after its current bounded send.
+  cameraStreamGeneration.fetch_add(1);
+  streamStopRequested.store(true);
+  cameraEnabled.store(false);
+  CameraGuard guard;
+  if (!guard.locked()) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return sendText(req, "CAMERA_BUSY");
+  }
   sleepCamera();
-
-  return result;
+  return sendText(req, "CAMERA_SLEEP");
 }
 
 // ============================================================
@@ -588,6 +700,12 @@ esp_err_t statusHandler(httpd_req_t *req)
 
 esp_err_t captureHandler(httpd_req_t *req)
 {
+  CameraGuard guard;
+  if (!guard.locked()) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return sendText(req, "CAMERA_BUSY");
+  }
+  const uint32_t captureStartedAt = millis();
   // /capture also works without a preceding /start.
   if (!cameraInitialized || !cameraEnabled)
   {
@@ -644,7 +762,8 @@ esp_err_t captureHandler(httpd_req_t *req)
       frame->len);
 
   esp_camera_fb_return(frame);
-
+  if (res != ESP_OK) Serial.printf("[CAPTURE] Send failed: %s\n", esp_err_to_name(res));
+  Serial.printf("[CAPTURE] Capture/send took %lu ms\n", millis() - captureStartedAt);
   return res;
 }
 
@@ -687,6 +806,11 @@ bool startHttpServer()
 
   config.server_port = 80;
   config.max_uri_handlers = 8;
+  // A QVGA JPEG is sent as one HTTP response. Two seconds can expire midway
+  // through that response on a congested Wi-Fi link, yielding a truncated
+  // JPEG at the main ESP32. Keep this above its 5-second capture read timeout.
+  config.send_wait_timeout = 10;
+  config.recv_wait_timeout = 3;
   config.lru_purge_enable = true;
 
   if (httpd_start(&cameraServer, &config) != ESP_OK)
@@ -832,7 +956,7 @@ void registerCameraWithBackend()
     }
   }
 
-  if (httpCode > 0)
+  if (httpCode >= 200 && httpCode < 300)
   {
     Serial.printf(
         "Dynamic camera IP registered to backend (HTTP %d): %s\n",
@@ -959,6 +1083,11 @@ void connectWiFi()
 void setup()
 {
   Serial.begin(115200);
+  cameraMutex = xSemaphoreCreateMutex();
+  if (!cameraMutex) {
+    Serial.println("FATAL: Camera mutex allocation failed");
+    while (true) delay(1000);
+  }
 
   delay(500);
 
@@ -1002,7 +1131,7 @@ void setup()
   // HTTP SERVER
   // ==========================================================
 
-  if (!startHttpServer())
+  if (!startHttpServer() || !startStreamServer())
   {
     Serial.println("FATAL: HTTP server failed");
 

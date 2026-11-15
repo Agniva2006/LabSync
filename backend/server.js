@@ -48,7 +48,8 @@ const globalLimiter = rateLimit({
   legacyHeaders: false,
   // Hardware face samples use a dedicated device-keyed limiter below. Keep
   // the IP-wide API limit for every other endpoint.
-  skip: (req) => req.path === '/api/face/enroll-hardware' && Boolean(req.device),
+  skip: (req) => Boolean(req.device) &&
+    (req.path === '/api/face/enroll-hardware' || req.path === '/api/face/verify'),
 });
 
 const hardwareFaceEnrollLimiter = rateLimit({
@@ -219,7 +220,9 @@ app.use('/api/esp32', deviceAuth.verifyDeviceSignature, esp32Routes);
 // Authenticate the camera before applying its per-device upload quota. This
 // route then passes through globalLimiter, which skips only authenticated
 // hardware enrollment uploads.
-app.post('/api/face/enroll-hardware', deviceAuth.requireDeviceAuth, hardwareFaceEnrollLimiter);
+app.post(['/api/face/enroll-hardware', '/api/face/verify'],
+  deviceAuth.requireDeviceAuth,
+  hardwareFaceEnrollLimiter);
 
 // Apply global rate limiter to all other non-auth API routes
 app.use('/api/', globalLimiter);

@@ -58,9 +58,15 @@ Cooling fan:
 #include "esp_random.h"
 #include <time.h>
 #include <sys/time.h>
+#include <atomic>
+#include <new>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+struct FaceBox;
+struct FaceReply;
 
 // ============================================================
-// ⚠️  CHANGE THESE — WiFi and lab configuration
+//   CHANGE THESE — WiFi and lab configuration
 // ============================================================
 
 const char *WIFI_SSID = "Arun";         // ← Change to your WiFi name
@@ -68,7 +74,7 @@ const char *WIFI_PASSWORD = "4064097a"; // ← Change to your WiFi password
 
 // Default Server URL (Can be changed dynamically via Preferences / Serial
 // without reflashing)
-const char *DEFAULT_SERVER_URL = "https://labsync-460952407297.asia-south1.run.app";
+const char *DEFAULT_SERVER_URL = "xyz";
 String activeServerUrl = DEFAULT_SERVER_URL;
 
 const char *CAMERA_MDNS_NAME = "esp32cam";
@@ -194,7 +200,9 @@ static_assert(FAN_RUN_MS < FAN_INTERVAL_MS, "Fan run must be shorter than interv
 // ============================================================
 
 constexpr uint32_t LIVE_VIEW_TIME_MS = 35000;
-constexpr uint32_t FACE_REQUEST_INTERVAL_MS = 900;
+constexpr uint32_t FACE_REQUEST_INTERVAL_MS = 2000;
+constexpr uint32_t ENROLL_MAX_TIME_MS = 90000;
+constexpr uint32_t ENROLL_NO_PROGRESS_MS = 45000;
 constexpr uint32_t FACE_UPLOAD_TIMEOUT_MS = 30000;
 constexpr uint32_t COMMAND_POLL_INTERVAL_MS = 3000;
 constexpr uint32_t HEARTBEAT_INTERVAL_MS = 30000;
@@ -206,11 +214,11 @@ constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 5000;
 // JPEG
 // ============================================================
 
-// QVGA JPEGs do not need a 120 KB contiguous buffer.
-// Try a sensible primary size first, with smaller fallbacks for ESP32-WROOM.
-constexpr size_t JPEG_BUFFER_PRIMARY_BYTES = 45000;
-constexpr size_t JPEG_BUFFER_FALLBACK_1_BYTES = 38000;
-constexpr size_t JPEG_BUFFER_FALLBACK_2_BYTES = 32000;
+// QVGA frame buffers are capped to leave heap for MJPEG reception and TLS.
+// Oversized frames are dropped intact, never recompressed or partially uploaded.
+constexpr size_t JPEG_BUFFER_PRIMARY_BYTES = 24000;
+constexpr size_t JPEG_BUFFER_FALLBACK_1_BYTES = 20000;
+constexpr size_t JPEG_BUFFER_FALLBACK_2_BYTES = 16000;
 
 // ============================================================
 // TFT LAYOUT
@@ -1121,6 +1129,369 @@ bool resolveCamera(const String &excludedBaseUrl = "") {
 // CAMERA COMMAND
 // ============================================================
 
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <ctype.h>
+
+// Receives a DECHUNKED multipart body. HTTPClient handles HTTP chunk framing.
+// No heap allocation. A JPEG is published only after its complete declared body.
+class MjpegParser {
+public:
+  typedef void (*FrameCallback)(const uint8_t *, size_t, void *);
+  MjpegParser(uint8_t *buffer, size_t capacity, FrameCallback callback, void *context)
+      : buffer_(buffer), capacity_(capacity), callback_(callback), context_(context) {}
+
+  bool setBoundary(const char *boundary) {
+    const size_t n = boundary ? strlen(boundary) : 0;
+    if (n == 0 || n > 70) return false;
+    memcpy(boundary_, "--", 2);
+    memcpy(boundary_ + 2, boundary, n + 1);
+    reset();
+    return true;
+  }
+
+  void reset() {
+    state_ = BOUNDARY;
+    lineLength_ = 0;
+    overflow_ = false;
+    expected_ = received_ = 0;
+    contentLengthSeen_ = false;
+    headerCount_ = 0;
+  }
+
+  void feed(const uint8_t *data, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+      const uint8_t c = data[i];
+      if (state_ == PAYLOAD) {
+        if (expected_ <= capacity_) buffer_[received_] = c;
+        if (++received_ == expected_) {
+          if (expected_ <= capacity_ && expected_ >= 4 && buffer_[0] == 0xFF &&
+              buffer_[1] == 0xD8 && buffer_[expected_ - 2] == 0xFF &&
+              buffer_[expected_ - 1] == 0xD9 && callback_) {
+            callback_(buffer_, expected_, context_);
+          }
+          reset();
+        }
+        continue;
+      }
+      if (c == '\n') {
+        if (lineLength_ && line_[lineLength_ - 1] == '\r') --lineLength_;
+        line_[lineLength_] = '\0';
+        processLine();
+        lineLength_ = 0;
+        overflow_ = false;
+      } else if (lineLength_ + 1 < sizeof(line_)) {
+        line_[lineLength_++] = static_cast<char>(c);
+      } else {
+        overflow_ = true;
+      }
+    }
+  }
+
+private:
+  enum State { BOUNDARY, HEADERS, PAYLOAD };
+  uint8_t *buffer_;
+  size_t capacity_;
+  FrameCallback callback_;
+  void *context_;
+  char boundary_[73] = {};
+  char line_[192] = {};
+  size_t lineLength_ = 0, expected_ = 0, received_ = 0;
+  bool overflow_ = false, contentLengthSeen_ = false;
+  unsigned headerCount_ = 0;
+  State state_ = BOUNDARY;
+
+  void processLine() {
+    if (overflow_) { state_ = BOUNDARY; return; }
+    if (strcmp(line_, boundary_) == 0) {
+      state_ = HEADERS;
+      expected_ = received_ = 0;
+      contentLengthSeen_ = false;
+      headerCount_ = 0;
+      return;
+    }
+    if (state_ != HEADERS) return;
+    if (lineLength_ == 0) {
+      // Oversized but bounded parts are drained rather than misparsed as headers.
+      state_ = contentLengthSeen_ && expected_ >= 4 ? PAYLOAD : BOUNDARY;
+      return;
+    }
+    if (++headerCount_ > 16) { state_ = BOUNDARY; return; }
+    const char *name = "content-length:";
+    size_t i = 0;
+    while (name[i] && line_[i] && tolower(static_cast<unsigned char>(line_[i])) == name[i]) ++i;
+    if (name[i]) return;
+    const char *p = line_ + i;
+    while (*p == ' ' || *p == '\t') ++p;
+    size_t value = 0;
+    bool valid = isdigit(static_cast<unsigned char>(*p)) != 0;
+    while (isdigit(static_cast<unsigned char>(*p))) {
+      const unsigned digit = static_cast<unsigned>(*p++ - '0');
+      if (value > (1024U * 1024U - digit) / 10U) { valid = false; break; }
+      value = value * 10U + digit;
+    }
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p || !valid || contentLengthSeen_) {
+      state_ = BOUNDARY;
+      return;
+    }
+    contentLengthSeen_ = true;
+    expected_ = value;
+  }
+};
+
+// MJPEG receiver owns its network connection. The TFT task only copies the
+// latest complete frame; it never waits for the camera HTTP connection.
+SemaphoreHandle_t previewMutex = nullptr;
+TaskHandle_t previewTask = nullptr;
+std::atomic<bool> previewRequested{false};
+std::atomic<bool> previewActive{false};
+std::atomic<uint32_t> previewReceived{0};
+uint8_t *previewReceiveBuffer = nullptr;
+uint8_t *previewLatestBuffer = nullptr;
+size_t previewCapacity = 0, previewLatestLength = 0;
+uint32_t previewSequence = 0, previewConsumedSequence = 0;
+String previewTarget;
+String previewLastMainTarget;
+uint32_t previewDrawn = 0, previewLastStats = 0;
+uint32_t previewLastReceivedStats = 0, previewLastDrawnStats = 0;
+
+void publishPreviewFrame(const uint8_t *data, size_t length, void *context);
+void previewWorker(void *parameter);
+bool startMjpegPreview();
+bool stopMjpegPreview();
+
+// HTTPClient's chunk-body helper can keep waiting when a peer stalls in the
+// middle of a chunk. Enforce cancellation and an inter-byte deadline here.
+class PreviewClient : public NetworkClient {
+public:
+  uint8_t connected() override {
+    if (!previewRequested.load() || millis() - lastRead_ > 5000) NetworkClient::stop();
+    return NetworkClient::connected();
+  }
+  int read(uint8_t *buffer, size_t size) override {
+    if (!connected()) return -1;
+    const int count = NetworkClient::read(buffer, size);
+    if (count > 0) lastRead_ = millis();
+    return count;
+  }
+  int read() override {
+    uint8_t value;
+    return read(&value, 1) == 1 ? value : -1;
+  }
+  size_t readBytes(char *buffer, size_t size) override {
+    size_t count = 0;
+    while (count < size && connected()) {
+      const int got = read(reinterpret_cast<uint8_t *>(buffer) + count, size - count);
+      if (got > 0) count += got;
+      else delay(1);
+    }
+    return count;
+  }
+  size_t readBytes(uint8_t *buffer, size_t size) override {
+    return readBytes(reinterpret_cast<char *>(buffer), size);
+  }
+private:
+  uint32_t lastRead_ = millis();
+};
+
+class MjpegSink : public Stream {
+public:
+  explicit MjpegSink(MjpegParser &parser) : parser_(parser) {}
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+  size_t write(uint8_t value) override { return write(&value, 1); }
+  size_t write(const uint8_t *data, size_t length) override {
+    if (!previewRequested.load()) return 0;
+    parser_.feed(data, length);
+    return length;
+  }
+private:
+  MjpegParser &parser_;
+};
+
+void publishPreviewFrame(const uint8_t *data, size_t length, void *context) {
+  (void)context;
+  if (!previewRequested.load() || length > previewCapacity) return;
+  if (xSemaphoreTake(previewMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+  memcpy(previewLatestBuffer, data, length);
+  previewLatestLength = length;
+  ++previewSequence;
+  xSemaphoreGive(previewMutex);
+  previewReceived.fetch_add(1);
+}
+
+void previewWorker(void *parameter) {
+  (void)parameter;
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    xSemaphoreTake(previewMutex, portMAX_DELAY);
+    const bool run = previewRequested.load();
+    if (run) previewActive.store(true);
+    xSemaphoreGive(previewMutex);
+    if (!run) continue;
+
+    unsigned failures = 0;
+    while (previewRequested.load()) {
+      String target;
+      xSemaphoreTake(previewMutex, portMAX_DELAY);
+      target = previewTarget;
+      xSemaphoreGive(previewMutex);
+      if (WiFi.status() == WL_CONNECTED && target.length()) {
+        // Use the cached address first. Only repeated failures trigger mDNS.
+        if (failures >= 3) {
+          IPAddress ip = MDNS.queryHost(CAMERA_MDNS_NAME, 600);
+          if (!ipIsZero(ip)) {
+            target = "http://" + ip.toString();
+            xSemaphoreTake(previewMutex, portMAX_DELAY);
+            previewTarget = target;
+            xSemaphoreGive(previewMutex);
+          }
+        }
+        PreviewClient client;
+        HTTPClient http;
+        http.setConnectTimeout(CAMERA_CONNECT_TIMEOUT_MS);
+        http.setTimeout(1800);
+        http.setReuse(false);
+        const char *headers[] = {"Content-Type"};
+        http.collectHeaders(headers, 1);
+        const String url = target + ":81/stream";
+        const uint32_t before = previewReceived.load();
+        if (http.begin(client, url)) {
+          const int code = http.GET();
+          String type = http.header("Content-Type");
+          const int boundaryAt = type.indexOf("boundary=");
+          if (code == 200 && type.startsWith("multipart/x-mixed-replace") && boundaryAt >= 0) {
+            String boundary = type.substring(boundaryAt + 9);
+            const int semicolon = boundary.indexOf(';');
+            if (semicolon >= 0) boundary = boundary.substring(0, semicolon);
+            boundary.trim();
+            if (boundary.startsWith("\"") && boundary.endsWith("\""))
+              boundary = boundary.substring(1, boundary.length() - 1);
+            MjpegParser parser(previewReceiveBuffer, previewCapacity, publishPreviewFrame, nullptr);
+            if (parser.setBoundary(boundary.c_str())) {
+              Serial.println("[MJPEG] Connected: " + url);
+              MjpegSink sink(parser);
+              // This decodes HTTP Transfer-Encoding: chunked before multipart parsing.
+              http.writeToStream(&sink);
+            }
+          } else if (previewRequested.load()) {
+            Serial.printf("[MJPEG] Stream HTTP status %d\n", code);
+          }
+          http.end();
+        }
+        client.stop();
+        failures = previewReceived.load() != before ? 0 : failures + 1;
+      } else {
+        ++failures;
+      }
+      // Notification wakes the retry wait immediately when stopping.
+      if (previewRequested.load()) {
+        const uint32_t waitMs = failures > 2 ? 1800 : 400;
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(waitMs));
+      }
+    }
+    previewActive.store(false);
+  }
+}
+
+bool startMjpegPreview() {
+  if (previewActive.load() && !stopMjpegPreview()) return false;
+  if (!previewMutex) previewMutex = xSemaphoreCreateMutex();
+  if (!previewMutex) return false;
+  if (!previewReceiveBuffer || !previewLatestBuffer) {
+    const size_t sizes[] = {24000, 20000, 16000};
+    for (size_t size : sizes) {
+      if (size > jpegBufferCapacity) continue;
+      uint8_t *receive = static_cast<uint8_t *>(malloc(size));
+      uint8_t *latest = static_cast<uint8_t *>(malloc(size));
+      // Preserve working space for the upload task, JPEG copy and TLS heap.
+      if (receive && latest && ESP.getFreeHeap() >= 90000 && ESP.getMaxAllocHeap() >= 40000) {
+        previewReceiveBuffer = receive;
+        previewLatestBuffer = latest;
+        previewCapacity = size;
+        break;
+      }
+      free(receive);
+      free(latest);
+    }
+    if (!previewReceiveBuffer || !previewLatestBuffer) {
+      Serial.println("[MJPEG] Not enough heap for frame buffers.");
+      return false;
+    }
+  }
+  if (!previewTask && xTaskCreatePinnedToCore(previewWorker, "mjpeg", 6144, nullptr, 1,
+                                             &previewTask, 0) != pdPASS) {
+    previewTask = nullptr;
+    return false;
+  }
+  xSemaphoreTake(previewMutex, portMAX_DELAY);
+  previewTarget = cameraBaseUrl;
+  previewLastMainTarget = cameraBaseUrl;
+  previewLatestLength = 0;
+  previewConsumedSequence = previewSequence;
+  previewRequested.store(true);
+  xSemaphoreGive(previewMutex);
+  previewReceived.store(0);
+  previewDrawn = previewLastReceivedStats = previewLastDrawnStats = 0;
+  previewLastStats = millis();
+  xTaskNotifyGive(previewTask);
+  return true;
+}
+
+bool stopMjpegPreview() {
+  if (!previewTask || !previewMutex) return true;
+  xSemaphoreTake(previewMutex, portMAX_DELAY);
+  previewRequested.store(false);
+  xSemaphoreGive(previewMutex);
+  xTaskNotifyGive(previewTask);
+  const uint32_t start = millis();
+  while (previewActive.load() && millis() - start < 6500) delay(10);
+  if (previewActive.load()) {
+    Serial.println("[MJPEG] Receiver still stopping; no sensor deinitialization yet.");
+    return false;
+  }
+  xSemaphoreTake(previewMutex, portMAX_DELAY);
+  if (previewTarget.length()) cameraBaseUrl = previewTarget;
+  previewLatestLength = 0;
+  xSemaphoreGive(previewMutex);
+  return true;
+}
+
+size_t fetchJpegFrame(uint8_t *buf, size_t maxLen) {
+  if (!cameraStreaming || !previewMutex) return 0;
+  // Nonblocking UDP updates can carry a new DHCP address during a session.
+  processCameraUdpAnnouncement(0);
+  if (xSemaphoreTake(previewMutex, 0) != pdTRUE) return 0;
+  if (cameraBaseUrl != previewLastMainTarget) {
+    previewTarget = cameraBaseUrl;
+    previewLastMainTarget = cameraBaseUrl;
+  }
+  size_t length = 0;
+  if (previewSequence != previewConsumedSequence && previewLatestLength <= maxLen) {
+    length = previewLatestLength;
+    if (length) memcpy(buf, previewLatestBuffer, length);
+    previewConsumedSequence = previewSequence;
+  }
+  xSemaphoreGive(previewMutex);
+  const uint32_t now = millis();
+  if (now - previewLastStats >= 5000) {
+    const uint32_t received = previewReceived.load();
+    const float seconds = (now - previewLastStats) / 1000.0f;
+    Serial.printf("[MJPEG] receive=%.1f fps display=%.1f fps RSSI=%d heap=%u largest=%u\n",
+                  (received - previewLastReceivedStats) / seconds,
+                  (previewDrawn - previewLastDrawnStats) / seconds,
+                  WiFi.RSSI(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    previewLastReceivedStats = received;
+    previewLastDrawnStats = previewDrawn;
+    previewLastStats = now;
+  }
+  return length;
+}
+
 bool sendCameraCmd(const char *path) {
   cameraLastHttpCode = 0;
   cameraLastResponse = "";
@@ -1138,7 +1509,7 @@ bool sendCameraCmd(const char *path) {
   HTTPClient http;
   const bool waking = strcmp(path, "/start") == 0;
   http.setConnectTimeout(CAMERA_CONNECT_TIMEOUT_MS);
-  http.setTimeout(waking ? CAMERA_WAKE_TIMEOUT_MS : CAMERA_COMMAND_TIMEOUT_MS);
+  http.setTimeout((waking || strcmp(path, "/stop") == 0) ? CAMERA_WAKE_TIMEOUT_MS : CAMERA_COMMAND_TIMEOUT_MS);
   http.useHTTP10(true);
   http.setReuse(false);
 
@@ -1210,6 +1581,12 @@ bool startCamera() {
       if (sendCameraCmd("/start") && sendCameraCmd("/status")) {
         cameraStreaming = true;
         Serial.println("Camera ACTIVE confirmed");
+        if (!startMjpegPreview()) {
+          cameraStreaming = false;
+          sendCameraCmd("/stop");
+          Serial.println("[MJPEG] Preview startup failed");
+          return false;
+        }
         return true;
       }
 
@@ -1244,7 +1621,8 @@ void stopCamera() {
     return;
   requestCoolingFan(); // Continue cooling for 3 minutes after camera use.
   Serial.println("Putting camera into standby...");
-  const bool confirmed = sendCameraCmd("/stop");
+  const bool receiverStopped = stopMjpegPreview();
+  const bool confirmed = receiverStopped && sendCameraCmd("/stop");
   cameraStreaming = false;
   Serial.println(confirmed ? "ESP32-CAM standby confirmed"
                            : "Camera stop not confirmed; sensor state unknown");
@@ -1270,82 +1648,6 @@ bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitma
 // ============================================================
 // FETCH JPEG
 // ============================================================
-
-size_t fetchJpegFrame(uint8_t *buf, size_t maxLen) {
-  if (!cameraStreaming) {
-    return 0;
-  }
-
-  // Camera HTTP can briefly drop a connection while the OV2640/frame buffer
-  // wakes. Retry once and allow slow Wi-Fi transfers more than the old 1.2s
-  // inter-chunk gap before treating a JPEG as truncated.
-  for (int attempt = 0; attempt < 2; attempt++) {
-    if (cameraBaseUrl.length() == 0 && !resolveCamera()) {
-      delay(150);
-      continue;
-    }
-
-    NetworkClient client;
-    HTTPClient http;
-    http.setConnectTimeout(CAMERA_CONNECT_TIMEOUT_MS);
-    http.setTimeout(CAMERA_COMMAND_TIMEOUT_MS);
-    http.useHTTP10(true);
-    http.setReuse(false);
-
-    String url = cameraBaseUrl + "/capture";
-    if (!http.begin(client, url)) {
-      cameraBaseUrl = "";
-      delay(150);
-      continue;
-    }
-
-    int code = http.GET();
-    if (code != HTTP_CODE_OK) {
-      String detail = code > 0 ? http.getString() : HTTPClient::errorToString(code);
-      Serial.printf("Capture HTTP error: %d: %s (attempt %d/2)\n", code, detail.c_str(), attempt + 1);
-      http.end();
-      if (code < 0) cameraBaseUrl = ""; // rediscover if the camera IP/server changed
-      delay(150);
-      continue;
-    }
-
-    int len = http.getSize();
-    if (len <= 0 || (size_t)len > maxLen) {
-      if (len > 0) Serial.printf("JPEG too large: %d bytes (buffer %u)\n", len, (unsigned int)maxLen);
-      http.end();
-      return 0;
-    }
-
-    NetworkClient *stream = http.getStreamPtr();
-    size_t received = 0;
-    unsigned long lastData = millis();
-    while (received < (size_t)len) {
-      int available = stream->available();
-      if (available > 0) {
-        size_t toRead = min((size_t)available, (size_t)len - received);
-        toRead = min(toRead, (size_t)4096);
-        int got = stream->read(buf + received, toRead);
-        if (got > 0) {
-          received += (size_t)got;
-          lastData = millis();
-        }
-      } else if (!stream->connected() || millis() - lastData > CAMERA_COMMAND_TIMEOUT_MS) {
-        break;
-      } else {
-        delay(1);
-      }
-    }
-    http.end();
-
-    if (received == (size_t)len) return received;
-
-    Serial.printf("Incomplete JPEG: %u/%d bytes (attempt %d/2)\n",
-                  (unsigned int)received, len, attempt + 1);
-    delay(150);
-  }
-
-  return 0;
-}
 
 // ============================================================
 // CAMERA TFT SCREEN
@@ -1388,15 +1690,26 @@ struct FaceBox {
   bool valid;
 };
 
+struct FaceReply {
+  bool completed = false;
+  bool sampleAccepted = false;
+  int acceptedSamples = -1;
+  int requiredSamples = -1;
+  int httpStatus = 0;
+  uint32_t retryAfterMs = 0;
+  char message[128] = {};
+};
+
 // Explicit prototypes are required in an Arduino .ino when functions use
 // user-defined types. They prevent the Arduino preprocessor from creating
 // invalid auto-prototypes before FaceBox is declared.
 void drawDynamicFaceBox(int x, int y, int w, int h, uint16_t color);
 
 bool postFaceVerify(const String &userId, const String &roomId, uint8_t *jpegBuf, size_t jpegLen,
-                    FaceBox *outBox);
+                    FaceBox *outBox, FaceReply *reply = nullptr);
 
-bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen, FaceBox *outBox);
+bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen, FaceBox *outBox,
+                    FaceReply *reply = nullptr);
 
 void drawCameraFaceBox(const FaceBox &box, uint16_t color);
 
@@ -1513,7 +1826,9 @@ bool displayJpegOnTFT(uint8_t *buf, size_t len) {
   lastJpegDrawY = y;
   lastJpegScale = scale;
 
-  return TJpgDec.drawJpg(x, y, buf, len) == JDR_OK;
+  const bool decoded = TJpgDec.drawJpg(x, y, buf, len) == JDR_OK;
+  if (decoded) ++previewDrawn;
+  return decoded;
 }
 
 // ============================================================
@@ -1818,224 +2133,108 @@ String httpPostJson(const String &path, const String &jsonBody, int *outStatus =
 // MULTIPART UPLOAD
 // ============================================================
 
+class MultipartBodyStream : public Stream {
+public:
+  MultipartBodyStream(const String &first, const uint8_t *jpeg, size_t size, const String &last)
+      : first_(first), jpeg_(jpeg), size_(size), last_(last), total_(first.length() + size + last.length()) {}
+  int available() override { return static_cast<int>(total_ - position_); }
+  int peek() override {
+    if (position_ >= total_) return -1;
+    if (position_ < first_.length()) return static_cast<uint8_t>(first_[position_]);
+    const size_t p = position_ - first_.length();
+    return p < size_ ? jpeg_[p] : static_cast<uint8_t>(last_[p - size_]);
+  }
+  int read() override { const int value = peek(); if (value >= 0) ++position_; return value; }
+  size_t readBytes(char *buffer, size_t length) override {
+    size_t count = 0;
+    while (count < length && position_ < total_) buffer[count++] = static_cast<char>(read());
+    return count;
+  }
+  size_t readBytes(uint8_t *buffer, size_t length) override {
+    return readBytes(reinterpret_cast<char *>(buffer), length);
+  }
+  size_t write(uint8_t) override { return 0; }
+  void flush() override {}
+  bool complete() const { return position_ == total_; }
+private:
+  const String &first_;
+  const uint8_t *jpeg_;
+  size_t size_;
+  const String &last_;
+  size_t total_, position_ = 0;
+};
+
+uint32_t parseRetryAfterMs(String value) {
+  value.trim();
+  if (!value.length()) return 0;
+  bool digits = true;
+  for (size_t i = 0; i < value.length(); ++i)
+    if (!isdigit(static_cast<unsigned char>(value[i]))) digits = false;
+  if (digits) {
+    const unsigned long long seconds = strtoull(value.c_str(), nullptr, 10);
+    return static_cast<uint32_t>(seconds > 86400ULL ? 86400000ULL : seconds * 1000ULL);
+  }
+  struct tm retryTime = {};
+  const char *end = strptime(value.c_str(), "%a, %d %b %Y %H:%M:%S GMT", &retryTime);
+  if (!end || *end) return 0;
+  retryTime.tm_isdst = 0;
+  const time_t epoch = mktime(&retryTime); // configTime(0, 0, ...) uses UTC.
+  const unsigned long long now = epochMs();
+  if (epoch <= 0 || !now || static_cast<unsigned long long>(epoch) * 1000ULL <= now) return 0;
+  const unsigned long long delta = static_cast<unsigned long long>(epoch) * 1000ULL - now;
+  return static_cast<uint32_t>(delta > 86400000ULL ? 86400000ULL : delta);
+}
+
 bool postMultipartStreaming(const String &path, const String &part1, uint8_t *jpegBuf,
-                            size_t jpegLen, const String &part3, String &outResp) {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi(false);
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
+                            size_t jpegLen, const String &part3, String &outResp,
+                            FaceReply *reply = nullptr) {
+  outResp = "";
+  if (!jpegBuf || jpegLen < 4 || WiFi.status() != WL_CONNECTED || epochMs() == 0) {
+    if (reply) snprintf(reply->message, sizeof(reply->message), "WiFi/time not ready");
     return false;
   }
-
-  ensureDeviceTimeSync();
-  if (epochMs() == 0) {
-    Serial.println("[AUTH] Waiting for NTP time before face upload.");
+  const String url = normalizeServerUrl(activeServerUrl) + path;
+  NetworkClient plain;
+  WiFiClientSecure secure;
+  secure.setInsecure(); // Preserves the existing TLS configuration.
+  secure.setHandshakeTimeout(10);
+  NetworkClient &transport = url.startsWith("https://") ? static_cast<NetworkClient &>(secure) : plain;
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(FACE_UPLOAD_TIMEOUT_MS);
+  http.setReuse(false);
+  const char *responseHeaders[] = {"Retry-After"};
+  http.collectHeaders(responseHeaders, 1);
+  if (!http.begin(transport, url)) {
+    if (reply) snprintf(reply->message, sizeof(reply->message), "Upload connection setup failed");
     return false;
   }
-
-  String server = normalizeServerUrl(activeServerUrl);
-
-  bool https = server.startsWith("https://");
-
-  int protocolPos = server.indexOf("://");
-
-  String hostPort = protocolPos >= 0 ? server.substring(protocolPos + 3) : server;
-
-  while (hostPort.endsWith("/")) {
-    hostPort.remove(hostPort.length() - 1);
+  http.addHeader("Content-Type", "multipart/form-data; boundary=----LabSyncBoundary7344");
+  // Existing backend contract signs an empty body hash for multipart requests.
+  // JPEG bytes, form field names, boundary and endpoints remain unchanged.
+  applyDeviceHeaders(http, "POST", path, "");
+  MultipartBodyStream body(part1, jpegBuf, jpegLen, part3);
+  const size_t total = part1.length() + jpegLen + part3.length();
+  const uint32_t startedAt = millis();
+  const int code = http.sendRequest("POST", &body, total);
+  if (reply) {
+    reply->httpStatus = code;
+    reply->retryAfterMs = parseRetryAfterMs(http.header("Retry-After"));
   }
-
-  String host = hostPort;
-
-  int port = https ? 443 : 80;
-
-  int colon = hostPort.indexOf(':');
-
-  if (colon >= 0) {
-    host = hostPort.substring(0, colon);
-
-    port = hostPort.substring(colon + 1).toInt();
+  if (code > 0) outResp = http.getString();
+  const bool sent = body.complete();
+  Serial.printf("[FACE-HTTP] status=%d sent=%s body=%u bytes time=%lu ms heap=%u\n",
+                code, sent ? "complete" : "incomplete", static_cast<unsigned>(outResp.length()),
+                millis() - startedAt, ESP.getFreeHeap());
+  if (code < 0) Serial.println("[FACE-HTTP] " + HTTPClient::errorToString(code));
+  if ((code < 200 || code >= 300) && outResp.length())
+    Serial.println("[FACE-HTTP] Error body: " + outResp.substring(0, 512));
+  if (reply && (code < 200 || code >= 300)) {
+    const String message = code == 429 ? "Rate limited; waiting before retry" : "Upload failed; retrying";
+    snprintf(reply->message, sizeof(reply->message), "%s", message.c_str());
   }
-
-  const String boundary = "----LabSyncBoundary7344";
-
-  size_t totalLength = part1.length() + jpegLen + part3.length();
-
-  String response = "";
-
-  if (https) {
-    WiFiClientSecure client;
-
-    client.setInsecure();
-    client.setHandshakeTimeout(15);
-    client.setTimeout(FACE_UPLOAD_TIMEOUT_MS);
-
-    Serial.printf("[HTTPS] Connecting to %s:%d...\n", host.c_str(), port);
-
-    if (!client.connect(host.c_str(), port)) {
-      Serial.printf("[HTTPS] Connection to %s failed!\n", host.c_str());
-      return false;
-    }
-
-    Serial.printf("[HTTPS] Uploading %s (%u bytes)...\n", path.c_str(), (unsigned int)totalLength);
-
-    String ts, nonce, signature;
-    deviceSignature("POST", path, "", ts, nonce, signature);
-
-    client.printf("POST %s HTTP/1.1\r\n", path.c_str());
-
-    client.printf("Host: %s\r\n", host.c_str());
-
-    client.printf("X-Device-Id: %s\r\n", DEVICE_ID);
-
-    client.printf("X-Device-Ts: %s\r\n", ts.c_str());
-
-    client.printf("X-Device-Nonce: %s\r\n", nonce.c_str());
-
-    client.printf("X-Device-Sig: %s\r\n", signature.c_str());
-
-    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
-
-    client.printf("Content-Length: %u\r\n", (unsigned int)totalLength);
-
-    client.print("Connection: close\r\n\r\n");
-
-    client.print(part1);
-
-    size_t sent = 0;
-
-    while (sent < jpegLen && client.connected()) {
-      size_t remaining = jpegLen - sent;
-
-      size_t chunk = remaining > 1024 ? 1024 : remaining;
-
-      size_t written = client.write(jpegBuf + sent, chunk);
-
-      if (written == 0)
-        break;
-
-      sent += written;
-    }
-
-    client.print(part3);
-
-    client.flush();
-
-    unsigned long start = millis();
-
-    while (!client.available() && client.connected() && millis() - start < FACE_UPLOAD_TIMEOUT_MS) {
-      delay(5);
-    }
-
-    unsigned long lastData = millis();
-
-    while (client.connected() || client.available()) {
-      while (client.available()) {
-        response += (char)client.read();
-
-        lastData = millis();
-      }
-
-      if (millis() - lastData > FACE_UPLOAD_TIMEOUT_MS) {
-        break;
-      }
-
-      delay(1);
-    }
-
-    client.stop();
-
-    Serial.printf("[HTTPS] Response (%d bytes): %s\n", response.length(),
-                  response.substring(0, 100).c_str());
-
-  } else {
-    NetworkClient client;
-
-    client.setTimeout(FACE_UPLOAD_TIMEOUT_MS);
-
-    if (!client.connect(host.c_str(), port)) {
-      return false;
-    }
-
-    String ts, nonce, signature;
-    deviceSignature("POST", path, "", ts, nonce, signature);
-
-    client.printf("POST %s HTTP/1.1\r\n", path.c_str());
-
-    client.printf("Host: %s:%d\r\n", host.c_str(), port);
-
-    client.printf("X-Device-Id: %s\r\n", DEVICE_ID);
-
-    client.printf("X-Device-Ts: %s\r\n", ts.c_str());
-
-    client.printf("X-Device-Nonce: %s\r\n", nonce.c_str());
-
-    client.printf("X-Device-Sig: %s\r\n", signature.c_str());
-
-    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
-
-    client.printf("Content-Length: %u\r\n", (unsigned int)totalLength);
-
-    client.print("Connection: close\r\n\r\n");
-
-    client.print(part1);
-
-    size_t sent = 0;
-
-    while (sent < jpegLen && client.connected()) {
-      size_t remaining = jpegLen - sent;
-
-      size_t chunk = remaining > 1024 ? 1024 : remaining;
-
-      size_t written = client.write(jpegBuf + sent, chunk);
-
-      if (written == 0)
-        break;
-
-      sent += written;
-    }
-
-    client.print(part3);
-
-    client.flush();
-
-    unsigned long start = millis();
-
-    while (!client.available() && client.connected() && millis() - start < FACE_UPLOAD_TIMEOUT_MS) {
-      delay(5);
-    }
-
-    unsigned long lastData = millis();
-
-    while (client.connected() || client.available()) {
-      while (client.available()) {
-        response += (char)client.read();
-
-        lastData = millis();
-      }
-
-      if (millis() - lastData > FACE_UPLOAD_TIMEOUT_MS) {
-        break;
-      }
-
-      delay(1);
-    }
-
-    client.stop();
-  }
-
-  outResp = response;
-
-  int bodyStart = response.indexOf("\r\n\r\n");
-
-  if (bodyStart >= 0) {
-    outResp = response.substring(bodyStart + 4);
-  }
-
-  bool httpSuccess = response.startsWith("HTTP/1.1 2") || response.startsWith("HTTP/1.0 2");
-
-  return httpSuccess;
+  http.end();
+  return sent && code >= 200 && code < 300;
 }
 
 // ============================================================
@@ -2043,7 +2242,7 @@ bool postMultipartStreaming(const String &path, const String &part1, uint8_t *jp
 // ============================================================
 
 bool postFaceVerify(const String &userId, const String &roomId, uint8_t *jpegBuf, size_t jpegLen,
-                    FaceBox *outBox) {
+                    FaceBox *outBox, FaceReply *reply) {
   const String boundary = "----LabSyncBoundary7344";
 
   const String CRLF = "\r\n";
@@ -2068,7 +2267,7 @@ bool postFaceVerify(const String &userId, const String &roomId, uint8_t *jpegBuf
 
   String response;
 
-  bool ok = postMultipartStreaming("/api/face/verify", part1, jpegBuf, jpegLen, part3, response);
+  bool ok = postMultipartStreaming("/api/face/verify", part1, jpegBuf, jpegLen, part3, response, reply);
 
   if (!ok)
     return false;
@@ -2088,6 +2287,10 @@ bool postFaceVerify(const String &userId, const String &roomId, uint8_t *jpegBuf
   }
 
   bool success = doc["success"] | false;
+  if (reply) {
+    reply->completed = success;
+    snprintf(reply->message, sizeof(reply->message), "%s", doc["message"] | (success ? "Face matched" : "Face not matched"));
+  }
 
   float confidence = doc["confidence"] | 0.0f;
 
@@ -2113,7 +2316,8 @@ bool postFaceVerify(const String &userId, const String &roomId, uint8_t *jpegBuf
 // FACE ENROLL
 // ============================================================
 
-bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen, FaceBox *outBox) {
+bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen, FaceBox *outBox,
+                    FaceReply *reply) {
   const String boundary = "----LabSyncBoundary7344";
 
   const String CRLF = "\r\n";
@@ -2135,7 +2339,7 @@ bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen, Face
   String response;
 
   bool ok =
-      postMultipartStreaming("/api/face/enroll-hardware", part1, jpegBuf, jpegLen, part3, response);
+      postMultipartStreaming("/api/face/enroll-hardware", part1, jpegBuf, jpegLen, part3, response, reply);
 
   if (!ok) {
     Serial.printf("[FACE-ENROLL] Network/HTTP error. Response len: %d\n", response.length());
@@ -2155,8 +2359,23 @@ bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen, Face
     return false;
   }
 
-  bool success = (doc["success"] | false) || (doc["finalized"] | false);
+  // A present finalized=false means intermediate progress, even if success=true.
+  // Legacy backends without finalized retain their existing success contract.
+  bool success = doc.containsKey("finalized")
+      ? (doc["finalized"].is<bool>() && doc["finalized"].as<bool>())
+      : (doc["success"].is<bool>() && doc["success"].as<bool>());
   const char *serverMsg = doc["message"] | "";
+  if (reply) {
+    reply->completed = success;
+    snprintf(reply->message, sizeof(reply->message), "%s", serverMsg);
+    int accepted = 0, required = 0;
+    if (strstr(serverMsg, "accepted") && sscanf(serverMsg, "Sample %d/%d", &accepted, &required) == 2 &&
+        accepted > 0 && required >= accepted) {
+      reply->sampleAccepted = true;
+      reply->acceptedSamples = accepted;
+      reply->requiredSamples = required;
+    }
+  }
   Serial.printf("[FACE-ENROLL] Server Result: success=%s, finalized=%s, msg=\"%s\"\n",
                 (doc["success"] | false) ? "true" : "false",
                 (doc["finalized"] | false) ? "true" : "false", serverMsg);
@@ -2187,210 +2406,155 @@ bool postFaceEnroll(const String &userId, uint8_t *jpegBuf, size_t jpegLen, Face
 
 enum FaceRequestMode { FACE_REQUEST_NONE, FACE_REQUEST_VERIFY, FACE_REQUEST_ENROLL };
 
-// Explicit prototypes for functions that use FaceRequestMode.
-// This avoids Arduino's auto-prototype generator placing declarations
-// before the enum definition.
+struct FaceResult {
+  uint32_t session;
+  FaceRequestMode mode;
+  bool success;
+  FaceBox box;
+  FaceReply reply;
+};
+
+struct FaceJob {
+  uint32_t session;
+  FaceRequestMode mode;
+  String userId, roomId;
+  uint8_t *jpeg;
+  size_t length;
+};
+
 uint32_t beginFaceSession();
 void faceRequestWorker(void *parameter);
-
 bool startFaceRequestAsync(FaceRequestMode mode, uint32_t session, const String &userId,
                            const String &roomId, const uint8_t *jpeg, size_t jpegLen);
-
 bool takeFaceResult(uint32_t session, FaceRequestMode expectedMode, bool &success, FaceBox &box);
-
 bool finishPendingFaceRequest(uint32_t session, FaceRequestMode mode, bool &success, FaceBox &box,
                               uint16_t reticleColor);
 
-volatile bool faceRequestBusy = false;
-volatile bool faceResultReady = false;
-
-FaceRequestMode faceRequestMode = FACE_REQUEST_NONE;
-FaceRequestMode faceResultMode = FACE_REQUEST_NONE;
-
-String faceRequestUserId = "";
-String faceRequestRoomId = "";
-
-uint8_t *faceRequestJpeg = nullptr;
-size_t faceRequestJpegLen = 0;
-
+std::atomic<bool> faceRequestBusy{false};
+std::atomic<uint32_t> activeFaceSession{0};
+QueueHandle_t faceResults = nullptr;
 uint32_t faceSessionCounter = 0;
-uint32_t faceRequestSession = 0;
-uint32_t faceResultSession = 0;
+FaceReply lastFaceReply = {};
+uint32_t faceNextAllowedAt = 0;
+unsigned faceRateFailures = 0;
 
-bool faceResultSuccess = false;
-FaceBox faceResultBox = {0, 0, 0, 0, false};
-
-TaskHandle_t faceRequestTaskHandle = nullptr;
+bool faceResultsPending() {
+  return faceResults && uxQueueMessagesWaiting(faceResults) > 0;
+}
 
 uint32_t beginFaceSession() {
-  faceSessionCounter++;
-
-  if (faceSessionCounter == 0) {
-    faceSessionCounter = 1;
-  }
-
-  // Any result from an older session is no longer relevant.
-  faceResultReady = false;
-
+  if (!faceResults) faceResults = xQueueCreate(1, sizeof(FaceResult));
+  if (++faceSessionCounter == 0) ++faceSessionCounter;
+  activeFaceSession.store(faceSessionCounter);
+  if (faceResults) xQueueReset(faceResults);
+  lastFaceReply = FaceReply{};
   return faceSessionCounter;
 }
 
 void faceRequestWorker(void *parameter) {
-  (void)parameter;
-
-  FaceBox box = {0, 0, 0, 0, false};
-  bool success = false;
-
-  FaceRequestMode mode = faceRequestMode;
-
-  uint32_t session = faceRequestSession;
-
-  if (faceRequestJpeg != nullptr && faceRequestJpegLen > 0) {
-    if (mode == FACE_REQUEST_VERIFY) {
-      success = postFaceVerify(faceRequestUserId, faceRequestRoomId, faceRequestJpeg,
-                               faceRequestJpegLen, &box);
-    } else if (mode == FACE_REQUEST_ENROLL) {
-      success = postFaceEnroll(faceRequestUserId, faceRequestJpeg, faceRequestJpegLen, &box);
-    }
+  FaceJob *job = static_cast<FaceJob *>(parameter);
+  FaceResult result = {};
+  result.session = job->session;
+  result.mode = job->mode;
+  result.reply.acceptedSamples = -1;
+  result.reply.requiredSamples = -1;
+  if (activeFaceSession.load() == job->session) {
+    if (job->mode == FACE_REQUEST_VERIFY)
+      result.success = postFaceVerify(job->userId, job->roomId, job->jpeg, job->length,
+                                     &result.box, &result.reply);
+    else if (job->mode == FACE_REQUEST_ENROLL)
+      result.success = postFaceEnroll(job->userId, job->jpeg, job->length, &result.box, &result.reply);
   }
-
-  if (faceRequestJpeg != nullptr) {
-    free(faceRequestJpeg);
-    faceRequestJpeg = nullptr;
+  free(job->jpeg);
+  delete job;
+  // Queue publication copies the entire result atomically between tasks.
+  if (activeFaceSession.load() == result.session && faceResults) {
+    xQueueOverwrite(faceResults, &result);
   }
-
-  faceRequestJpegLen = 0;
-
-  faceResultSuccess = success;
-  faceResultBox = box;
-  faceResultMode = mode;
-  faceResultSession = session;
-
-  // Publish the result only after all fields above are complete.
-  faceResultReady = true;
-  faceRequestBusy = false;
-  faceRequestTaskHandle = nullptr;
-
+  faceRequestBusy.store(false);
   vTaskDelete(nullptr);
 }
 
-// Check JPEG boundary markers only. The backend decodes and detects faces.
 bool hasJpegMarkers(const uint8_t *jpeg, size_t jpegLen) {
-  return jpeg != nullptr && jpegLen >= 4 && jpeg[0] == 0xFF && jpeg[1] == 0xD8 &&
+  return jpeg && jpegLen >= 4 && jpeg[0] == 0xFF && jpeg[1] == 0xD8 &&
          jpeg[jpegLen - 2] == 0xFF && jpeg[jpegLen - 1] == 0xD9;
 }
 
 bool startFaceRequestAsync(FaceRequestMode mode, uint32_t session, const String &userId,
                            const String &roomId, const uint8_t *jpeg, size_t jpegLen) {
-  if (faceRequestBusy || faceResultReady || !hasJpegMarkers(jpeg, jpegLen)) {
-    return false;
-  }
-
+  if (!faceResults || faceResultsPending() || !hasJpegMarkers(jpeg, jpegLen) ||
+      (faceNextAllowedAt && static_cast<int32_t>(millis() - faceNextAllowedAt) < 0)) return false;
+  bool expected = false;
+  if (!faceRequestBusy.compare_exchange_strong(expected, true)) return false;
+  FaceJob *job = new (std::nothrow) FaceJob;
   uint8_t *copy = static_cast<uint8_t *>(malloc(jpegLen));
-
-  if (copy == nullptr) {
-    Serial.printf("Face request skipped: cannot allocate %u-byte JPEG copy\n",
-                  (unsigned int)jpegLen);
-
+  if (!job || !copy) {
+    delete job;
+    free(copy);
+    faceRequestBusy.store(false);
+    Serial.println("[FACE] Not enough heap for upload copy");
     return false;
   }
-
   memcpy(copy, jpeg, jpegLen);
-
-  faceRequestMode = mode;
-  faceRequestSession = session;
-  faceRequestUserId = userId;
-  faceRequestRoomId = roomId;
-  faceRequestJpeg = copy;
-  faceRequestJpegLen = jpegLen;
-  faceRequestBusy = true;
-
-  BaseType_t created =
-      xTaskCreate(faceRequestWorker, "faceHttp", 16384, nullptr, 1, &faceRequestTaskHandle);
-
-  if (created != pdPASS) {
-    free(faceRequestJpeg);
-    faceRequestJpeg = nullptr;
-    faceRequestJpegLen = 0;
-    faceRequestBusy = false;
-    faceRequestTaskHandle = nullptr;
-
-    Serial.println("Face request task creation failed");
-
+  job->session = session;
+  job->mode = mode;
+  job->userId = userId;
+  job->roomId = roomId;
+  job->jpeg = copy;
+  job->length = jpegLen;
+  if (xTaskCreate(faceRequestWorker, "faceHttp", 16384, job, 1, nullptr) != pdPASS) {
+    free(copy);
+    delete job;
+    faceRequestBusy.store(false);
     return false;
   }
-
   return true;
 }
 
 bool takeFaceResult(uint32_t session, FaceRequestMode expectedMode, bool &success, FaceBox &box) {
-  if (!faceResultReady) {
-    return false;
+  if (!faceResults) return false;
+  FaceResult result;
+  if (xQueueReceive(faceResults, &result, 0) != pdTRUE) return false;
+  if (result.session != session || result.mode != expectedMode) return false;
+  success = result.success;
+  box = result.box;
+  lastFaceReply = result.reply;
+  const uint32_t now = millis();
+  if (result.reply.httpStatus == 429) {
+    faceRateFailures = min(faceRateFailures + 1, 4U);
+    uint32_t wait = result.reply.retryAfterMs;
+    if (!wait) wait = min(5000U << (faceRateFailures - 1), 30000U);
+    faceNextAllowedAt = now + wait;
+    Serial.printf("[FACE] Rate-limit cooldown: %lu ms\n", wait);
+  } else if (result.reply.httpStatus <= 0 || result.reply.httpStatus >= 500) {
+    faceNextAllowedAt = now + 3000;
+  } else {
+    faceRateFailures = 0;
+    faceNextAllowedAt = now + FACE_REQUEST_INTERVAL_MS;
   }
-
-  uint32_t resultSession = faceResultSession;
-
-  FaceRequestMode resultMode = faceResultMode;
-
-  success = faceResultSuccess;
-
-  box = faceResultBox;
-
-  faceResultReady = false;
-
-  if (resultSession != session || resultMode != expectedMode) {
-    return false;
-  }
-
   return true;
 }
 
-// Drain pending work before ending either face session. A ready result must
-// be consumed even when the worker has already cleared faceRequestBusy.
 bool finishPendingFaceRequest(uint32_t session, FaceRequestMode mode, bool &success, FaceBox &box,
                               uint16_t reticleColor) {
-  const unsigned long waitingSince = millis();
-
-  while (true) {
-    bool resultSuccess = false;
-    FaceBox resultBox = {0, 0, 0, 0, false};
-    if (takeFaceResult(session, mode, resultSuccess, resultBox)) {
-      success = resultSuccess;
-      box = resultBox;
-      return true;
-    }
-
-    // Use the existing upload timeout, replacing the separate 15-second cap.
-    if (!faceRequestBusy || millis() - waitingSince >= FACE_UPLOAD_TIMEOUT_MS) {
-      break;
-    }
-
-    // Keep the preview moving while the request finishes. No new uploads here.
-    size_t jpegLen = fetchJpegFrame(jpegBuffer, jpegBufferCapacity);
-    if (jpegLen > 0) {
-      displayJpegOnTFT(jpegBuffer, jpegLen);
+  const uint32_t start = millis();
+  uint32_t lastStatus = 0;
+  while (millis() - start < FACE_UPLOAD_TIMEOUT_MS + 15000UL) {
+    if (takeFaceResult(session, mode, success, box)) return true;
+    if (!faceRequestBusy.load()) break;
+    const size_t length = fetchJpegFrame(jpegBuffer, jpegBufferCapacity);
+    if (length) {
+      displayJpegOnTFT(jpegBuffer, length);
       drawFaceReticle(reticleColor);
-      if (box.valid) {
-        drawCameraFaceBox(box, COLOR_YELLOW);
-      }
     }
-    tftShowStatus("Look at camera", "Waiting for server...", COLOR_CYAN);
-    delay(10);
+    if (millis() - lastStatus >= 250) {
+      tftShowStatus("Finishing last request", "Preview remains active", COLOR_CYAN);
+      lastStatus = millis();
+    }
+    delay(20);
   }
-
-  // The worker may have published between the first result check and the
-  // busy/deadline check. Always consume once more before reporting failure.
-  bool resultSuccess = false;
-  FaceBox resultBox = {0, 0, 0, 0, false};
-  if (takeFaceResult(session, mode, resultSuccess, resultBox)) {
-    success = resultSuccess;
-    box = resultBox;
-    return true;
-  }
-
-  if (faceRequestBusy) {
-    Serial.println("Face request still pending after completion wait timed out");
-  }
+  if (takeFaceResult(session, mode, success, box)) return true;
+  if (faceRequestBusy.load()) Serial.println("[FACE] Last request still pending; next upload waits.");
   return false;
 }
 
@@ -2455,6 +2619,10 @@ void clearCompletedEnrollment(int fingerId) {
   }
   const String key = "f" + String(fingerId);
   prefs.putString(key.c_str(), "");
+  const String pending = "p" + String(fingerId);
+  const String linked = "l" + String(fingerId);
+  prefs.remove(pending.c_str());
+  prefs.remove(linked.c_str());
   prefs.end();
 }
 
@@ -2471,10 +2639,83 @@ void rememberCompletedEnrollment(const String &userId, int fingerId) {
   const String key = "f" + String(fingerId);
   const String identity = completedEnrollmentIdentity(userId);
   const size_t written = prefs.putString(key.c_str(), identity);
+  if (written == identity.length()) {
+    const String pending = "p" + String(fingerId);
+    const String linked = "l" + String(fingerId);
+    prefs.remove(pending.c_str());
+    prefs.remove(linked.c_str());
+  }
   prefs.end();
   if (written != identity.length()) {
     Serial.println("ERROR: Enrollment completed, but completion record was not saved.");
   }
+}
+
+// A failed face stage must not consume a second fingerprint slot on retry.
+int findPendingFingerprint(const String &userId) {
+  if (!fingerprintReady || !userId.length()) return -1;
+  Preferences prefs;
+  if (!prefs.begin("ls_enroll", true)) return -1;
+  const String identity = completedEnrollmentIdentity(userId);
+  int found = -1;
+  for (int id = 1; id <= finger.capacity; ++id) {
+    const String key = "p" + String(id);
+    if (prefs.getString(key.c_str(), "") == identity && finger.loadModel(id) == FINGERPRINT_OK) {
+      found = id;
+      break;
+    }
+  }
+  prefs.end();
+  return found;
+}
+
+void rememberPendingFingerprint(const String &userId, int slot) {
+  Preferences prefs;
+  if (!prefs.begin("ls_enroll", false)) {
+    Serial.println("[ENROLL] Cannot save pending fingerprint record");
+    return;
+  }
+  const String key = "p" + String(slot);
+  const String identity = completedEnrollmentIdentity(userId);
+  if (prefs.putString(key.c_str(), identity) != identity.length())
+    Serial.println("[ENROLL] Pending fingerprint record could not be persisted");
+  prefs.end();
+}
+
+bool linkFingerprintToBackend(const String &userId, const String &userName,
+                              const String &role, int slot) {
+  const String identity = completedEnrollmentIdentity(userId);
+  const String linkedKey = "l" + String(slot);
+  Preferences saved;
+  if (saved.begin("ls_enroll", true)) {
+    const bool alreadyLinked = saved.getString(linkedKey.c_str(), "") == identity;
+    saved.end();
+    if (alreadyLinked) return true; // Do not restart a backend sample session on face retry.
+  }
+  StaticJsonDocument<384> doc;
+  doc["fingerId"] = slot;
+  doc["userId"] = userId;
+  doc["userName"] = userName;
+  doc["role"] = role;
+  doc["roomId"] = ROOM_ID;
+  String body;
+  serializeJson(doc, body);
+  int status = 0;
+  const String response = httpPostJson("/api/esp32/enrollment-complete", body, &status);
+  if (status < 200 || status >= 300) {
+    Serial.printf("[ENROLL] Fingerprint link pending; HTTP %d\n", status);
+    return false;
+  }
+  // Respect an explicit application rejection even with HTTP 200.
+  JsonDocument result;
+  if (response.length() && deserializeJson(result, response) == DeserializationError::Ok &&
+      result["success"].is<bool>() && !result["success"].as<bool>()) return false;
+  if (saved.begin("ls_enroll", false)) {
+    if (saved.putString(linkedKey.c_str(), identity) != identity.length())
+      Serial.println("[ENROLL] Backend link succeeded; local link record could not be saved");
+    saved.end();
+  }
+  return true;
 }
 
 // ============================================================
@@ -2705,98 +2946,73 @@ void reportEnrollmentFailure(const String &userId, const String &userName, int e
 bool runFaceRegistrationOnly(const String &userId, const String &userName,
                              const String &role = "user", int fingerId = 0) {
   tftShowFullScreen("ENROLL STEP 2/2", "Waking camera...", COLOR_CYAN);
-
   if (!startCamera()) {
     tftShowFullScreen("CAMERA ERROR", "Unable to wake camera", COLOR_RED);
     delay(2000);
     return false;
   }
-
   prepareCameraScreen("FACE REGISTRATION", userName);
+  const uint32_t session = beginFaceSession();
+  const uint32_t startedAt = millis();
+  uint32_t lastProgressAt = startedAt, lastStatusAt = 0;
+  int accepted = 0, required = 0;
+  bool completed = false;
+  FaceBox box = {0, 0, 0, 0, false};
 
-  bool faceEnrolled = false;
-  uint32_t faceSession = beginFaceSession();
-  unsigned long start = millis();
-  unsigned long lastFaceRequest = 0;
-  FaceBox overlayBox = {0, 0, 0, 0, false};
-  uint16_t overlayColor = COLOR_YELLOW;
-  uint16_t reticleColor = COLOR_YELLOW;
-
-  while (millis() - start < LIVE_VIEW_TIME_MS && !faceEnrolled) {
-    bool resultSuccess = false;
+  while (millis() - startedAt < ENROLL_MAX_TIME_MS && !completed) {
+    bool success = false;
     FaceBox resultBox = {0, 0, 0, 0, false};
-
-    if (takeFaceResult(faceSession, FACE_REQUEST_ENROLL, resultSuccess, resultBox)) {
-      overlayBox = resultBox;
-      faceEnrolled = resultSuccess;
-      overlayColor = faceEnrolled ? COLOR_GREEN : COLOR_RED;
-      reticleColor = faceEnrolled ? COLOR_GREEN : COLOR_RED;
+    if (takeFaceResult(session, FACE_REQUEST_ENROLL, success, resultBox)) {
+      completed = success;
+      box = resultBox;
+      if (lastFaceReply.sampleAccepted && lastFaceReply.acceptedSamples > accepted) {
+        accepted = lastFaceReply.acceptedSamples;
+        required = lastFaceReply.requiredSamples;
+        lastProgressAt = millis(); // Only real progress extends the inactivity window.
+      }
     }
-
-    size_t jpegLen = fetchJpegFrame(jpegBuffer, jpegBufferCapacity);
-    if (jpegLen > 0) {
-      displayJpegOnTFT(jpegBuffer, jpegLen);
-      drawFaceReticle(reticleColor);
-
-      if (overlayBox.valid) {
-        drawCameraFaceBox(overlayBox, overlayColor);
+    const uint32_t now = millis();
+    if (now - lastProgressAt >= ENROLL_NO_PROGRESS_MS && !faceRequestBusy.load()) break;
+    const size_t length = fetchJpegFrame(jpegBuffer, jpegBufferCapacity);
+    if (length) {
+      displayJpegOnTFT(jpegBuffer, length);
+      drawFaceReticle(completed ? COLOR_GREEN : COLOR_YELLOW);
+      if (box.valid) drawCameraFaceBox(box, completed ? COLOR_GREEN : COLOR_YELLOW);
+      if (!completed && !faceRequestBusy.load() && !faceResultsPending())
+        startFaceRequestAsync(FACE_REQUEST_ENROLL, session, userId, "", jpegBuffer, length);
+    }
+    if (now - lastStatusAt >= 250) {
+      String top = required > 0 ? "Accepted " + String(accepted) + "/" + String(required)
+                                : "Look at camera; hold still";
+      String bottom = lastFaceReply.message[0] ? String(lastFaceReply.message) : "Connecting MJPEG preview...";
+      if (faceRequestBusy.load()) bottom = "Checking current JPEG...";
+      if (lastFaceReply.httpStatus == 429 && faceNextAllowedAt &&
+          static_cast<int32_t>(now - faceNextAllowedAt) < 0) {
+        const uint32_t seconds = (faceNextAllowedAt - now + 999) / 1000;
+        bottom = "Next upload in " + String(seconds) + " s";
       }
-
-      if (faceEnrolled) {
-        tftShowStatus("Face Captured!", "Biometrics locked", COLOR_GREEN);
-        delay(500);
-        break;
-      }
-
-      if (faceRequestBusy) {
-        tftShowStatus("Align face in frame", "Checking image...", COLOR_CYAN);
-      } else {
-        tftShowStatus("Align face in frame", "Live preview", COLOR_CYAN);
-      }
-
-      unsigned long now = millis();
-      bool validJpeg = hasJpegMarkers(jpegBuffer, jpegLen);
-
-      if (faceRequestBusy) {
-        tftShowStatus("Enrolling face...", "Extracting template", COLOR_CYAN);
-      } else if (!validJpeg) {
-        tftShowStatus("Camera image error", "Waiting for JPEG...", COLOR_YELLOW);
-      } else {
-        tftShowStatus("Look at camera", "Hold still for capture", COLOR_CYAN);
-      }
-
-      uint32_t adaptiveInterval = overlayBox.valid ? 700 : 1200;
-
-      if (!faceRequestBusy && !faceResultReady && validJpeg &&
-          now - lastFaceRequest >= adaptiveInterval) {
-        if (startFaceRequestAsync(FACE_REQUEST_ENROLL, faceSession, userId, "", jpegBuffer,
-                                  jpegLen)) {
-          lastFaceRequest = now;
-          reticleColor = COLOR_YELLOW;
-        }
-      }
+      tftShowStatus(top.substring(0, 37), bottom.substring(0, 37), COLOR_CYAN);
+      lastStatusAt = now;
     }
     delay(10);
   }
-
-  if (!faceEnrolled) {
-    finishPendingFaceRequest(faceSession, FACE_REQUEST_ENROLL, faceEnrolled, overlayBox,
-                             COLOR_YELLOW);
-  }
-
+  if (!completed)
+    finishPendingFaceRequest(session, FACE_REQUEST_ENROLL, completed, box, COLOR_YELLOW);
+  if (completed) tftShowStatus("Face enrollment completed", "Saving result...", COLOR_GREEN);
+  activeFaceSession.store(0); // Late results cannot update a later user's UI.
   stopCamera();
-
-  if (faceEnrolled) {
+  if (completed) {
     rememberCompletedEnrollment(userId, fingerId);
-    tftShowFullScreen(role.equalsIgnoreCase("admin") ? "ADMIN ENROLLED" : "USER ENROLLED", userName,
-                      COLOR_GREEN);
-    tftShowStatus("Biometrics Active", "Google Sheets Synced", COLOR_GREEN);
+    tftShowFullScreen(role.equalsIgnoreCase("admin") ? "ADMIN ENROLLED" : "USER ENROLLED",
+                      userName, COLOR_GREEN);
+    tftShowStatus("Enrollment completed", "All samples finalized", COLOR_GREEN);
   } else {
-    tftShowFullScreen("FACE INCOMPLETE", "Retry from admin menu", COLOR_RED);
+    tftShowFullScreen("FACE INCOMPLETE", "Fingerprint kept; retry face", COLOR_RED);
+    const String detail = lastFaceReply.message[0] ? String(lastFaceReply.message) : "No completed face response";
+    tftShowStatus(detail.substring(0, 37), "Touch saved finger to retry", COLOR_YELLOW);
   }
-
   delay(2000);
-  return faceEnrolled;
+  return completed;
 }
 
 // ============================================================
@@ -2808,6 +3024,16 @@ bool runEnrollmentSequence(const String &userId, const String &userName,
   if (!fingerprintReady)
     return false;
 
+  const int pendingSlot = findPendingFingerprint(userId);
+  if (pendingSlot > 0) {
+    Serial.printf("[ENROLL] Resuming face stage; reuse fingerprint slot %d\n", pendingSlot);
+    if (!linkFingerprintToBackend(userId, userName, role, pendingSlot)) {
+      tftShowFullScreen("LINK PENDING", "Fingerprint kept; retry later", COLOR_YELLOW);
+      delay(2000);
+      return false;
+    }
+    return runFaceRegistrationOnly(userId, userName, role, pendingSlot);
+  }
   requestCoolingFan();
 
   // ------------------------------------------------------------
@@ -2947,16 +3173,12 @@ bool runEnrollmentSequence(const String &userId, const String &userName,
     return false;
   }
 
-  StaticJsonDocument<384> enrollDoc;
-  enrollDoc["fingerId"] = nextId;
-  enrollDoc["userId"] = userId;
-  enrollDoc["userName"] = userName;
-  enrollDoc["role"] = role;
-  enrollDoc["roomId"] = ROOM_ID;
-
-  String body;
-  serializeJson(enrollDoc, body);
-  httpPostJson("/api/esp32/enrollment-complete", body);
+  rememberPendingFingerprint(userId, nextId);
+  if (!linkFingerprintToBackend(userId, userName, role, nextId)) {
+    tftShowFullScreen("LINK PENDING", "Fingerprint kept; retry later", COLOR_YELLOW);
+    delay(2000);
+    return false;
+  }
 
   tftShowStatus("Fingerprint Saved!", "Slot #" + String(nextId), COLOR_GREEN);
 
@@ -3368,7 +3590,7 @@ void runAccessFlow(int fingerId) {
 
   uint16_t reticleColor = COLOR_CYAN;
 
-  size_t prevVerifyJpegLen = 0;
+  uint32_t lastVerifyStatus = 0;
   int verifyAttempts = 0;
   constexpr int MAX_VERIFY_ATTEMPTS = 8;
 
@@ -3403,20 +3625,23 @@ void runAccessFlow(int fingerId) {
       // Send valid JPEGs; the backend decides whether a face is present.
       bool validJpeg = hasJpegMarkers(jpegBuffer, jpegLen);
 
-      if (faceRequestBusy) {
-        tftShowStatus("Verifying face...", "AI matching in cloud", COLOR_CYAN);
-      } else if (!validJpeg) {
-        tftShowStatus("Camera image error", "Waiting for JPEG...", COLOR_YELLOW);
-      } else {
-        tftShowStatus("Look at camera", "Hold still...", COLOR_CYAN);
+      const uint32_t statusNow = millis();
+      if (statusNow - lastVerifyStatus >= 250) {
+        String status = faceRequestBusy.load() ? "Checking current JPEG..."
+            : (lastFaceReply.message[0] ? String(lastFaceReply.message) : "Hold still...");
+        if (lastFaceReply.httpStatus == 429 && faceNextAllowedAt &&
+            static_cast<int32_t>(statusNow - faceNextAllowedAt) < 0)
+          status = "Next upload in " + String((faceNextAllowedAt - statusNow + 999) / 1000) + " s";
+        tftShowStatus("Face verification", status.substring(0, 37), COLOR_CYAN);
+        lastVerifyStatus = statusNow;
       }
 
       unsigned long now = millis();
       // Adaptive timing: fast 600ms when face candidate was found, calm 1200ms when waiting
-      uint32_t adaptiveInterval = overlayBox.valid ? 600 : 1200;
+      uint32_t adaptiveInterval = FACE_REQUEST_INTERVAL_MS;
 
       // Dispatch valid images at the existing interval while attempts remain
-      if (!faceRequestBusy && !faceResultReady && validJpeg &&
+      if (!faceRequestBusy && !faceResultsPending() && validJpeg &&
           verifyAttempts < MAX_VERIFY_ATTEMPTS && now - lastFaceRequest >= adaptiveInterval) {
         if (startFaceRequestAsync(FACE_REQUEST_VERIFY, faceSession, userId, String(ROOM_ID),
                                   jpegBuffer, jpegLen)) {
@@ -3435,6 +3660,7 @@ void runAccessFlow(int fingerId) {
                              COLOR_CYAN);
   }
 
+  activeFaceSession.store(0);
   stopCamera();
 
   if (faceVerified) {
